@@ -1,0 +1,106 @@
+# Lagoon 4-site Yggdrasil mesh test environment.
+#
+# Sites:
+#   lagoon.lagun.co  202:725c:7241:f0be:4559:d423:404:3978  (flagship)
+#   lon.lagun.co     200:90e:e34d:924d:3722:be20:7d69:ab7d
+#   per.lagun.co     201:6647:b411:52ad:a45a:fba5:efd1:cfe5
+#   nyc.lagun.co     200:ac38:920e:cbe8:3168:3f75:360c:667b
+#
+# Host peers with containers via published ports 19001-19004.
+# Containers peer with each other via Docker DNS (lagoon, lon, per, nyc).
+
+x-lagoon: &lagoon-base
+  image: debian:trixie-slim
+  cap_add:
+    - NET_ADMIN
+  devices:
+    - /dev/net/tun
+  sysctls:
+    - net.ipv6.conf.all.disable_ipv6=0
+  volumes:
+    - ../target/release/lagoon:/usr/local/bin/lagoon:ro
+    - /usr/sbin/yggdrasil:/usr/sbin/yggdrasil:ro
+    - /usr/sbin/yggdrasilctl:/usr/sbin/yggdrasilctl:ro
+    - ./entrypoint.sh:/entrypoint.sh:ro
+  entrypoint: /entrypoint.sh
+  restart: unless-stopped
+  networks:
+    - mesh
+
+services:
+  lagoon:
+    <<: *lagoon-base
+    container_name: lagoon
+    hostname: lagoon.lagun.co
+    environment:
+      - SITE_NAME=lagoon
+      - RUST_LOG=info
+      - LAGOON_PEERS=lagoon.lagun.co,lon.lagun.co,per.lagun.co,nyc.lagun.co
+    volumes:
+      - ../target/release/lagoon:/usr/local/bin/lagoon:ro
+      - /usr/sbin/yggdrasil:/usr/sbin/yggdrasil:ro
+      - /usr/sbin/yggdrasilctl:/usr/sbin/yggdrasilctl:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+      - ./yggdrasil/lagoon.conf:/etc/yggdrasil/yggdrasil.conf:ro
+    ports:
+      - "19004:9001"   # Yggdrasil peering (host -> lagoon)
+      - "6667:6667"    # IRC (host -> lagoon — the flagship)
+
+  lon:
+    <<: *lagoon-base
+    container_name: lon
+    hostname: lon.lagun.co
+    environment:
+      - SITE_NAME=lon
+      - RUST_LOG=info
+      - LAGOON_PEERS=lagoon.lagun.co,lon.lagun.co,per.lagun.co,nyc.lagun.co
+    volumes:
+      - ../target/release/lagoon:/usr/local/bin/lagoon:ro
+      - /usr/sbin/yggdrasil:/usr/sbin/yggdrasil:ro
+      - /usr/sbin/yggdrasilctl:/usr/sbin/yggdrasilctl:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+      - ./yggdrasil/lon.conf:/etc/yggdrasil/yggdrasil.conf:ro
+    ports:
+      - "19001:9001"   # Yggdrasil peering (host -> lon)
+      - "16667:6667"   # IRC fallback (host -> lon via TCP)
+
+  per:
+    <<: *lagoon-base
+    container_name: per
+    hostname: per.lagun.co
+    environment:
+      - SITE_NAME=per
+      - RUST_LOG=info
+      - LAGOON_PEERS=lagoon.lagun.co,lon.lagun.co,per.lagun.co,nyc.lagun.co
+    volumes:
+      - ../target/release/lagoon:/usr/local/bin/lagoon:ro
+      - /usr/sbin/yggdrasil:/usr/sbin/yggdrasil:ro
+      - /usr/sbin/yggdrasilctl:/usr/sbin/yggdrasilctl:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+      - ./yggdrasil/per.conf:/etc/yggdrasil/yggdrasil.conf:ro
+    ports:
+      - "19002:9001"   # Yggdrasil peering (host -> per)
+      - "26667:6667"   # IRC fallback (host -> per via TCP)
+
+  nyc:
+    <<: *lagoon-base
+    container_name: nyc
+    hostname: nyc.lagun.co
+    environment:
+      - SITE_NAME=nyc
+      - RUST_LOG=info
+      - LAGOON_PEERS=lagoon.lagun.co,lon.lagun.co,per.lagun.co,nyc.lagun.co
+    volumes:
+      - ../target/release/lagoon:/usr/local/bin/lagoon:ro
+      - /usr/sbin/yggdrasil:/usr/sbin/yggdrasil:ro
+      - /usr/sbin/yggdrasilctl:/usr/sbin/yggdrasilctl:ro
+      - ./entrypoint.sh:/entrypoint.sh:ro
+      - ./yggdrasil/nyc.conf:/etc/yggdrasil/yggdrasil.conf:ro
+    ports:
+      - "19003:9001"   # Yggdrasil peering (host -> nyc)
+      - "36667:6667"   # IRC fallback (host -> nyc via TCP)
+
+networks:
+  mesh:
+    driver: bridge
+    enable_ipv6: true

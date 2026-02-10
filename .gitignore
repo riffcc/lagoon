@@ -24,3 +24,6 @@ target
 .claude
 CLAUDE.md
 .mcp.json
+
+# Yggdrasil private keys — NEVER commit these
+infra/yggdrasil/*.conf
