@@ -24,8 +24,6 @@ x-lagoon: &lagoon-base
     - ./entrypoint.sh:/entrypoint.sh:ro
   entrypoint: /entrypoint.sh
   restart: unless-stopped
-  networks:
-    - mesh
 
 services:
   lagoon:
@@ -35,6 +33,7 @@ services:
     environment:
       - SITE_NAME=lagoon
       - RUST_LOG=info
+      - LAGOON_IRC_BIND=[::]:6667
       - LAGOON_PEERS=lagoon.lagun.co,lon.lagun.co,per.lagun.co,nyc.lagun.co
     volumes:
       - ../target/release/lagoon:/usr/local/bin/lagoon:ro
@@ -44,7 +43,11 @@ services:
       - ./yggdrasil/lagoon.conf:/etc/yggdrasil/yggdrasil.conf:ro
     ports:
       - "19004:9001"   # Yggdrasil peering (host -> lagoon)
-      - "6667:6667"    # IRC (host -> lagoon — the flagship)
+      - "46667:6667"   # IRC (host -> lagoon — avoids gateway on 127.0.0.1:6667)
+    networks:
+      mesh:
+        aliases:
+          - lagoon.lagun.co
 
   lon:
     <<: *lagoon-base
@@ -53,6 +56,7 @@ services:
     environment:
       - SITE_NAME=lon
       - RUST_LOG=info
+      - LAGOON_IRC_BIND=[::]:6667
       - LAGOON_PEERS=lagoon.lagun.co,lon.lagun.co,per.lagun.co,nyc.lagun.co
     volumes:
       - ../target/release/lagoon:/usr/local/bin/lagoon:ro
@@ -63,6 +67,10 @@ services:
     ports:
       - "19001:9001"   # Yggdrasil peering (host -> lon)
       - "16667:6667"   # IRC fallback (host -> lon via TCP)
+    networks:
+      mesh:
+        aliases:
+          - lon.lagun.co
 
   per:
     <<: *lagoon-base
@@ -71,6 +79,7 @@ services:
     environment:
       - SITE_NAME=per
       - RUST_LOG=info
+      - LAGOON_IRC_BIND=[::]:6667
       - LAGOON_PEERS=lagoon.lagun.co,lon.lagun.co,per.lagun.co,nyc.lagun.co
     volumes:
       - ../target/release/lagoon:/usr/local/bin/lagoon:ro
@@ -81,6 +90,10 @@ services:
     ports:
       - "19002:9001"   # Yggdrasil peering (host -> per)
       - "26667:6667"   # IRC fallback (host -> per via TCP)
+    networks:
+      mesh:
+        aliases:
+          - per.lagun.co
 
   nyc:
     <<: *lagoon-base
@@ -89,6 +102,7 @@ services:
     environment:
       - SITE_NAME=nyc
       - RUST_LOG=info
+      - LAGOON_IRC_BIND=[::]:6667
       - LAGOON_PEERS=lagoon.lagun.co,lon.lagun.co,per.lagun.co,nyc.lagun.co
     volumes:
       - ../target/release/lagoon:/usr/local/bin/lagoon:ro
@@ -99,6 +113,10 @@ services:
     ports:
       - "19003:9001"   # Yggdrasil peering (host -> nyc)
       - "36667:6667"   # IRC fallback (host -> nyc via TCP)
+    networks:
+      mesh:
+        aliases:
+          - nyc.lagun.co
 
 networks:
   mesh:

@@ -15,7 +15,8 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 /// Server ports (mapped from Docker containers to localhost).
-const LAGOON_PORT: u16 = 6667;
+/// The lagoon container uses 46667 to avoid conflict with the gateway's 127.0.0.1:6667.
+const LAGOON_PORT: u16 = 46667;
 const LON_PORT: u16 = 16667;
 const PER_PORT: u16 = 26667;
 const NYC_PORT: u16 = 36667;
@@ -24,7 +25,6 @@ const NYC_PORT: u16 = 36667;
 struct TestClient {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
-    nick: String,
     lines: Vec<String>,
 }
 
@@ -41,7 +41,6 @@ impl TestClient {
         let mut client = Self {
             reader,
             writer,
-            nick: nick.to_string(),
             lines: Vec::new(),
         };
 

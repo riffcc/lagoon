@@ -20,11 +20,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut addrs: Vec<&str> = vec![bind_static];
 
     // Check for Yggdrasil interface.
-    if let Some(ygg_addr) = lagoon_server::irc::transport::detect_yggdrasil_addr() {
-        info!("detected Yggdrasil address: {ygg_addr}");
-        // Leak the string so we get a &'static str — this runs once at startup.
-        let addr: &'static str = Box::leak(format!("[{ygg_addr}]:6667").into_boxed_str());
-        addrs.push(addr);
+    // Skip if the primary bind is already a wildcard ([::] or 0.0.0.0) — it covers all addresses.
+    let is_wildcard = bind_static.starts_with("[::]:") || bind_static.starts_with("0.0.0.0:");
+    if !is_wildcard {
+        if let Some(ygg_addr) = lagoon_server::irc::transport::detect_yggdrasil_addr() {
+            info!("detected Yggdrasil address: {ygg_addr}");
+            // Leak the string so we get a &'static str — this runs once at startup.
+            let addr: &'static str = Box::leak(format!("[{ygg_addr}]:6667").into_boxed_str());
+            addrs.push(addr);
+        }
     }
 
     lagoon_server::irc::server::run(&addrs).await
