@@ -679,6 +679,35 @@ struct TaskChannel {
     pending: Vec<RelayCommand>,
 }
 
+/// Wait with exponential backoff while draining commands from the relay channel.
+///
+/// Returns `true` to continue reconnecting, `false` to exit (Shutdown or
+/// channel closed — the relay handle was removed from state).
+async fn backoff_drain(
+    cmd_rx: &mut mpsc::UnboundedReceiver<RelayCommand>,
+    saved_mesh_hello: &mut Option<String>,
+    failures: u32,
+) -> bool {
+    let secs = (2u64.pow(failures)).min(60);
+    let backoff = tokio::time::sleep(std::time::Duration::from_secs(secs));
+    tokio::pin!(backoff);
+    loop {
+        tokio::select! {
+            _ = &mut backoff => return true,
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(RelayCommand::Shutdown) => return false,
+                    Some(RelayCommand::MeshHello { json }) => {
+                        *saved_mesh_hello = Some(json);
+                    }
+                    Some(_) => {} // Drop other commands during backoff.
+                    None => return false, // Channel closed — relay handle removed.
+                }
+            }
+        }
+    }
+}
+
 /// The relay task — connects to a remote Lagoon server, registers, and
 /// relays messages bidirectionally for multiple channels using FRELAY.
 async fn relay_task(
@@ -688,22 +717,38 @@ async fn relay_task(
     transport_config: Arc<TransportConfig>,
 ) {
     let our_name = &*SERVER_NAME;
-    let mut relay_nick = if let Some(prefix) = our_name.split('.').next() {
+    let base_relay_nick = if let Some(prefix) = our_name.split('.').next() {
         format!("{prefix}~relay")
     } else {
         "lagoon~relay".into()
     };
-
     let our_suffix = format!("@{our_name}");
 
+    let max_attempts: u32 = 10;
+    let mut consecutive_failures: u32 = 0;
+    let mut saved_mesh_hello: Option<String> = None;
+
+    'reconnect: loop {
+    let mut relay_nick = base_relay_nick.clone();
+
     let stream = match transport::connect(&remote_host, &transport_config).await {
-        Ok(s) => s,
+        Ok(s) => {
+            consecutive_failures = 0;
+            s
+        }
         Err(e) => {
-            warn!(remote_host, "federation: failed to connect: {e}");
-            let _ = event_tx.send(RelayEvent::Disconnected {
-                remote_host,
-            });
-            return;
+            consecutive_failures += 1;
+            if consecutive_failures >= max_attempts {
+                warn!(remote_host, attempts = consecutive_failures,
+                    "federation: giving up after repeated connect failures: {e}");
+                break 'reconnect;
+            }
+            warn!(remote_host, attempt = consecutive_failures,
+                "federation: connect failed, will retry: {e}");
+            if !backoff_drain(&mut cmd_rx, &mut saved_mesh_hello, consecutive_failures).await {
+                return;
+            }
+            continue 'reconnect;
         }
     };
 
@@ -733,9 +778,17 @@ async fn relay_task(
             .await
             .is_err()
     {
-        warn!(remote_host, "federation: failed to send registration");
-        let _ = event_tx.send(RelayEvent::Disconnected { remote_host });
-        return;
+        consecutive_failures += 1;
+        if consecutive_failures >= max_attempts {
+            warn!(remote_host, "federation: giving up after registration failure");
+            break 'reconnect;
+        }
+        warn!(remote_host, attempt = consecutive_failures,
+            "federation: registration send failed, will retry");
+        if !backoff_drain(&mut cmd_rx, &mut saved_mesh_hello, consecutive_failures).await {
+            return;
+        }
+        continue 'reconnect;
     }
 
     info!(remote_host, "federation: registration sent, waiting for 001");
@@ -744,6 +797,11 @@ async fn relay_task(
     let mut channels: HashMap<String, TaskChannel> = HashMap::new();
     // Commands received before registration completes.
     let mut pre_reg_cmds: Vec<RelayCommand> = Vec::new();
+
+    // Re-queue saved MESH HELLO so it's sent after registration on reconnection.
+    if let Some(ref json) = saved_mesh_hello {
+        pre_reg_cmds.push(RelayCommand::MeshHello { json: json.clone() });
+    }
 
     // Keepalive: send PING every 30s to prevent proxy idle timeouts (Cloudflare: 60s).
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -1053,6 +1111,7 @@ async fn relay_task(
                         }
                     }
                     RelayCommand::MeshHello { json } => {
+                        saved_mesh_hello = Some(json.clone());
                         if registered {
                             let mesh_msg = Message {
                                 prefix: None,
@@ -1096,6 +1155,21 @@ async fn relay_task(
             }
         }
     }
+
+    // Inner loop broke — connection lost. Try to reconnect.
+    consecutive_failures += 1;
+    if consecutive_failures >= max_attempts {
+        warn!(remote_host, attempts = consecutive_failures,
+            "federation: giving up after repeated disconnections");
+        break 'reconnect;
+    }
+    info!(remote_host, attempt = consecutive_failures,
+        "federation: connection lost, will reconnect");
+    if !backoff_drain(&mut cmd_rx, &mut saved_mesh_hello, consecutive_failures).await {
+        return;
+    }
+
+    } // end 'reconnect loop
 
     let _ = event_tx.send(RelayEvent::Disconnected { remote_host });
 }
