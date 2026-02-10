@@ -1,0 +1,21 @@
+[package]
+name = "lagoon"
+version = "0.1.0"
+edition = "2024"
+authors = ["Riff Labs <hello@riff.cc>"]
+description = "Lagun's Lagoon - where you call home. A decentralized IRC server with mesh networking."
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/riffcc/lagoon"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+tokio-util = { version = "0.7.18", features = ["codec"] }
+bytes = "1.11.1"
+tokio-stream = "0.1.18"
+futures = "0.3.31"
+
+[dev-dependencies]
+pretty_assertions = "1"
