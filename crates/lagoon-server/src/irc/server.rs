@@ -20,6 +20,11 @@ use super::lens::LensIdentity;
 use super::message::Message;
 use super::transport::{self, TransportConfig};
 
+/// Normalize a string for case-insensitive IRC comparison (CASEMAPPING=ascii).
+pub(crate) fn irc_lower(s: &str) -> String {
+    s.to_ascii_lowercase()
+}
+
 /// Server identity — from `SERVER_NAME` env var, or system hostname at startup.
 pub static SERVER_NAME: LazyLock<String> = LazyLock::new(|| {
     std::env::var("SERVER_NAME")
@@ -222,6 +227,8 @@ pub struct ServerState {
     /// Persistent channel roles: channel name → (nick → prefix).
     /// Survives PART/QUIT — restored on rejoin.
     pub channel_roles: HashMap<String, HashMap<String, MemberPrefix>>,
+    /// Channel topics: channel name → (topic text, set_by nick, unix timestamp).
+    pub channel_topics: HashMap<String, (String, String, u64)>,
     /// Federation manager for `#room:server` relay connections.
     pub federation: FederationManager,
     /// Sender for federation relay events (relays send events here).
@@ -263,6 +270,7 @@ impl ServerState {
             clients: HashMap::new(),
             channels: HashMap::new(),
             channel_roles: HashMap::new(),
+            channel_topics: HashMap::new(),
             federation: FederationManager::new(),
             federation_event_tx,
             transport_config,
@@ -546,10 +554,22 @@ async fn handle_client(
                             let user = user.clone();
                             let realname = realname.clone();
 
-                            // Check for nick collision.
+                            // Enforce NICKLEN=30.
+                            if nick.len() > 30 {
+                                let err = Message {
+                                    prefix: Some(SERVER_NAME.clone()),
+                                    command: "432".into(),
+                                    params: vec!["*".into(), nick.clone(), "Erroneous nickname (too long)".into()],
+                                };
+                                framed.send(err).await?;
+                                pending.nick = None;
+                                continue;
+                            }
+
+                            // Check for nick collision (case-insensitive).
                             {
                                 let st = state.read().await;
-                                if st.clients.contains_key(&nick) {
+                                if st.clients.contains_key(&irc_lower(&nick)) {
                                     let err = Message {
                                         prefix: Some(SERVER_NAME.clone()),
                                         command: "433".into(),
@@ -561,10 +581,10 @@ async fn handle_client(
                                 }
                             }
 
-                            // Register the client.
+                            // Register the client (key is lowercased, nick preserves case).
                             {
                                 let mut st = state.write().await;
-                                st.clients.insert(nick.clone(), ClientHandle {
+                                st.clients.insert(irc_lower(&nick), ClientHandle {
                                     nick: nick.clone(),
                                     user: Some(user.clone()),
                                     realname: Some(realname.clone()),
@@ -572,7 +592,7 @@ async fn handle_client(
                                     tx: tx.clone(),
                                 });
                                 if user.starts_with("web~") {
-                                    st.mesh.web_clients.insert(nick.clone());
+                                    st.mesh.web_clients.insert(irc_lower(&nick));
                                     st.notify_topology_change();
                                 }
                             }
@@ -709,7 +729,22 @@ async fn send_welcome(
                 nick.into(),
                 "PREFIX=(qaov)~&@+".into(),
                 "CHANTYPES=#&".into(),
+                "CHANMODES=,,,o".into(),
+                "MODES=4".into(),
                 format!("NETWORK={}", *NETWORK_TAG),
+                "are supported by this server".into(),
+            ],
+        },
+        Message {
+            prefix: Some(SERVER_NAME.clone()),
+            command: "005".into(),
+            params: vec![
+                nick.into(),
+                "NICKLEN=30".into(),
+                "CHANNELLEN=50".into(),
+                "TOPICLEN=390".into(),
+                "KICKLEN=390".into(),
+                "CASEMAPPING=ascii".into(),
                 "are supported by this server".into(),
             ],
         },
@@ -795,13 +830,20 @@ async fn handle_command(
                         params: vec![nick.into(), "No nickname given".into()],
                     };
                     framed.send(err).await?;
-                } else if new_nick == nick {
-                    // Same nick — no-op.
+                } else if new_nick.len() > 30 {
+                    let err = Message {
+                        prefix: Some(SERVER_NAME.clone()),
+                        command: "432".into(),
+                        params: vec![nick.into(), new_nick.clone(), "Erroneous nickname (too long)".into()],
+                    };
+                    framed.send(err).await?;
+                } else if irc_lower(new_nick) == irc_lower(nick) {
+                    // Same nick (case-insensitive) — no-op.
                 } else {
                     let mut st = state.write().await;
 
-                    // Check for collision.
-                    if st.clients.contains_key(new_nick) {
+                    // Check for collision (case-insensitive).
+                    if st.clients.contains_key(&irc_lower(new_nick)) {
                         let err = Message {
                             prefix: Some(SERVER_NAME.clone()),
                             command: "433".into(),
@@ -821,10 +863,12 @@ async fn handle_command(
                         };
 
                         // Collect every user who shares a channel with us (deduplicated).
+                        let nick_key = irc_lower(nick);
+                        let new_nick_key = irc_lower(new_nick);
                         let mut notify: HashSet<String> = HashSet::new();
-                        notify.insert(nick.to_owned()); // notify self
+                        notify.insert(nick_key.clone()); // notify self
                         for (_ch, members) in &st.channels {
-                            if members.contains_key(nick) {
+                            if members.contains_key(&nick_key) {
                                 for member in members.keys() {
                                     notify.insert(member.clone());
                                 }
@@ -834,29 +878,29 @@ async fn handle_command(
                         broadcast(&st, &notify_list, &nick_msg);
 
                         // Update client handle.
-                        if let Some(mut handle) = st.clients.remove(nick) {
+                        if let Some(mut handle) = st.clients.remove(&nick_key) {
                             handle.nick = new_nick.clone();
-                            st.clients.insert(new_nick.clone(), handle);
+                            st.clients.insert(new_nick_key.clone(), handle);
                         }
 
                         // Update channel memberships.
                         for members in st.channels.values_mut() {
-                            if let Some(prefix) = members.remove(nick) {
-                                members.insert(new_nick.clone(), prefix);
+                            if let Some(prefix) = members.remove(&nick_key) {
+                                members.insert(new_nick_key.clone(), prefix);
                             }
                         }
 
                         // Transfer persistent roles.
                         for roles in st.channel_roles.values_mut() {
-                            if let Some(prefix) = roles.remove(nick) {
-                                roles.insert(new_nick.clone(), prefix);
+                            if let Some(prefix) = roles.remove(&nick_key) {
+                                roles.insert(new_nick_key.clone(), prefix);
                             }
                         }
 
                         // Update federation relay local_users.
                         for (_host, relay) in st.federation.relays.iter_mut() {
                             for (_local_ch, fed_ch) in relay.channels.iter_mut() {
-                                if fed_ch.local_users.remove(nick) {
+                                if fed_ch.local_users.remove(&nick_key) {
                                     let _ = relay.outgoing_tx.send(
                                         federation::RelayCommand::Part {
                                             nick: nick.to_owned(),
@@ -864,7 +908,7 @@ async fn handle_command(
                                             reason: format!("Nick changed to {new_nick}"),
                                         },
                                     );
-                                    fed_ch.local_users.insert(new_nick.clone());
+                                    fed_ch.local_users.insert(new_nick_key.clone());
                                     let _ = relay.outgoing_tx.send(
                                         federation::RelayCommand::Join {
                                             nick: new_nick.clone(),
@@ -876,8 +920,8 @@ async fn handle_command(
                         }
 
                         // Update web client tracking for topology.
-                        if st.mesh.web_clients.remove(nick) {
-                            st.mesh.web_clients.insert(new_nick.clone());
+                        if st.mesh.web_clients.remove(&nick_key) {
+                            st.mesh.web_clients.insert(new_nick_key);
                             st.notify_topology_change();
                         }
 
@@ -901,6 +945,21 @@ async fn handle_command(
                         continue;
                     }
 
+                    // Enforce CHANNELLEN=50.
+                    if channel.len() > 50 {
+                        let err = Message {
+                            prefix: Some(SERVER_NAME.clone()),
+                            command: "479".into(),
+                            params: vec![nick.into(), channel.clone(), "Channel name too long".into()],
+                        };
+                        framed.send(err).await?;
+                        continue;
+                    }
+
+                    // Normalize channel name for case-insensitive lookup.
+                    let channel = irc_lower(&channel);
+                    let nick_key = irc_lower(nick);
+
                     // Federated channel? Route through federation manager.
                     if let Some((remote_chan, remote_host)) =
                         federation::parse_federated_channel(&channel)
@@ -913,7 +972,7 @@ async fn handle_command(
                             if relay.channels.contains_key(&channel) {
                                 // Channel already tracked — just add user.
                                 let fed_ch = relay.channels.get_mut(&channel).unwrap();
-                                fed_ch.local_users.insert(nick.to_owned());
+                                fed_ch.local_users.insert(nick_key.clone());
                                 let _ = relay.outgoing_tx.send(
                                     federation::RelayCommand::Join {
                                         nick: nick.to_owned(),
@@ -923,7 +982,7 @@ async fn handle_command(
                             } else {
                                 // New channel on existing relay connection.
                                 let mut local_users = HashSet::new();
-                                local_users.insert(nick.to_owned());
+                                local_users.insert(nick_key.clone());
                                 relay.channels.insert(
                                     channel.clone(),
                                     FederatedChannel {
@@ -954,7 +1013,7 @@ async fn handle_command(
                                 Arc::clone(&st.transport_config),
                             );
                             let mut local_users = HashSet::new();
-                            local_users.insert(nick.to_owned());
+                            local_users.insert(nick_key.clone());
                             // Tell relay to join the channel (buffered until registered).
                             let _ = cmd_tx.send(federation::RelayCommand::JoinChannel {
                                 remote_channel: remote_chan.to_owned(),
@@ -988,8 +1047,11 @@ async fn handle_command(
 
                         let names = if let Some(relay) = st.federation.relays.get(remote_host) {
                             if let Some(fed_ch) = relay.channels.get(&channel) {
-                                let mut parts: Vec<String> =
-                                    fed_ch.local_users.iter().cloned().collect();
+                                let mut parts: Vec<String> = fed_ch
+                                    .local_users
+                                    .iter()
+                                    .map(|k| st.clients.get(k).map(|h| h.nick.clone()).unwrap_or_else(|| k.clone()))
+                                    .collect();
                                 for rn in &fed_ch.remote_users {
                                     if rn.contains('@') {
                                         parts.push(rn.clone());
@@ -1037,13 +1099,13 @@ async fn handle_command(
                         let prefix = st
                             .channel_roles
                             .get(&channel)
-                            .and_then(|r| r.get(nick).copied())
+                            .and_then(|r| r.get(&nick_key).copied())
                             .unwrap_or(MemberPrefix::Normal);
 
                         st.channels
                             .entry(channel.clone())
                             .or_default()
-                            .insert(nick.to_owned(), prefix);
+                            .insert(nick_key.clone(), prefix);
 
                         let join_msg = Message {
                             prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
@@ -1059,7 +1121,7 @@ async fn handle_command(
                             let other_nicks: Vec<_> = st
                                 .channels
                                 .get(&channel)
-                                .map(|m| m.keys().filter(|n| *n != nick).cloned().collect())
+                                .map(|m| m.keys().filter(|n| *n != &nick_key).cloned().collect())
                                 .unwrap_or_default();
 
                             broadcast(&st, &other_nicks, &join_msg);
@@ -1071,12 +1133,32 @@ async fn handle_command(
                             .map(|m| {
                                 m.iter()
                                     .filter(|(n, _)| !federation::is_relay_nick(n))
-                                    .map(|(n, p)| format!("{}{n}", p.symbol()))
+                                    .map(|(n, p)| {
+                                        let display = st.clients.get(n).map(|h| h.nick.as_str()).unwrap_or(n);
+                                        format!("{}{display}", p.symbol())
+                                    })
                                     .collect::<Vec<_>>()
                                     .join(" ")
                             })
                             .unwrap_or_default();
+                        let topic = st.channel_topics.get(&channel).cloned();
                         drop(st);
+
+                        // Send topic (332/333) if set.
+                        if let Some((text, set_by, timestamp)) = topic {
+                            let r332 = Message {
+                                prefix: Some(SERVER_NAME.clone()),
+                                command: "332".into(),
+                                params: vec![nick.into(), channel.clone(), text],
+                            };
+                            framed.send(r332).await?;
+                            let r333 = Message {
+                                prefix: Some(SERVER_NAME.clone()),
+                                command: "333".into(),
+                                params: vec![nick.into(), channel.clone(), set_by, timestamp.to_string()],
+                            };
+                            framed.send(r333).await?;
+                        }
 
                         let names_msg = Message {
                             prefix: Some(SERVER_NAME.clone()),
@@ -1101,11 +1183,13 @@ async fn handle_command(
         }
 
         "PART" => {
-            if let Some(channel) = msg.params.first() {
+            if let Some(raw_channel) = msg.params.first() {
+                let channel = irc_lower(raw_channel);
+                let nick_key = irc_lower(nick);
                 let reason = msg.params.get(1).cloned().unwrap_or_default();
 
                 if let Some((remote_chan, remote_host)) =
-                    federation::parse_federated_channel(channel)
+                    federation::parse_federated_channel(&channel)
                 {
                     // Federated channel — remove user, maybe tear down relay.
                     let mut st = state.write().await;
@@ -1115,7 +1199,7 @@ async fn handle_command(
                         .federation
                         .relays
                         .get(remote_host)
-                        .and_then(|r| r.channels.get(channel))
+                        .and_then(|r| r.channels.get(&channel))
                         .map(|fc| fc.local_users.iter().cloned().collect())
                         .unwrap_or_default();
 
@@ -1137,8 +1221,8 @@ async fn handle_command(
                             },
                         );
                         let mut remove_channel = false;
-                        if let Some(fed_ch) = relay.channels.get_mut(channel) {
-                            fed_ch.local_users.remove(nick);
+                        if let Some(fed_ch) = relay.channels.get_mut(&channel) {
+                            fed_ch.local_users.remove(&nick_key);
                             if fed_ch.local_users.is_empty() {
                                 let _ = relay.outgoing_tx.send(
                                     federation::RelayCommand::PartChannel {
@@ -1149,7 +1233,7 @@ async fn handle_command(
                             }
                         }
                         if remove_channel {
-                            relay.channels.remove(channel);
+                            relay.channels.remove(&channel);
                         }
                         if relay.channels.is_empty() && !relay.mesh_connected {
                             let _ = relay
@@ -1177,17 +1261,17 @@ async fn handle_command(
                             command: "PART".into(),
                             params: vec![channel.clone(), reason],
                         };
-                        if let Some(members) = st.channels.get(channel) {
+                        if let Some(members) = st.channels.get(&channel) {
                             let member_list: Vec<_> = members.keys().cloned().collect();
                             broadcast(&st, &member_list, &part_msg);
                         }
                     }
 
                     // Remove nick from channel.
-                    if let Some(members) = st.channels.get_mut(channel) {
-                        members.remove(nick);
+                    if let Some(members) = st.channels.get_mut(&channel) {
+                        members.remove(&nick_key);
                         if members.is_empty() {
-                            st.channels.remove(channel);
+                            st.channels.remove(&channel);
                         }
                     }
                 }
@@ -1197,11 +1281,13 @@ async fn handle_command(
         "PRIVMSG" | "NOTICE" => {
             if msg.params.len() >= 2 {
                 let target = &msg.params[0];
+                let target_lower = irc_lower(target);
+                let nick_key = irc_lower(nick);
                 let text = &msg.params[1];
 
                 if let Some((remote_chan, remote_host)) = {
                     if target.starts_with('#') || target.starts_with('&') {
-                        federation::parse_federated_channel(target)
+                        federation::parse_federated_channel(&target_lower)
                     } else {
                         None
                     }
@@ -1218,16 +1304,16 @@ async fn handle_command(
                             },
                         );
                         // Echo to other local users in the federated channel.
-                        if let Some(fed_ch) = relay.channels.get(target) {
+                        if let Some(fed_ch) = relay.channels.get(&target_lower) {
                             let echo = Message {
                                 prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
                                 command: msg.command.clone(),
-                                params: vec![target.clone(), text.clone()],
+                                params: vec![target_lower.clone(), text.clone()],
                             };
                             let others: Vec<_> = fed_ch
                                 .local_users
                                 .iter()
-                                .filter(|n| *n != nick)
+                                .filter(|n| *n != &nick_key)
                                 .cloned()
                                 .collect();
                             broadcast(&st, &others, &echo);
@@ -1238,13 +1324,13 @@ async fn handle_command(
                     let relay_msg = Message {
                         prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
                         command: msg.command.clone(),
-                        params: vec![target.clone(), text.clone()],
+                        params: vec![target_lower.clone(), text.clone()],
                     };
                     let st = state.read().await;
-                    if let Some(members) = st.channels.get(target) {
+                    if let Some(members) = st.channels.get(&target_lower) {
                         let others: Vec<_> = members
                             .keys()
-                            .filter(|n| *n != nick)
+                            .filter(|n| *n != &nick_key)
                             .cloned()
                             .collect();
                         broadcast(&st, &others, &relay_msg);
@@ -1300,7 +1386,7 @@ async fn handle_command(
                         params: vec![target.clone(), text.clone()],
                     };
                     let st = state.read().await;
-                    if let Some(handle) = st.clients.get(target) {
+                    if let Some(handle) = st.clients.get(&target_lower) {
                         let _ = handle.tx.send(relay_msg);
                     } else {
                         drop(st);
@@ -1316,39 +1402,159 @@ async fn handle_command(
         }
 
         "TOPIC" => {
-            if let Some(channel) = msg.params.first() {
-                // Just acknowledge — no persistent topic storage yet.
+            if let Some(raw_channel) = msg.params.first() {
+                let channel = irc_lower(raw_channel);
                 if msg.params.len() >= 2 {
-                    let topic = &msg.params[1];
+                    // Enforce TOPICLEN=390.
+                    let raw_topic = &msg.params[1];
+                    let topic: &str = if raw_topic.len() > 390 { &raw_topic[..390] } else { raw_topic };
                     let topic_msg = Message {
                         prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
                         command: "TOPIC".into(),
-                        params: vec![channel.clone(), topic.clone()],
+                        params: vec![channel.clone(), topic.to_owned()],
                     };
-                    let st = state.read().await;
-                    if let Some(members) = st.channels.get(channel) {
+                    let mut st = state.write().await;
+                    // Store the topic.
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    st.channel_topics.insert(
+                        channel.clone(),
+                        (topic.to_owned(), nick.to_owned(), now),
+                    );
+                    if let Some(members) = st.channels.get(&channel) {
                         let member_list: Vec<_> = members.keys().cloned().collect();
                         broadcast(&st, &member_list, &topic_msg);
                     }
                 } else {
-                    // No topic set.
-                    let reply = Message {
+                    // Topic query — return stored topic or 331.
+                    let st = state.read().await;
+                    if let Some((text, set_by, timestamp)) = st.channel_topics.get(&channel) {
+                        let r332 = Message {
+                            prefix: Some(SERVER_NAME.clone()),
+                            command: "332".into(),
+                            params: vec![nick.into(), channel.clone(), text.clone()],
+                        };
+                        let r333 = Message {
+                            prefix: Some(SERVER_NAME.clone()),
+                            command: "333".into(),
+                            params: vec![nick.into(), channel.clone(), set_by.clone(), timestamp.to_string()],
+                        };
+                        drop(st);
+                        framed.send(r332).await?;
+                        framed.send(r333).await?;
+                    } else {
+                        drop(st);
+                        let reply = Message {
+                            prefix: Some(SERVER_NAME.clone()),
+                            command: "331".into(),
+                            params: vec![nick.into(), channel.clone(), "No topic is set".into()],
+                        };
+                        framed.send(reply).await?;
+                    }
+                }
+            }
+        }
+
+        "KICK" => {
+            // KICK #channel target :reason
+            if msg.params.len() >= 2 {
+                let channel = irc_lower(&msg.params[0]);
+                let target_nick = &msg.params[1];
+                let target_key = irc_lower(target_nick);
+                let nick_key = irc_lower(nick);
+                let reason = msg.params.get(2).cloned().unwrap_or_else(|| nick.to_owned());
+                // Enforce KICKLEN=390.
+                let reason: String = if reason.len() > 390 { reason[..390].to_owned() } else { reason };
+
+                let mut st = state.write().await;
+
+                // Verify sender is in channel.
+                let sender_prefix = st
+                    .channels
+                    .get(&channel)
+                    .and_then(|m| m.get(&nick_key).copied());
+
+                let Some(sender_prefix) = sender_prefix else {
+                    drop(st);
+                    let err = Message {
                         prefix: Some(SERVER_NAME.clone()),
-                        command: "331".into(),
-                        params: vec![nick.into(), channel.clone(), "No topic is set".into()],
+                        command: "442".into(),
+                        params: vec![nick.into(), channel.clone(), "You're not on that channel".into()],
                     };
-                    framed.send(reply).await?;
+                    framed.send(err).await?;
+                    return Ok(CommandResult::Ok);
+                };
+
+                // Verify sender has Op+ privileges.
+                if sender_prefix < MemberPrefix::Op {
+                    drop(st);
+                    let err = Message {
+                        prefix: Some(SERVER_NAME.clone()),
+                        command: "482".into(),
+                        params: vec![nick.into(), channel.clone(), "You're not channel operator".into()],
+                    };
+                    framed.send(err).await?;
+                    return Ok(CommandResult::Ok);
+                }
+
+                // Verify target is in channel.
+                let target_in_channel = st
+                    .channels
+                    .get(&channel)
+                    .is_some_and(|m| m.contains_key(&target_key));
+
+                if !target_in_channel {
+                    // Get display nick for the error.
+                    let display_target = st.clients.get(&target_key)
+                        .map(|h| h.nick.clone())
+                        .unwrap_or_else(|| target_nick.clone());
+                    drop(st);
+                    let err = Message {
+                        prefix: Some(SERVER_NAME.clone()),
+                        command: "441".into(),
+                        params: vec![nick.into(), display_target, channel.clone(), "They aren't on that channel".into()],
+                    };
+                    framed.send(err).await?;
+                    return Ok(CommandResult::Ok);
+                }
+
+                // Get display nick for kick message.
+                let display_target = st.clients.get(&target_key)
+                    .map(|h| h.nick.clone())
+                    .unwrap_or_else(|| target_nick.clone());
+
+                // Broadcast KICK to all channel members (including the target).
+                let kick_msg = Message {
+                    prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
+                    command: "KICK".into(),
+                    params: vec![channel.clone(), display_target, reason],
+                };
+                if let Some(members) = st.channels.get(&channel) {
+                    let member_list: Vec<_> = members.keys().cloned().collect();
+                    broadcast(&st, &member_list, &kick_msg);
+                }
+
+                // Remove target from channel.
+                if let Some(members) = st.channels.get_mut(&channel) {
+                    members.remove(&target_key);
+                    if members.is_empty() {
+                        st.channels.remove(&channel);
+                    }
                 }
             }
         }
 
         "WHO" => {
-            if let Some(target) = msg.params.first() {
+            if let Some(raw_target) = msg.params.first() {
+                let target = irc_lower(raw_target);
                 let st = state.read().await;
                 if target.starts_with('#') || target.starts_with('&') {
                     // WHO for a channel — list local members (hide relay nicks).
-                    if let Some(members) = st.channels.get(target) {
-                        for (member, prefix) in members.iter().filter(|(n, _)| !federation::is_relay_nick(n)) {
+                    if let Some(members) = st.channels.get(&target) {
+                        for (member_key, prefix) in members.iter().filter(|(n, _)| !federation::is_relay_nick(n)) {
+                            let display = st.clients.get(member_key).map(|h| h.nick.as_str()).unwrap_or(member_key);
                             let flags = format!("H{}", prefix.symbol());
                             let reply = Message {
                                 prefix: Some(SERVER_NAME.clone()),
@@ -1356,12 +1562,12 @@ async fn handle_command(
                                 params: vec![
                                     nick.into(),
                                     target.clone(),
-                                    member.clone(),
+                                    display.to_owned(),
                                     "lagoon".into(),
                                     SERVER_NAME.clone(),
-                                    member.clone(),
+                                    display.to_owned(),
                                     flags,
-                                    format!("0 {member}"),
+                                    format!("0 {display}"),
                                 ],
                             };
                             framed.send(reply).await?;
@@ -1369,7 +1575,7 @@ async fn handle_command(
                     }
                     // Include remote users from federation relays.
                     for relay in st.federation.relays.values() {
-                        if let Some(fed_ch) = relay.channels.get(target) {
+                        if let Some(fed_ch) = relay.channels.get(&target) {
                             for rn in &fed_ch.remote_users {
                                 let display_nick = if rn.contains('@') {
                                     rn.clone()
@@ -1418,6 +1624,9 @@ async fn handle_command(
 
             for (channel, members) in &st.channels {
                 // RPL_LIST (322): channel, visible member count, topic
+                let topic_text = st.channel_topics.get(channel)
+                    .map(|(t, _, _)| t.clone())
+                    .unwrap_or_default();
                 let reply = Message {
                     prefix: Some(SERVER_NAME.clone()),
                     command: "322".into(),
@@ -1425,7 +1634,7 @@ async fn handle_command(
                         nick.into(),
                         channel.clone(),
                         members.len().to_string(),
-                        String::new(),
+                        topic_text,
                     ],
                 };
                 framed.send(reply).await?;
@@ -1442,18 +1651,19 @@ async fn handle_command(
         }
 
         "NAMES" => {
-            if let Some(channel) = msg.params.first() {
+            if let Some(raw_channel) = msg.params.first() {
+                let channel = irc_lower(raw_channel);
                 if let Some((_remote_chan, remote_host)) =
-                    federation::parse_federated_channel(channel)
+                    federation::parse_federated_channel(&channel)
                 {
                     // Federated channel — combine local + remote users.
                     let st = state.read().await;
                     let names = if let Some(relay) = st.federation.relays.get(remote_host) {
-                        if let Some(fed_ch) = relay.channels.get(channel) {
+                        if let Some(fed_ch) = relay.channels.get(&channel) {
                             let mut parts: Vec<String> = fed_ch
                                 .local_users
                                 .iter()
-                                .cloned()
+                                .map(|k| st.clients.get(k).map(|h| h.nick.clone()).unwrap_or_else(|| k.clone()))
                                 .collect();
                             for rn in &fed_ch.remote_users {
                                 if rn.contains('@') {
@@ -1489,11 +1699,14 @@ async fn handle_command(
                     let st = state.read().await;
                     let names = st
                         .channels
-                        .get(channel)
+                        .get(&channel)
                         .map(|m| {
                             m.iter()
                                 .filter(|(n, _)| !federation::is_relay_nick(n))
-                                .map(|(n, p)| format!("{}{n}", p.symbol()))
+                                .map(|(n, p)| {
+                                    let display = st.clients.get(n).map(|h| h.nick.as_str()).unwrap_or(n);
+                                    format!("{}{display}", p.symbol())
+                                })
                                 .collect::<Vec<_>>()
                                 .join(" ")
                         })
@@ -1518,17 +1731,20 @@ async fn handle_command(
         }
 
         "MODE" => {
-            if let Some(target) = msg.params.first() {
+            if let Some(raw_target) = msg.params.first() {
+                let target = irc_lower(raw_target);
                 if target.starts_with('#') || target.starts_with('&') {
                     if msg.params.len() >= 3 {
                         // Channel mode change — apply if sender is op or owner.
                         let mode_str = &msg.params[1];
                         let mode_target = &msg.params[2];
+                        let mode_target_key = irc_lower(mode_target);
+                        let nick_key = irc_lower(nick);
                         let st = state.read().await;
                         let sender_prefix = st
                             .channels
-                            .get(target)
-                            .and_then(|m| m.get(nick).copied())
+                            .get(&target)
+                            .and_then(|m| m.get(&nick_key).copied())
                             .unwrap_or(MemberPrefix::Normal);
                         drop(st);
 
@@ -1543,8 +1759,8 @@ async fn handle_command(
                             };
                             if let Some(prefix) = new_prefix {
                                 let mut st = state.write().await;
-                                if let Some(members) = st.channels.get_mut(target) {
-                                    if let Some(p) = members.get_mut(mode_target) {
+                                if let Some(members) = st.channels.get_mut(&target) {
+                                    if let Some(p) = members.get_mut(&mode_target_key) {
                                         *p = prefix;
                                     }
                                 }
@@ -1552,7 +1768,7 @@ async fn handle_command(
                                 st.channel_roles
                                     .entry(target.clone())
                                     .or_default()
-                                    .insert(mode_target.clone(), prefix);
+                                    .insert(mode_target_key, prefix);
                                 // Broadcast MODE change.
                                 let mode_msg = Message {
                                     prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
@@ -1563,7 +1779,7 @@ async fn handle_command(
                                         mode_target.clone(),
                                     ],
                                 };
-                                if let Some(members) = st.channels.get(target) {
+                                if let Some(members) = st.channels.get(&target) {
                                     let member_list: Vec<_> =
                                         members.keys().cloned().collect();
                                     broadcast(&st, &member_list, &mode_msg);
@@ -1628,10 +1844,13 @@ async fn handle_command(
                 let sub_cmd = &msg.params[0];
                 let origin_nick = &msg.params[1];
                 let origin_host = &msg.params[2];
-                let channel = &msg.params[3];
+                let raw_channel = &msg.params[3];
+                let channel = irc_lower(raw_channel);
+                let nick_key = irc_lower(nick);
 
                 // Build the virtual nick: nick@origin_host
                 let virtual_nick = format!("{origin_nick}@{origin_host}");
+                let virtual_nick_key = irc_lower(&virtual_nick);
                 let virtual_prefix =
                     format!("{virtual_nick}!{origin_nick}@{origin_host}");
 
@@ -1644,10 +1863,10 @@ async fn handle_command(
                                 params: vec![channel.clone(), text.clone()],
                             };
                             let st = state.read().await;
-                            if let Some(members) = st.channels.get(channel) {
+                            if let Some(members) = st.channels.get(&channel) {
                                 let others: Vec<_> = members
                                     .keys()
-                                    .filter(|n| *n != nick)
+                                    .filter(|n| *n != &nick_key)
                                     .cloned()
                                     .collect();
                                 broadcast(&st, &others, &relay_msg);
@@ -1661,11 +1880,11 @@ async fn handle_command(
                             params: vec![channel.clone()],
                         };
                         let mut st = state.write().await;
-                        if let Some(members) = st.channels.get_mut(channel) {
-                            members.insert(virtual_nick.clone(), MemberPrefix::Normal);
+                        if let Some(members) = st.channels.get_mut(&channel) {
+                            members.insert(virtual_nick_key.clone(), MemberPrefix::Normal);
                             let others: Vec<_> = members
                                 .keys()
-                                .filter(|n| *n != nick && *n != &virtual_nick)
+                                .filter(|n| *n != &nick_key && *n != &virtual_nick_key)
                                 .cloned()
                                 .collect();
                             broadcast(&st, &others, &join_msg);
@@ -1681,33 +1900,33 @@ async fn handle_command(
                         let mut st = state.write().await;
                         let others: Vec<_> = st
                             .channels
-                            .get(channel)
+                            .get(&channel)
                             .map(|members| {
                                 members
                                     .keys()
-                                    .filter(|n| *n != nick && *n != &virtual_nick)
+                                    .filter(|n| *n != &nick_key && *n != &virtual_nick_key)
                                     .cloned()
                                     .collect()
                             })
                             .unwrap_or_default();
                         broadcast(&st, &others, &part_msg);
                         // Remove virtual user from channel membership.
-                        if let Some(members) = st.channels.get_mut(channel) {
-                            members.remove(&virtual_nick);
+                        if let Some(members) = st.channels.get_mut(&channel) {
+                            members.remove(&virtual_nick_key);
                         }
                     }
                     "DM" => {
                         // FRELAY DM <sender> <origin_host> <target_nick> :<text>
-                        // channel (params[3]) is repurposed as target_nick.
-                        let target_nick = channel; // params[3]
+                        // channel (params[3]) is repurposed as target_nick (already lowered).
+                        let target_key = &channel;
                         if let Some(text) = msg.params.get(4) {
-                            let dm_msg = Message {
-                                prefix: Some(virtual_prefix),
-                                command: "PRIVMSG".into(),
-                                params: vec![target_nick.clone(), text.clone()],
-                            };
                             let st = state.read().await;
-                            if let Some(handle) = st.clients.get(target_nick) {
+                            if let Some(handle) = st.clients.get(target_key) {
+                                let dm_msg = Message {
+                                    prefix: Some(virtual_prefix),
+                                    command: "PRIVMSG".into(),
+                                    params: vec![handle.nick.clone(), text.clone()],
+                                };
                                 let _ = handle.tx.send(dm_msg);
                             }
                         }
@@ -1718,10 +1937,12 @@ async fn handle_command(
         }
 
         "WHOIS" => {
-            if let Some(target) = msg.params.last() {
+            if let Some(raw_target) = msg.params.last() {
+                let target_key = irc_lower(raw_target);
                 let st = state.read().await;
-                if let Some(handle) = st.clients.get(target) {
-                    let user = handle.user.as_deref().unwrap_or(target);
+                if let Some(handle) = st.clients.get(&target_key) {
+                    let display_nick = &handle.nick;
+                    let user = handle.user.as_deref().unwrap_or(display_nick);
                     let realname = handle.realname.as_deref().unwrap_or("");
                     // 311 RPL_WHOISUSER
                     let r311 = Message {
@@ -1729,7 +1950,7 @@ async fn handle_command(
                         command: "311".into(),
                         params: vec![
                             nick.into(),
-                            target.clone(),
+                            display_nick.clone(),
                             user.into(),
                             "lagoon".into(),
                             "*".into(),
@@ -1743,7 +1964,7 @@ async fn handle_command(
                         command: "312".into(),
                         params: vec![
                             nick.into(),
-                            target.clone(),
+                            display_nick.clone(),
                             SERVER_NAME.clone(),
                             DISPLAY_NAME.clone(),
                         ],
@@ -1752,7 +1973,7 @@ async fn handle_command(
                     // 319 RPL_WHOISCHANNELS
                     let mut chans = Vec::new();
                     for (ch_name, members) in &st.channels {
-                        if let Some(prefix) = members.get(target) {
+                        if let Some(prefix) = members.get(&target_key) {
                             chans.push(format!("{}{ch_name}", prefix.symbol()));
                         }
                     }
@@ -1760,7 +1981,7 @@ async fn handle_command(
                         let r319 = Message {
                             prefix: Some(SERVER_NAME.clone()),
                             command: "319".into(),
-                            params: vec![nick.into(), target.clone(), chans.join(" ")],
+                            params: vec![nick.into(), display_nick.clone(), chans.join(" ")],
                         };
                         framed.send(r319).await?;
                     }
@@ -1769,7 +1990,7 @@ async fn handle_command(
                     let err = Message {
                         prefix: Some(SERVER_NAME.clone()),
                         command: "401".into(),
-                        params: vec![nick.into(), target.clone(), "No such nick/channel".into()],
+                        params: vec![nick.into(), raw_target.clone(), "No such nick/channel".into()],
                     };
                     framed.send(err).await?;
                 }
@@ -1778,7 +1999,7 @@ async fn handle_command(
                 let r318 = Message {
                     prefix: Some(SERVER_NAME.clone()),
                     command: "318".into(),
-                    params: vec![nick.into(), target.clone(), "End of /WHOIS list".into()],
+                    params: vec![nick.into(), raw_target.clone(), "End of /WHOIS list".into()],
                 };
                 framed.send(r318).await?;
             }
@@ -2301,6 +2522,7 @@ pub fn broadcast(state: &ServerState, nicks: &[String], msg: &Message) {
 
 /// Clean up when a client disconnects.
 async fn cleanup_client(nick: &str, state: &SharedState) {
+    let nick_key = irc_lower(nick);
     let mut st = state.write().await;
 
     // Relay nicks are invisible — suppress QUIT broadcast.
@@ -2313,9 +2535,9 @@ async fn cleanup_client(nick: &str, state: &SharedState) {
 
         let mut notified: HashSet<String> = HashSet::new();
         for (_channel, members) in st.channels.iter() {
-            if members.contains_key(nick) {
+            if members.contains_key(&nick_key) {
                 for member in members.keys() {
-                    if member != nick && !notified.contains(member) {
+                    if *member != nick_key && !notified.contains(member) {
                         if let Some(handle) = st.clients.get(member) {
                             let _ = handle.tx.send(quit_msg.clone());
                         }
@@ -2328,7 +2550,7 @@ async fn cleanup_client(nick: &str, state: &SharedState) {
 
     // Remove from all local channels.
     st.channels.retain(|_name, members| {
-        members.remove(nick);
+        members.remove(&nick_key);
         !members.is_empty()
     });
 
@@ -2337,7 +2559,7 @@ async fn cleanup_client(nick: &str, state: &SharedState) {
     for (host, relay) in st.federation.relays.iter_mut() {
         let mut empty_channels = Vec::new();
         for (local_ch, fed_ch) in relay.channels.iter_mut() {
-            if fed_ch.local_users.remove(nick) {
+            if fed_ch.local_users.remove(&nick_key) {
                 let _ = relay.outgoing_tx.send(federation::RelayCommand::Part {
                     nick: nick.to_owned(),
                     remote_channel: fed_ch.remote_channel.clone(),
@@ -2368,10 +2590,10 @@ async fn cleanup_client(nick: &str, state: &SharedState) {
     }
 
     // Remove from clients.
-    st.clients.remove(nick);
+    st.clients.remove(&nick_key);
 
     // Remove from web client tracking if applicable.
-    if st.mesh.web_clients.remove(nick) {
+    if st.mesh.web_clients.remove(&nick_key) {
         st.notify_topology_change();
     }
 

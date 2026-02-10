@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 use super::message::Message;
-use super::server::{broadcast, ClientHandle, MemberPrefix, SharedState};
+use super::server::{broadcast, irc_lower, ClientHandle, MemberPrefix, SharedState};
 
 const BOT_NICK: &str = "LagoonBot";
 
@@ -15,10 +15,11 @@ pub async fn spawn(state: SharedState) {
     let (tx, rx) = mpsc::unbounded_channel::<Message>();
 
     // Register bot as a virtual client and join #lagoon.
+    let bot_key = irc_lower(BOT_NICK);
     {
         let mut st = state.write().await;
         st.clients.insert(
-            BOT_NICK.into(),
+            bot_key.clone(),
             ClientHandle {
                 nick: BOT_NICK.into(),
                 user: Some("bot".into()),
@@ -32,7 +33,7 @@ pub async fn spawn(state: SharedState) {
         st.channels
             .entry("#lagoon".into())
             .or_default()
-            .insert(BOT_NICK.into(), MemberPrefix::Op);
+            .insert(bot_key.clone(), MemberPrefix::Op);
     }
 
     // Broadcast JOIN to anyone already in #lagoon.
@@ -46,7 +47,7 @@ pub async fn spawn(state: SharedState) {
         if let Some(members) = st.channels.get("#lagoon") {
             let others: Vec<_> = members
                 .keys()
-                .filter(|n| *n != BOT_NICK)
+                .filter(|n| **n != bot_key)
                 .cloned()
                 .collect();
             broadcast(&st, &others, &join_msg);
@@ -75,9 +76,9 @@ async fn handle_irc_message(msg: &Message, state: &SharedState) {
         "JOIN" => {
             // When a user JOINs #lagoon, promote to Owner if no owner exists yet.
             if let Some(channel) = msg.params.first() {
-                if channel == "#lagoon" {
+                if irc_lower(channel) == "#lagoon" {
                     if let Some(ref nick) = sender_nick {
-                        if nick != BOT_NICK && !super::federation::is_relay_nick(nick) {
+                        if irc_lower(nick) != irc_lower(BOT_NICK) && !super::federation::is_relay_nick(nick) {
                             let has_owner = {
                                 let st = state.read().await;
                                 st.channel_roles
@@ -100,7 +101,7 @@ async fn handle_irc_message(msg: &Message, state: &SharedState) {
             let target = msg.params.first().map(|s| s.as_str()).unwrap_or("");
 
             // Respond to !help in channels, or any DM to the bot.
-            let is_dm = target == BOT_NICK;
+            let is_dm = irc_lower(target) == irc_lower(BOT_NICK);
             let is_help = text.starts_with("!help");
 
             if is_dm || is_help {
@@ -130,6 +131,7 @@ const HELP_LINES: &[&str] = &[
 ];
 
 async fn send_help(target: &str, state: &SharedState) {
+    let target_key = irc_lower(target);
     let st = state.read().await;
     for line in HELP_LINES {
         let help_msg = Message {
@@ -139,13 +141,13 @@ async fn send_help(target: &str, state: &SharedState) {
         };
         if target.starts_with('#') || target.starts_with('&') {
             // Channel message — broadcast to all members.
-            if let Some(members) = st.channels.get(target) {
+            if let Some(members) = st.channels.get(&target_key) {
                 let member_list: Vec<_> = members.keys().cloned().collect();
                 broadcast(&st, &member_list, &help_msg);
             }
         } else {
             // DM — send to the user directly.
-            if let Some(handle) = st.clients.get(target) {
+            if let Some(handle) = st.clients.get(&target_key) {
                 let _ = handle.tx.send(help_msg);
             }
         }
@@ -154,10 +156,12 @@ async fn send_help(target: &str, state: &SharedState) {
 
 /// Promote a nick to Owner (~) in a channel and broadcast the MODE change.
 async fn promote_owner(nick: &str, channel: &str, state: &SharedState) {
+    let nick_key = irc_lower(nick);
+    let channel_key = irc_lower(channel);
     {
         let mut st = state.write().await;
-        if let Some(members) = st.channels.get_mut(channel) {
-            if let Some(prefix) = members.get_mut(nick) {
+        if let Some(members) = st.channels.get_mut(&channel_key) {
+            if let Some(prefix) = members.get_mut(&nick_key) {
                 if *prefix < MemberPrefix::Owner {
                     *prefix = MemberPrefix::Owner;
                 }
@@ -165,9 +169,9 @@ async fn promote_owner(nick: &str, channel: &str, state: &SharedState) {
         }
         // Persist to channel_roles so ownership survives disconnect.
         st.channel_roles
-            .entry(channel.into())
+            .entry(channel_key.clone())
             .or_default()
-            .insert(nick.into(), MemberPrefix::Owner);
+            .insert(nick_key, MemberPrefix::Owner);
     }
 
     // Broadcast MODE +q to the channel.
@@ -178,7 +182,7 @@ async fn promote_owner(nick: &str, channel: &str, state: &SharedState) {
     };
 
     let st = state.read().await;
-    if let Some(members) = st.channels.get(channel) {
+    if let Some(members) = st.channels.get(&channel_key) {
         let member_list: Vec<_> = members.keys().cloned().collect();
         broadcast(&st, &member_list, &mode_msg);
     }
