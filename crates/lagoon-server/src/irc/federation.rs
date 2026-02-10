@@ -468,18 +468,64 @@ pub fn spawn_event_processor(
                         "mesh: received HELLO"
                     );
 
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+
+                    // Determine transport hints from our config for this peer.
+                    let (peer_port, peer_tls) = st
+                        .transport_config
+                        .peers
+                        .get(&remote_host)
+                        .map(|p| (p.port, p.tls))
+                        .unwrap_or((6667, false));
+
                     st.mesh.known_peers.insert(
                         lens_id.clone(),
                         MeshPeerInfo {
                             lens_id: lens_id.clone(),
                             server_name: server_name.clone(),
                             public_key_hex,
+                            port: peer_port,
+                            tls: peer_tls,
+                            last_seen: now,
                         },
                     );
                     st.mesh
                         .connections
                         .insert(lens_id, MeshConnectionState::Connected);
                     st.notify_topology_change();
+
+                    // Send MESH PEERS to the newly connected peer.
+                    let peers_list: Vec<MeshPeerInfo> =
+                        st.mesh.known_peers.values().cloned().collect();
+                    if !peers_list.is_empty() {
+                        if let Ok(peers_json) = serde_json::to_string(&peers_list) {
+                            if let Some(relay) = st.federation.relays.get(&remote_host) {
+                                let _ =
+                                    relay.outgoing_tx.send(RelayCommand::Raw(Message {
+                                        prefix: None,
+                                        command: "MESH".into(),
+                                        params: vec!["PEERS".into(), peers_json],
+                                    }));
+                            }
+                        }
+                    }
+
+                    // Send MESH TOPOLOGY — our full mesh view.
+                    let topo_snapshot = st.build_mesh_snapshot();
+                    if let Some(relay) = st.federation.relays.get(&remote_host) {
+                        if let Ok(topo_json) = serde_json::to_string(&topo_snapshot)
+                        {
+                            let _ =
+                                relay.outgoing_tx.send(RelayCommand::Raw(Message {
+                                    prefix: None,
+                                    command: "MESH".into(),
+                                    params: vec!["TOPOLOGY".into(), topo_json],
+                                }));
+                        }
+                    }
                 }
 
                 RelayEvent::MeshPeers {
@@ -488,6 +534,8 @@ pub fn spawn_event_processor(
                 } => {
                     let mut st = state.write().await;
                     let mut changed = false;
+                    let mut new_peer_servers = Vec::new();
+
                     for peer in peers {
                         if st.mesh.defederated.contains(&peer.lens_id)
                             || st.mesh.defederated.contains(&peer.server_name)
@@ -502,23 +550,104 @@ pub fn spawn_event_processor(
                                 remote_host,
                                 peer_id = %peer.lens_id,
                                 server = %peer.server_name,
+                                port = peer.port,
+                                tls = peer.tls,
                                 "mesh: discovered peer via gossip"
                             );
+                            let server_name = peer.server_name.clone();
+                            let port = peer.port;
+                            let tls = peer.tls;
                             st.mesh.known_peers.insert(peer.lens_id.clone(), peer);
                             changed = true;
+                            new_peer_servers.push((server_name, port, tls));
                         }
                     }
                     if changed {
                         st.notify_topology_change();
                     }
+
+                    // Auto-connect to newly discovered peers.
+                    if !new_peer_servers.is_empty() {
+                        let hello_json =
+                            serde_json::to_string(&MeshHelloPayload {
+                                peer_id: st.lens.peer_id.clone(),
+                                server_name: st.lens.server_name.clone(),
+                                public_key_hex: st.lens.public_key_hex.clone(),
+                            })
+                            .unwrap_or_default();
+                        let event_tx = st.federation_event_tx.clone();
+                        let tc = st.transport_config.clone();
+
+                        for (server_name, port, tls) in new_peer_servers {
+                            // Skip if we already have a relay to this server.
+                            if st.federation.relays.contains_key(&server_name) {
+                                continue;
+                            }
+                            // Skip self.
+                            if server_name == *SERVER_NAME {
+                                continue;
+                            }
+                            // Skip defederated.
+                            if st.mesh.defederated.contains(&server_name) {
+                                continue;
+                            }
+
+                            info!(
+                                peer = %server_name,
+                                port,
+                                tls,
+                                "mesh: auto-connecting to gossip-discovered peer"
+                            );
+
+                            // Add transport hints for this peer so connect() knows
+                            // how to reach it.
+                            let mut tc_with_peer =
+                                (*tc).clone();
+                            tc_with_peer.peers.entry(server_name.clone()).or_insert(
+                                transport::PeerEntry {
+                                    yggdrasil_addr: None,
+                                    port,
+                                    tls,
+                                },
+                            );
+                            let tc_arc = Arc::new(tc_with_peer);
+
+                            let (cmd_tx, task_handle) = spawn_relay(
+                                server_name.clone(),
+                                event_tx.clone(),
+                                tc_arc,
+                            );
+                            let _ = cmd_tx.send(RelayCommand::MeshHello {
+                                json: hello_json.clone(),
+                            });
+
+                            st.federation.relays.insert(
+                                server_name.clone(),
+                                RelayHandle {
+                                    outgoing_tx: cmd_tx,
+                                    remote_host: server_name,
+                                    channels: HashMap::new(),
+                                    task_handle,
+                                    mesh_connected: true,
+                                },
+                            );
+                        }
+                    }
                 }
 
                 RelayEvent::MeshTopology {
-                    remote_host: _,
-                    json: _,
+                    remote_host,
+                    json,
                 } => {
-                    // Topology reports are informational — we build our own view.
-                    // Future: could use for multi-hop discovery.
+                    if let Ok(snapshot) =
+                        serde_json::from_str::<super::server::MeshSnapshot>(&json)
+                    {
+                        let mut st = state.write().await;
+                        st.mesh
+                            .remote_topologies
+                            .insert(remote_host, snapshot);
+                        st.notify_topology_change();
+                    }
                 }
             }
         }
@@ -616,8 +745,25 @@ async fn relay_task(
     // Commands received before registration completes.
     let mut pre_reg_cmds: Vec<RelayCommand> = Vec::new();
 
+    // Keepalive: send PING every 30s to prevent proxy idle timeouts (Cloudflare: 60s).
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
+    // Skip the first immediate tick.
+    keepalive.tick().await;
+
     loop {
         tokio::select! {
+            _ = keepalive.tick() => {
+                if registered {
+                    let ping = Message {
+                        prefix: None,
+                        command: "PING".into(),
+                        params: vec![our_name.to_string()],
+                    };
+                    if framed.send(ping).await.is_err() {
+                        break;
+                    }
+                }
+            }
             frame = framed.next() => {
                 let msg = match frame {
                     Some(Ok(msg)) => msg,

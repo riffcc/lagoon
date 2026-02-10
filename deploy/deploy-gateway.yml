@@ -43,7 +43,7 @@
 
     - !shell
       name: Extract web frontend
-      cmd: rm -rf {{ lagoon_web_dir }}/web/dist/* && tar xzf /tmp/lagoon-web-dist.tar.gz -C {{ lagoon_web_dir }}/web/dist/ && rm /tmp/lagoon-web-dist.tar.gz
+      cmd: rm -rf {{ lagoon_web_dir }}/web/dist/* && tar xzf /tmp/lagoon-web-dist.tar.gz --strip-components=1 -C {{ lagoon_web_dir }}/web/dist/ && rm /tmp/lagoon-web-dist.tar.gz
       with:
         sudo: root
 

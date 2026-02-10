@@ -98,6 +98,32 @@ pub struct MeshPeerInfo {
     pub server_name: String,
     /// Hex-encoded ed25519 public key.
     pub public_key_hex: String,
+    /// Port the peer listens on (default 6667).
+    #[serde(default = "default_peer_port")]
+    pub port: u16,
+    /// Whether the peer uses TLS/WSS (default false).
+    #[serde(default)]
+    pub tls: bool,
+    /// Unix timestamp of last contact with this peer.
+    #[serde(default)]
+    pub last_seen: u64,
+}
+
+fn default_peer_port() -> u16 {
+    6667
+}
+
+impl Default for MeshPeerInfo {
+    fn default() -> Self {
+        Self {
+            lens_id: String::new(),
+            server_name: String::new(),
+            public_key_hex: String::new(),
+            port: 6667,
+            tls: false,
+            last_seen: 0,
+        }
+    }
 }
 
 /// Connection state for a mesh peer.
@@ -120,6 +146,8 @@ pub struct MeshState {
     pub defederated: HashSet<String>,
     /// Currently connected web gateway users (nicks with `web~` ident).
     pub web_clients: HashSet<String>,
+    /// Remote peers' topology snapshots — for debug composite view.
+    pub remote_topologies: HashMap<String, MeshSnapshot>,
 }
 
 impl MeshState {
@@ -129,12 +157,13 @@ impl MeshState {
             connections: HashMap::new(),
             defederated: HashSet::new(),
             web_clients: HashSet::new(),
+            remote_topologies: HashMap::new(),
         }
     }
 }
 
 /// A single node in a mesh topology snapshot.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct MeshNodeReport {
     pub lens_id: String,
     pub server_name: String,
@@ -144,14 +173,14 @@ pub struct MeshNodeReport {
 }
 
 /// A single link in a mesh topology snapshot.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct MeshLinkReport {
     pub source: String,
     pub target: String,
 }
 
 /// Complete mesh topology snapshot — pushed via watch channel.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct MeshSnapshot {
     pub self_lens_id: String,
     pub self_server_name: String,
@@ -170,6 +199,17 @@ impl MeshSnapshot {
             timestamp: 0,
         }
     }
+}
+
+/// Debug view of the full mesh — local view, each peer's view, and merged global view.
+#[derive(Debug, Clone, Serialize)]
+pub struct MeshDebugSnapshot {
+    /// Our own topology view.
+    pub local: MeshSnapshot,
+    /// Each connected peer's reported topology (server_name → snapshot).
+    pub peer_views: HashMap<String, MeshSnapshot>,
+    /// Merged global view — all unique nodes and links across all perspectives.
+    pub global: MeshSnapshot,
 }
 
 /// Shared server state.
@@ -297,6 +337,50 @@ impl ServerState {
             nodes,
             links,
             timestamp: now,
+        }
+    }
+
+    /// Build a debug topology snapshot with composite view from all peers.
+    pub fn build_debug_snapshot(&self) -> MeshDebugSnapshot {
+        let local = self.build_mesh_snapshot();
+
+        // Merge all perspectives into a global view.
+        let mut all_nodes: HashMap<String, MeshNodeReport> = HashMap::new();
+        let mut all_links: HashSet<(String, String)> = HashSet::new();
+
+        // Add our own view.
+        for node in &local.nodes {
+            all_nodes.entry(node.lens_id.clone()).or_insert_with(|| node.clone());
+        }
+        for link in &local.links {
+            all_links.insert((link.source.clone(), link.target.clone()));
+        }
+
+        // Merge each remote peer's view.
+        for snapshot in self.mesh.remote_topologies.values() {
+            for node in &snapshot.nodes {
+                all_nodes.entry(node.lens_id.clone()).or_insert_with(|| node.clone());
+            }
+            for link in &snapshot.links {
+                all_links.insert((link.source.clone(), link.target.clone()));
+            }
+        }
+
+        let global = MeshSnapshot {
+            self_lens_id: self.lens.peer_id.clone(),
+            self_server_name: self.lens.server_name.clone(),
+            nodes: all_nodes.into_values().collect(),
+            links: all_links
+                .into_iter()
+                .map(|(source, target)| MeshLinkReport { source, target })
+                .collect(),
+            timestamp: local.timestamp,
+        };
+
+        MeshDebugSnapshot {
+            local,
+            peer_views: self.mesh.remote_topologies.clone(),
+            global,
         }
     }
 
@@ -1732,13 +1816,44 @@ async fn handle_command(
                                 "server_name": st.lens.server_name,
                                 "public_key_hex": st.lens.public_key_hex,
                             });
+
+                            // Collect peer list for MESH PEERS exchange.
+                            let peers_list: Vec<MeshPeerInfo> =
+                                st.mesh.known_peers.values().cloned().collect();
+
+                            // Collect topology snapshot for MESH TOPOLOGY exchange.
+                            let topo_snapshot = st.build_mesh_snapshot();
+
                             drop(st);
+
                             let reply = Message {
                                 prefix: Some(SERVER_NAME.clone()),
                                 command: "MESH".into(),
                                 params: vec!["HELLO".into(), our_hello.to_string()],
                             };
                             framed.send(reply).await?;
+
+                            // Send MESH PEERS — share our known peer list.
+                            if !peers_list.is_empty() {
+                                if let Ok(peers_json) = serde_json::to_string(&peers_list) {
+                                    let peers_msg = Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "MESH".into(),
+                                        params: vec!["PEERS".into(), peers_json],
+                                    };
+                                    framed.send(peers_msg).await?;
+                                }
+                            }
+
+                            // Send MESH TOPOLOGY — our full mesh view.
+                            if let Ok(topo_json) = serde_json::to_string(&topo_snapshot) {
+                                let topo_msg = Message {
+                                    prefix: Some(SERVER_NAME.clone()),
+                                    command: "MESH".into(),
+                                    params: vec!["TOPOLOGY".into(), topo_json],
+                                };
+                                framed.send(topo_msg).await?;
+                            }
                         }
                     }
                     "PEERS" => {

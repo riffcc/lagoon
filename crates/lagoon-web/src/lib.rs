@@ -34,6 +34,7 @@ fn build_router(state: AppState) -> Router {
         .route("/api/federation/ws", get(bridge::federation_ws_handler))
         // Topology endpoints
         .route("/api/topology", get(topology::get_topology))
+        .route("/api/topology/debug", get(topology::get_topology_debug))
         .route("/api/topology/ws", get(topology::topology_ws))
         // Invite endpoints
         .route("/api/invite/create", post(invites::create_invite))

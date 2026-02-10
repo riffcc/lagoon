@@ -81,6 +81,7 @@ async fn mesh_state_tracks_peers() {
                 lens_id: peer_id.peer_id.clone(),
                 server_name: "peer.lagun.co".into(),
                 public_key_hex: peer_id.public_key_hex.clone(),
+                ..Default::default()
             },
         );
         st.mesh
@@ -112,6 +113,7 @@ async fn topology_snapshot_includes_self_and_peers() {
                 lens_id: peer1.peer_id.clone(),
                 server_name: "peer1.lagun.co".into(),
                 public_key_hex: peer1.public_key_hex.clone(),
+                ..Default::default()
             },
         );
         st.mesh
@@ -124,6 +126,7 @@ async fn topology_snapshot_includes_self_and_peers() {
                 lens_id: peer2.peer_id.clone(),
                 server_name: "peer2.lagun.co".into(),
                 public_key_hex: peer2.public_key_hex.clone(),
+                ..Default::default()
             },
         );
         st.mesh
@@ -290,6 +293,7 @@ async fn defederation_blocks_peer() {
                 lens_id: peer.peer_id.clone(),
                 server_name: "blocked.lagun.co".into(),
                 public_key_hex: peer.public_key_hex.clone(),
+                ..Default::default()
             },
         );
         st.mesh
@@ -433,6 +437,7 @@ async fn mesh_snapshot_watch_channel_updates() {
                 lens_id: peer.peer_id.clone(),
                 server_name: "dynamic.lagun.co".into(),
                 public_key_hex: peer.public_key_hex.clone(),
+                ..Default::default()
             },
         );
         st.mesh
@@ -625,6 +630,7 @@ async fn duplicate_server_names_unique_nodes() {
                 lens_id: cdn1.peer_id.clone(),
                 server_name: "lagun.co".into(),
                 public_key_hex: cdn1.public_key_hex.clone(),
+                ..Default::default()
             },
         );
         st.mesh
@@ -637,6 +643,7 @@ async fn duplicate_server_names_unique_nodes() {
                 lens_id: cdn2.peer_id.clone(),
                 server_name: "lagun.co".into(),
                 public_key_hex: cdn2.public_key_hex.clone(),
+                ..Default::default()
             },
         );
         st.mesh
@@ -739,6 +746,7 @@ async fn disconnect_cleans_up_connection_state() {
                 lens_id: peer.peer_id.clone(),
                 server_name: "remote.lagun.co".into(),
                 public_key_hex: peer.public_key_hex.clone(),
+                ..Default::default()
             },
         );
         st.mesh

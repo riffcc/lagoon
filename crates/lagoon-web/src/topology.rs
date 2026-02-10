@@ -6,7 +6,7 @@ use axum::{
     response::IntoResponse,
 };
 
-use lagoon_server::irc::server::MeshSnapshot;
+use lagoon_server::irc::server::{MeshDebugSnapshot, MeshSnapshot};
 
 use crate::state::AppState;
 
@@ -17,6 +17,15 @@ pub async fn get_topology(
     let watch = state.mesh_watch.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let snapshot = watch.borrow().clone();
     Ok(Json(snapshot))
+}
+
+/// GET /api/topology/debug — composite view with local, peer, and global topology.
+pub async fn get_topology_debug(
+    State(state): State<AppState>,
+) -> Result<Json<MeshDebugSnapshot>, StatusCode> {
+    let irc_state = state.irc_state.as_ref().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let st = irc_state.read().await;
+    Ok(Json(st.build_debug_snapshot()))
 }
 
 /// GET /api/topology/ws — WebSocket that pushes MeshSnapshot on every change.

@@ -151,6 +151,12 @@ function parseIrcLine(line) {
       const chan = params[0]
       ensureChannel(chan)
       channels.get(chan).messages.push({ time: now, nick, text: 'has joined', type: 'event' })
+      // Add to member list.
+      const joinUsers = channels.get(chan).users
+      if (!joinUsers.includes(nick)) {
+        joinUsers.push(nick)
+        joinUsers.sort((a, b) => a.replace(/^[~&@%+]/, '').localeCompare(b.replace(/^[~&@%+]/, '')))
+      }
       if (nick === props.username && !activeChannel.value) {
         activeChannel.value = chan
       }
@@ -161,6 +167,10 @@ function parseIrcLine(line) {
       const chan = params[0]
       if (channels.has(chan)) {
         channels.get(chan).messages.push({ time: now, nick, text: params[1] || 'has left', type: 'event' })
+        // Remove from member list (match with or without prefix).
+        const partUsers = channels.get(chan).users
+        const partIdx = partUsers.findIndex(u => u.replace(/^[~&@%+]/, '') === nick)
+        if (partIdx !== -1) partUsers.splice(partIdx, 1)
       }
       break
     }
@@ -168,7 +178,26 @@ function parseIrcLine(line) {
     case 'QUIT': {
       const reason = params[0] || 'Quit'
       for (const [, ch] of channels) {
-        ch.messages.push({ time: now, nick, text: `has quit (${reason})`, type: 'event' })
+        // Remove from all channel member lists.
+        const quitIdx = ch.users.findIndex(u => u.replace(/^[~&@%+]/, '') === nick)
+        if (quitIdx !== -1) {
+          ch.users.splice(quitIdx, 1)
+          ch.messages.push({ time: now, nick, text: `has quit (${reason})`, type: 'event' })
+        }
+      }
+      break
+    }
+
+    case 'NICK': {
+      const newNick = params[0]
+      for (const [, ch] of channels) {
+        const nickIdx = ch.users.findIndex(u => u.replace(/^[~&@%+]/, '') === nick)
+        if (nickIdx !== -1) {
+          // Preserve prefix (e.g. @, +) when renaming.
+          const prefix = ch.users[nickIdx].match(/^[~&@%+]/)?.[0] || ''
+          ch.users[nickIdx] = prefix + newNick
+          ch.messages.push({ time: now, nick, text: `is now known as ${newNick}`, type: 'event' })
+        }
       }
       break
     }
