@@ -439,6 +439,64 @@ async fn handle_command(
             }
         }
 
+        "WHO" => {
+            if let Some(target) = msg.params.first() {
+                let st = state.read().await;
+                if target.starts_with('#') || target.starts_with('&') {
+                    // WHO for a channel — list members.
+                    if let Some(members) = st.channels.get(target) {
+                        for member in members {
+                            let reply = Message {
+                                prefix: Some(SERVER_NAME.into()),
+                                command: "352".into(),
+                                params: vec![
+                                    nick.into(),
+                                    target.clone(),
+                                    member.clone(),
+                                    "lagoon".into(),
+                                    SERVER_NAME.into(),
+                                    member.clone(),
+                                    "H :0".into(),
+                                    member.clone(),
+                                ],
+                            };
+                            framed.send(reply).await?;
+                        }
+                    }
+                }
+                drop(st);
+                // End of WHO.
+                let end = Message {
+                    prefix: Some(SERVER_NAME.into()),
+                    command: "315".into(),
+                    params: vec![nick.into(), target.clone(), "End of /WHO list".into()],
+                };
+                framed.send(end).await?;
+            }
+        }
+
+        "MODE" => {
+            if let Some(target) = msg.params.first() {
+                if target.starts_with('#') || target.starts_with('&') {
+                    // Channel mode query — return empty mode.
+                    let reply = Message {
+                        prefix: Some(SERVER_NAME.into()),
+                        command: "324".into(),
+                        params: vec![nick.into(), target.clone(), "+".into()],
+                    };
+                    framed.send(reply).await?;
+                } else {
+                    // User mode query.
+                    let reply = Message {
+                        prefix: Some(SERVER_NAME.into()),
+                        command: "221".into(),
+                        params: vec![nick.into(), "+".into()],
+                    };
+                    framed.send(reply).await?;
+                }
+            }
+        }
+
         "QUIT" => {
             return Ok(true);
         }
