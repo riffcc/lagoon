@@ -1,0 +1,100 @@
+---
+- name: Deploy Lagoon Gateway (lon.lagun.co)
+  groups:
+    - lagoon-gateway
+  ssh_user: wings
+
+  tasks:
+    - !shell
+      name: Set FQDN hostname
+      cmd: hostnamectl set-hostname {{ fqdn }}
+      with:
+        sudo: root
+
+    - !shell
+      name: Create directories
+      cmd: mkdir -p /var/lib/lagoon {{ lagoon_web_dir }}/web/dist
+      with:
+        sudo: root
+
+    - !shell
+      name: Stop existing gateway service if running
+      cmd: systemctl stop lagoon-web || true
+      with:
+        sudo: root
+
+    - !copy
+      name: Deploy lagoon-web binary
+      src: lagoon-web
+      dest: "{{ lagoon_web_binary_dest }}"
+      attributes:
+        owner: root
+        group: root
+        mode: "0o755"
+      with:
+        sudo: root
+
+    - !copy
+      name: Upload web frontend archive
+      src: lagoon-web-dist.tar.gz
+      dest: /tmp/lagoon-web-dist.tar.gz
+      attributes:
+        mode: "0o644"
+
+    - !shell
+      name: Extract web frontend
+      cmd: rm -rf {{ lagoon_web_dir }}/web/dist/* && tar xzf /tmp/lagoon-web-dist.tar.gz -C {{ lagoon_web_dir }}/web/dist/ && rm /tmp/lagoon-web-dist.tar.gz
+      with:
+        sudo: root
+
+    - !shell
+      name: Install systemd unit with resolved variables
+      cmd: |
+        cat > /etc/systemd/system/lagoon-web.service << 'UNIT'
+        [Unit]
+        Description=Lagoon Gateway (embedded IRC + Web)
+        After=network-online.target haproxy.service
+        Wants=network-online.target
+
+        [Service]
+        Type=simple
+        ExecStart=/usr/local/bin/lagoon-web
+        WorkingDirectory=/opt/lagoon-web
+        Environment=LAGOON_EMBEDDED=1
+        Environment=SERVER_NAME={{ server_name }}
+        Environment=LAGOON_WEB_NO_TLS=1
+        Environment=LAGOON_WEB_ADDR=127.0.0.1:8080
+        Environment=LAGOON_IRC_BIND=127.0.0.1:6667
+        Environment=LAGOON_IRC_ADDR=127.0.0.1:6667
+        Environment=LAGOON_PEERS={{ lagoon_peers }}
+        Environment=LAGOON_DATA_DIR=/var/lib/lagoon
+        Environment=RUST_LOG=info
+        Restart=on-failure
+        RestartSec=5
+
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
+      with:
+        sudo: root
+
+    - !shell
+      name: Reload systemd daemon
+      cmd: systemctl daemon-reload
+      with:
+        sudo: root
+
+    - !sd_service
+      name: Enable and start gateway
+      service: lagoon-web
+      enabled: "true"
+      started: "true"
+      restart: "true"
+      with:
+        sudo: root
+
+    - !shell
+      name: Verify gateway is listening
+      cmd: ss -tlnp | grep ':8080'
+      with:
+        sudo: root

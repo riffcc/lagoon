@@ -1,0 +1,23 @@
+[Unit]
+Description=Lagoon Gateway (embedded IRC + Web)
+After=network-online.target haproxy.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/lagoon-web
+WorkingDirectory=/opt/lagoon-web
+Environment=LAGOON_EMBEDDED=1
+Environment=SERVER_NAME={{ server_name }}
+Environment=LAGOON_WEB_NO_TLS=1
+Environment=LAGOON_WEB_ADDR=127.0.0.1:8080
+Environment=LAGOON_IRC_BIND=127.0.0.1:6667
+Environment=LAGOON_IRC_ADDR=127.0.0.1:6667
+Environment=LAGOON_PEERS=aus.lagun.co:443,nyc.lagun.co:443
+Environment=LAGOON_DATA_DIR=/var/lib/lagoon
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

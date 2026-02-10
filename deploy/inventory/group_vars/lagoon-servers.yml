@@ -1,0 +1,4 @@
+lagoon_port: 6667
+lagoon_binary_dest: /usr/local/bin/lagoon
+lagoon_service_file: /etc/systemd/system/lagoon.service
+rust_log: info

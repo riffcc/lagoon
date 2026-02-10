@@ -1,0 +1,21 @@
+[Unit]
+Description=Lagoon Web Gateway
+After=network-online.target lagoon.service
+Wants=network-online.target
+Requires=lagoon.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/lagoon-web
+WorkingDirectory=/opt/lagoon-web
+Environment=RUST_LOG=info
+Environment=LAGOON_IRC_ADDR=127.0.0.1:6667
+Environment=LAGOON_WEB_RP_ID=%H
+Environment=LAGOON_WEB_ORIGIN=https://%H:8443
+Environment=LAGOON_WEB_ADDR=0.0.0.0:8443
+Environment=LAGOON_WEB_TLS_DIR=/opt/lagoon-web/tls
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

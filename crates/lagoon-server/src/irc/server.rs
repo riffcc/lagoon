@@ -1,25 +1,36 @@
 /// IRC server core — state management, client handling, command dispatch.
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 
 use futures::SinkExt;
+use serde::Serialize;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
+use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::codec::Framed;
 use tracing::{info, warn};
 
 use super::codec::IrcCodec;
 use super::federation::{self, FederatedChannel, FederationManager, RelayEvent};
+use super::invite::InviteStore;
+use super::lens::LensIdentity;
 use super::message::Message;
+use super::transport::{self, TransportConfig};
 
-/// Server identity — derived from system hostname at startup.
+/// Server identity — from `SERVER_NAME` env var, or system hostname at startup.
 pub static SERVER_NAME: LazyLock<String> = LazyLock::new(|| {
-    hostname::get()
+    std::env::var("SERVER_NAME")
         .ok()
-        .and_then(|h| h.into_string().ok())
-        .filter(|h| h.contains('.'))
+        .filter(|s| s.contains('.'))
+        .or_else(|| {
+            hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .filter(|h| h.contains('.'))
+        })
         .unwrap_or_else(|| "lagoon.lagun.co".into())
 });
 
@@ -78,6 +89,89 @@ impl MemberPrefix {
     }
 }
 
+/// Information about a known mesh peer.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct MeshPeerInfo {
+    /// Lens PeerID (`"b3b3/{hex}"`).
+    pub lens_id: String,
+    /// The peer's server name (e.g. `"per.lagun.co"`).
+    pub server_name: String,
+    /// Hex-encoded ed25519 public key.
+    pub public_key_hex: String,
+}
+
+/// Connection state for a mesh peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum MeshConnectionState {
+    /// We know about this peer but aren't connected.
+    Known,
+    /// We have an active relay connection to this peer.
+    Connected,
+}
+
+/// Mesh networking state — tracks known peers and their connections.
+#[derive(Debug)]
+pub struct MeshState {
+    /// Known peers: LensID → peer info.
+    pub known_peers: HashMap<String, MeshPeerInfo>,
+    /// Connection state per lens_id (NOT server_name — multiple peers may share a name).
+    pub connections: HashMap<String, MeshConnectionState>,
+    /// Defederated LensIDs or server names — blocked from mesh.
+    pub defederated: HashSet<String>,
+    /// Currently connected web gateway users (nicks with `web~` ident).
+    pub web_clients: HashSet<String>,
+}
+
+impl MeshState {
+    pub fn new() -> Self {
+        Self {
+            known_peers: HashMap::new(),
+            connections: HashMap::new(),
+            defederated: HashSet::new(),
+            web_clients: HashSet::new(),
+        }
+    }
+}
+
+/// A single node in a mesh topology snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct MeshNodeReport {
+    pub lens_id: String,
+    pub server_name: String,
+    pub is_self: bool,
+    pub connected: bool,
+    pub node_type: String,
+}
+
+/// A single link in a mesh topology snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct MeshLinkReport {
+    pub source: String,
+    pub target: String,
+}
+
+/// Complete mesh topology snapshot — pushed via watch channel.
+#[derive(Debug, Clone, Serialize)]
+pub struct MeshSnapshot {
+    pub self_lens_id: String,
+    pub self_server_name: String,
+    pub nodes: Vec<MeshNodeReport>,
+    pub links: Vec<MeshLinkReport>,
+    pub timestamp: u64,
+}
+
+impl MeshSnapshot {
+    pub fn empty() -> Self {
+        Self {
+            self_lens_id: String::new(),
+            self_server_name: String::new(),
+            nodes: Vec::new(),
+            links: Vec::new(),
+            timestamp: 0,
+        }
+    }
+}
+
 /// Shared server state.
 #[derive(Debug)]
 pub struct ServerState {
@@ -92,6 +186,18 @@ pub struct ServerState {
     pub federation: FederationManager,
     /// Sender for federation relay events (relays send events here).
     pub federation_event_tx: mpsc::UnboundedSender<RelayEvent>,
+    /// Transport configuration for federation relay connections.
+    pub transport_config: Arc<TransportConfig>,
+    /// This server's cryptographic identity.
+    pub lens: Arc<LensIdentity>,
+    /// Mesh networking state.
+    pub mesh: MeshState,
+    /// Topology watch channel — updated on every mesh change.
+    pub mesh_topology_tx: watch::Sender<MeshSnapshot>,
+    /// Invite code store.
+    pub invites: InviteStore,
+    /// Data directory for persistence.
+    pub data_dir: PathBuf,
 }
 
 /// Handle to send messages to a connected client.
@@ -105,33 +211,160 @@ pub struct ClientHandle {
 }
 
 impl ServerState {
-    pub fn new(federation_event_tx: mpsc::UnboundedSender<RelayEvent>) -> Self {
+    pub fn new(
+        federation_event_tx: mpsc::UnboundedSender<RelayEvent>,
+        transport_config: Arc<TransportConfig>,
+        lens: Arc<LensIdentity>,
+        mesh_topology_tx: watch::Sender<MeshSnapshot>,
+        data_dir: PathBuf,
+    ) -> Self {
+        let invites = InviteStore::load_or_create(&data_dir);
         Self {
             clients: HashMap::new(),
             channels: HashMap::new(),
             channel_roles: HashMap::new(),
             federation: FederationManager::new(),
             federation_event_tx,
+            transport_config,
+            lens,
+            mesh: MeshState::new(),
+            mesh_topology_tx,
+            invites,
+            data_dir,
         }
+    }
+
+    /// Build a mesh topology snapshot from current state.
+    pub fn build_mesh_snapshot(&self) -> MeshSnapshot {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let mut nodes = Vec::new();
+        let mut links = Vec::new();
+
+        // Add self.
+        nodes.push(MeshNodeReport {
+            lens_id: self.lens.peer_id.clone(),
+            server_name: self.lens.server_name.clone(),
+            is_self: true,
+            connected: true,
+            node_type: "server".into(),
+        });
+
+        // Add known peers.
+        for (lens_id, peer_info) in &self.mesh.known_peers {
+            let connected = self
+                .mesh
+                .connections
+                .get(lens_id)
+                .copied()
+                == Some(MeshConnectionState::Connected);
+            nodes.push(MeshNodeReport {
+                lens_id: lens_id.clone(),
+                server_name: peer_info.server_name.clone(),
+                is_self: false,
+                connected,
+                node_type: "server".into(),
+            });
+            if connected {
+                links.push(MeshLinkReport {
+                    source: self.lens.peer_id.clone(),
+                    target: lens_id.clone(),
+                });
+            }
+        }
+
+        // Add web gateway clients.
+        for web_nick in &self.mesh.web_clients {
+            nodes.push(MeshNodeReport {
+                lens_id: format!("web/{web_nick}"),
+                server_name: self.lens.server_name.clone(),
+                is_self: false,
+                connected: true,
+                node_type: "browser".into(),
+            });
+            links.push(MeshLinkReport {
+                source: self.lens.peer_id.clone(),
+                target: format!("web/{web_nick}"),
+            });
+        }
+
+        MeshSnapshot {
+            self_lens_id: self.lens.peer_id.clone(),
+            self_server_name: self.lens.server_name.clone(),
+            nodes,
+            links,
+            timestamp: now,
+        }
+    }
+
+    /// Update the topology watch channel with current state.
+    pub fn notify_topology_change(&self) {
+        let snapshot = self.build_mesh_snapshot();
+        let _ = self.mesh_topology_tx.send(snapshot);
     }
 }
 
 /// Shared, thread-safe server state.
 pub type SharedState = Arc<RwLock<ServerState>>;
 
-/// Run the IRC server on the given addresses.
+/// Start the IRC server, returning the shared state and task handles.
 ///
-/// Binds to every address in the slice and accepts connections on all of them.
-/// This enables dual-stack: TCP on `0.0.0.0:6667` + Yggdrasil on `[200:...]:6667`.
-pub async fn run(addrs: &[&str]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// This is the library entry point for embedding the IRC server in another
+/// process (e.g. lagoon-web). The caller owns the state and can subscribe
+/// to the mesh topology watch channel.
+pub async fn start(
+    addrs: &[&str],
+) -> Result<(SharedState, watch::Receiver<MeshSnapshot>, Vec<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>>), Box<dyn std::error::Error + Send + Sync>> {
+    let transport_config = Arc::new(transport::build_config());
     let (event_tx, event_rx) = mpsc::unbounded_channel::<RelayEvent>();
-    let state: SharedState = Arc::new(RwLock::new(ServerState::new(event_tx)));
+
+    // Load or create Lens identity.
+    let data_dir = PathBuf::from(
+        std::env::var("LAGOON_DATA_DIR").unwrap_or_else(|_| "./lagoon-data".to_string()),
+    );
+    let lens = Arc::new(super::lens::load_or_create(&data_dir, &SERVER_NAME));
+    info!(
+        peer_id = %lens.peer_id,
+        server_name = %lens.server_name,
+        "lens identity active"
+    );
+
+    let (topology_tx, topology_rx) = watch::channel(MeshSnapshot::empty());
+
+    let state: SharedState = Arc::new(RwLock::new(ServerState::new(
+        event_tx,
+        transport_config.clone(),
+        Arc::clone(&lens),
+        topology_tx,
+        data_dir,
+    )));
+
+    // Load defederated peers.
+    {
+        let mut st = state.write().await;
+        let defed_path = st.data_dir.join("defederated.json");
+        if defed_path.exists() {
+            if let Ok(json) = std::fs::read_to_string(&defed_path) {
+                if let Ok(set) = serde_json::from_str::<HashSet<String>>(&json) {
+                    st.mesh.defederated = set;
+                    info!(count = st.mesh.defederated.len(), "loaded defederated peers");
+                }
+            }
+        }
+        st.notify_topology_change();
+    }
 
     // Spawn federation event processor.
     federation::spawn_event_processor(Arc::clone(&state), event_rx);
 
     // Spawn LagoonBot.
     super::bot::spawn(Arc::clone(&state)).await;
+
+    // Spawn mesh connector — proactively connects to all LAGOON_PEERS.
+    federation::spawn_mesh_connector(Arc::clone(&state), transport_config);
 
     // Bind all listeners first, so we fail fast on port conflicts.
     let mut listeners = Vec::with_capacity(addrs.len());
@@ -147,6 +380,16 @@ pub async fn run(addrs: &[&str]) -> Result<(), Box<dyn std::error::Error + Send 
         let state = Arc::clone(&state);
         handles.push(tokio::spawn(accept_loop(listener, state)));
     }
+
+    Ok((state, topology_rx, handles))
+}
+
+/// Run the IRC server on the given addresses.
+///
+/// Binds to every address in the slice and accepts connections on all of them.
+/// This enables dual-stack: TCP on `0.0.0.0:6667` + Yggdrasil on `[200:...]:6667`.
+pub async fn run(addrs: &[&str]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (_state, _topology_rx, handles) = start(addrs).await?;
 
     // Wait for any listener to exit (they shouldn't).
     for handle in handles {
@@ -244,6 +487,10 @@ async fn handle_client(
                                     addr,
                                     tx: tx.clone(),
                                 });
+                                if user.starts_with("web~") {
+                                    st.mesh.web_clients.insert(nick.clone());
+                                    st.notify_topology_change();
+                                }
                             }
 
                             // Send welcome numerics.
@@ -484,7 +731,7 @@ async fn handle_command(
                         framed.send(err).await?;
                     } else {
                         let nick_msg = Message {
-                            prefix: Some(format!("{nick}!{nick}@lagoon")),
+                            prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
                             command: "NICK".into(),
                             params: vec![new_nick.clone()],
                         };
@@ -542,6 +789,12 @@ async fn handle_command(
                                     );
                                 }
                             }
+                        }
+
+                        // Update web client tracking for topology.
+                        if st.mesh.web_clients.remove(nick) {
+                            st.mesh.web_clients.insert(new_nick.clone());
+                            st.notify_topology_change();
                         }
 
                         drop(st);
@@ -614,6 +867,7 @@ async fn handle_command(
                             let (cmd_tx, task_handle) = federation::spawn_relay(
                                 remote_host.to_owned(),
                                 event_tx,
+                                Arc::clone(&st.transport_config),
                             );
                             let mut local_users = HashSet::new();
                             local_users.insert(nick.to_owned());
@@ -643,6 +897,7 @@ async fn handle_command(
                                     remote_host: remote_host.to_owned(),
                                     channels,
                                     task_handle,
+                                    mesh_connected: false,
                                 },
                             );
                         }
@@ -668,7 +923,7 @@ async fn handle_command(
                         drop(st);
 
                         let join_msg = Message {
-                            prefix: Some(format!("{nick}!{nick}@lagoon")),
+                            prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
                             command: "JOIN".into(),
                             params: vec![channel.clone()],
                         };
@@ -706,62 +961,8 @@ async fn handle_command(
                             .or_default()
                             .insert(nick.to_owned(), prefix);
 
-                        // Auto-federation: ensure relays to all peers for this channel.
-                        if !federation::is_relay_nick(nick) && !federation::PEERS.is_empty() {
-                            for peer in federation::PEERS.iter() {
-                                if !st.federation.relays.contains_key(peer) {
-                                    let event_tx = st.federation_event_tx.clone();
-                                    let (cmd_tx, task_handle) =
-                                        federation::spawn_relay(peer.clone(), event_tx);
-                                    let _ = cmd_tx.send(
-                                        federation::RelayCommand::JoinChannel {
-                                            remote_channel: channel.clone(),
-                                            local_channel: channel.clone(),
-                                        },
-                                    );
-                                    let mut channels = HashMap::new();
-                                    channels.insert(
-                                        channel.clone(),
-                                        FederatedChannel {
-                                            remote_channel: channel.clone(),
-                                            local_users: HashSet::new(),
-                                            remote_users: HashSet::new(),
-                                        },
-                                    );
-                                    st.federation.relays.insert(
-                                        peer.clone(),
-                                        federation::RelayHandle {
-                                            outgoing_tx: cmd_tx,
-                                            remote_host: peer.clone(),
-                                            channels,
-                                            task_handle,
-                                        },
-                                    );
-                                } else {
-                                    let relay =
-                                        st.federation.relays.get_mut(peer).unwrap();
-                                    if !relay.channels.contains_key(&channel) {
-                                        relay.channels.insert(
-                                            channel.clone(),
-                                            FederatedChannel {
-                                                remote_channel: channel.clone(),
-                                                local_users: HashSet::new(),
-                                                remote_users: HashSet::new(),
-                                            },
-                                        );
-                                        let _ = relay.outgoing_tx.send(
-                                            federation::RelayCommand::JoinChannel {
-                                                remote_channel: channel.clone(),
-                                                local_channel: channel.clone(),
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
                         let join_msg = Message {
-                            prefix: Some(format!("{nick}!{nick}@lagoon")),
+                            prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
                             command: "JOIN".into(),
                             params: vec![channel.clone()],
                         };
@@ -780,8 +981,17 @@ async fn handle_command(
                             broadcast(&st, &other_nicks, &join_msg);
                         }
 
-                        let names =
-                            federation::build_channel_names(&st, &channel);
+                        let names = st
+                            .channels
+                            .get(&channel)
+                            .map(|m| {
+                                m.iter()
+                                    .filter(|(n, _)| !federation::is_relay_nick(n))
+                                    .map(|(n, p)| format!("{}{n}", p.symbol()))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            })
+                            .unwrap_or_default();
                         drop(st);
 
                         let names_msg = Message {
@@ -826,7 +1036,7 @@ async fn handle_command(
                         .unwrap_or_default();
 
                     let part_msg = Message {
-                        prefix: Some(format!("{nick}!{nick}@lagoon")),
+                        prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
                         command: "PART".into(),
                         params: vec![channel.clone(), reason.clone()],
                     };
@@ -857,7 +1067,7 @@ async fn handle_command(
                         if remove_channel {
                             relay.channels.remove(channel);
                         }
-                        if relay.channels.is_empty() {
+                        if relay.channels.is_empty() && !relay.mesh_connected {
                             let _ = relay
                                 .outgoing_tx
                                 .send(federation::RelayCommand::Shutdown);
@@ -879,7 +1089,7 @@ async fn handle_command(
                     // Relay nicks are invisible — suppress PART broadcast.
                     if !federation::is_relay_nick(nick) {
                         let part_msg = Message {
-                            prefix: Some(format!("{nick}!{nick}@lagoon")),
+                            prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
                             command: "PART".into(),
                             params: vec![channel.clone(), reason],
                         };
@@ -894,36 +1104,6 @@ async fn handle_command(
                         members.remove(nick);
                         if members.is_empty() {
                             st.channels.remove(channel);
-                        }
-                    }
-
-                    // Auto-federation cleanup: if no real users left, PART relays.
-                    let has_real_users = st
-                        .channels
-                        .get(channel)
-                        .is_some_and(|m| m.keys().any(|n| !federation::is_relay_nick(n)));
-                    if !has_real_users && !federation::PEERS.is_empty() {
-                        let mut empty_relays = Vec::new();
-                        for (host, relay) in st.federation.relays.iter_mut() {
-                            if relay.channels.contains_key(channel) {
-                                let _ = relay.outgoing_tx.send(
-                                    federation::RelayCommand::PartChannel {
-                                        remote_channel: channel.clone(),
-                                    },
-                                );
-                                relay.channels.remove(channel);
-                                if relay.channels.is_empty() {
-                                    let _ = relay.outgoing_tx.send(
-                                        federation::RelayCommand::Shutdown,
-                                    );
-                                    empty_relays.push(host.clone());
-                                }
-                            }
-                        }
-                        for host in empty_relays {
-                            if let Some(relay) = st.federation.relays.remove(&host) {
-                                relay.task_handle.abort();
-                            }
                         }
                     }
                 }
@@ -956,7 +1136,7 @@ async fn handle_command(
                         // Echo to other local users in the federated channel.
                         if let Some(fed_ch) = relay.channels.get(target) {
                             let echo = Message {
-                                prefix: Some(format!("{nick}!{nick}@lagoon")),
+                                prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
                                 command: msg.command.clone(),
                                 params: vec![target.clone(), text.clone()],
                             };
@@ -972,7 +1152,7 @@ async fn handle_command(
                 } else if target.starts_with('#') || target.starts_with('&') {
                     // Local channel message — broadcast to all members except sender.
                     let relay_msg = Message {
-                        prefix: Some(format!("{nick}!{nick}@lagoon")),
+                        prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
                         command: msg.command.clone(),
                         params: vec![target.clone(), text.clone()],
                     };
@@ -1031,7 +1211,7 @@ async fn handle_command(
                 } else {
                     // Direct message to a local user.
                     let relay_msg = Message {
-                        prefix: Some(format!("{nick}!{nick}@lagoon")),
+                        prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
                         command: msg.command.clone(),
                         params: vec![target.clone(), text.clone()],
                     };
@@ -1057,7 +1237,7 @@ async fn handle_command(
                 if msg.params.len() >= 2 {
                     let topic = &msg.params[1];
                     let topic_msg = Message {
-                        prefix: Some(format!("{nick}!{nick}@lagoon")),
+                        prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
                         command: "TOPIC".into(),
                         params: vec![channel.clone(), topic.clone()],
                     };
@@ -1221,10 +1401,19 @@ async fn handle_command(
                     };
                     framed.send(end_msg).await?;
                 } else {
-                    // Local channel (includes remote users from federation).
+                    // Local channel — local users only (relay nicks hidden).
                     let st = state.read().await;
-                    let names =
-                        federation::build_channel_names(&st, channel);
+                    let names = st
+                        .channels
+                        .get(channel)
+                        .map(|m| {
+                            m.iter()
+                                .filter(|(n, _)| !federation::is_relay_nick(n))
+                                .map(|(n, p)| format!("{}{n}", p.symbol()))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_default();
                     drop(st);
 
                     let names_msg = Message {
@@ -1282,7 +1471,7 @@ async fn handle_command(
                                     .insert(mode_target.clone(), prefix);
                                 // Broadcast MODE change.
                                 let mode_msg = Message {
-                                    prefix: Some(format!("{nick}!{nick}@lagoon")),
+                                    prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
                                     command: "MODE".into(),
                                     params: vec![
                                         target.clone(),
@@ -1372,13 +1561,9 @@ async fn handle_command(
                             };
                             let st = state.read().await;
                             if let Some(members) = st.channels.get(channel) {
-                                // Filter relay nicks to prevent loops in auto-federation.
                                 let others: Vec<_> = members
                                     .keys()
-                                    .filter(|n| {
-                                        *n != nick
-                                            && !federation::is_relay_nick(n)
-                                    })
+                                    .filter(|n| *n != nick)
                                     .cloned()
                                     .collect();
                                 broadcast(&st, &others, &relay_msg);
@@ -1393,16 +1578,10 @@ async fn handle_command(
                         };
                         let mut st = state.write().await;
                         if let Some(members) = st.channels.get_mut(channel) {
-                            // Add virtual user to channel membership.
                             members.insert(virtual_nick.clone(), MemberPrefix::Normal);
-                            // Filter relay nicks to prevent loops in auto-federation.
                             let others: Vec<_> = members
                                 .keys()
-                                .filter(|n| {
-                                    *n != nick
-                                        && *n != &virtual_nick
-                                        && !federation::is_relay_nick(n)
-                                })
+                                .filter(|n| *n != nick && *n != &virtual_nick)
                                 .cloned()
                                 .collect();
                             broadcast(&st, &others, &join_msg);
@@ -1416,18 +1595,13 @@ async fn handle_command(
                             params: vec![channel.clone(), reason],
                         };
                         let mut st = state.write().await;
-                        // Filter relay nicks to prevent loops in auto-federation.
                         let others: Vec<_> = st
                             .channels
                             .get(channel)
                             .map(|members| {
                                 members
                                     .keys()
-                                    .filter(|n| {
-                                        *n != nick
-                                            && *n != &virtual_nick
-                                            && !federation::is_relay_nick(n)
-                                    })
+                                    .filter(|n| *n != nick && *n != &virtual_nick)
                                     .cloned()
                                     .collect()
                             })
@@ -1526,6 +1700,463 @@ async fn handle_command(
             }
         }
 
+        // MESH — mesh networking protocol (Lagoon extension).
+        // Received from relay nicks — forwarded to federation event processor.
+        "MESH" => {
+            if msg.params.len() >= 2 {
+                let sub_cmd = &msg.params[0];
+                let json = &msg.params[1];
+                let st = state.read().await;
+
+                match sub_cmd.as_str() {
+                    "HELLO" => {
+                        #[derive(serde::Deserialize)]
+                        struct HelloPayload {
+                            peer_id: String,
+                            server_name: String,
+                            public_key_hex: String,
+                        }
+                        if let Ok(hello) = serde_json::from_str::<HelloPayload>(json) {
+                            let _ = st.federation_event_tx.send(
+                                federation::RelayEvent::MeshHello {
+                                    remote_host: hello.server_name.clone(),
+                                    lens_id: hello.peer_id,
+                                    server_name: hello.server_name,
+                                    public_key_hex: hello.public_key_hex,
+                                },
+                            );
+
+                            // Respond with our own HELLO.
+                            let our_hello = serde_json::json!({
+                                "peer_id": st.lens.peer_id,
+                                "server_name": st.lens.server_name,
+                                "public_key_hex": st.lens.public_key_hex,
+                            });
+                            drop(st);
+                            let reply = Message {
+                                prefix: Some(SERVER_NAME.clone()),
+                                command: "MESH".into(),
+                                params: vec!["HELLO".into(), our_hello.to_string()],
+                            };
+                            framed.send(reply).await?;
+                        }
+                    }
+                    "PEERS" => {
+                        if let Ok(peers) =
+                            serde_json::from_str::<Vec<MeshPeerInfo>>(json)
+                        {
+                            let _ = st.federation_event_tx.send(
+                                federation::RelayEvent::MeshPeers {
+                                    remote_host: nick.to_owned(),
+                                    peers,
+                                },
+                            );
+                        }
+                    }
+                    "TOPOLOGY" => {
+                        let _ = st.federation_event_tx.send(
+                            federation::RelayEvent::MeshTopology {
+                                remote_host: nick.to_owned(),
+                                json: json.clone(),
+                            },
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // INVITE — invite code management commands.
+        "INVITE" => {
+            if let Some(sub_cmd) = msg.params.first() {
+                match sub_cmd.to_uppercase().as_str() {
+                    "CREATE" => {
+                        // INVITE CREATE <kind> <target> [privileges] [max_uses] [expires]
+                        if msg.params.len() >= 3 {
+                            let kind_str = &msg.params[1];
+                            let target = &msg.params[2];
+                            let kind = match kind_str.to_lowercase().as_str() {
+                                "community" | "communitylink" => {
+                                    super::invite::InviteKind::CommunityLink
+                                }
+                                "peering" | "serverpeering" => {
+                                    super::invite::InviteKind::ServerPeering
+                                }
+                                _ => {
+                                    let err = Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "NOTICE".into(),
+                                        params: vec![
+                                            nick.into(),
+                                            "Unknown invite kind. Use: community, peering"
+                                                .into(),
+                                        ],
+                                    };
+                                    framed.send(err).await?;
+                                    return Ok(CommandResult::Ok);
+                                }
+                            };
+
+                            let privileges: Vec<super::invite::Privilege> = msg
+                                .params
+                                .get(3)
+                                .map(|p| {
+                                    p.split(',')
+                                        .filter_map(|s| s.parse().ok())
+                                        .collect()
+                                })
+                                .unwrap_or_else(|| {
+                                    vec![
+                                        super::invite::Privilege::Read,
+                                        super::invite::Privilege::Write,
+                                    ]
+                                });
+
+                            let max_uses: Option<u32> = msg
+                                .params
+                                .get(4)
+                                .and_then(|s| s.parse().ok());
+
+                            let expires_at: Option<chrono::DateTime<chrono::Utc>> = msg
+                                .params
+                                .get(5)
+                                .and_then(|s| s.parse().ok());
+
+                            let mut st = state.write().await;
+                            let lens_id = st.lens.peer_id.clone();
+                            let invite = st.invites.create(
+                                kind,
+                                lens_id,
+                                target.clone(),
+                                privileges,
+                                max_uses,
+                                expires_at,
+                            );
+                            let reply = Message {
+                                prefix: Some(SERVER_NAME.clone()),
+                                command: "NOTICE".into(),
+                                params: vec![
+                                    nick.into(),
+                                    format!(
+                                        "Invite code created: {} (target: {}, uses: {}/{})",
+                                        invite.code,
+                                        invite.target,
+                                        invite.uses,
+                                        invite
+                                            .max_uses
+                                            .map(|m| m.to_string())
+                                            .unwrap_or_else(|| "unlimited".into()),
+                                    ),
+                                ],
+                            };
+                            framed.send(reply).await?;
+                        }
+                    }
+                    "USE" => {
+                        if let Some(code) = msg.params.get(1) {
+                            let mut st = state.write().await;
+                            match st.invites.use_code(code) {
+                                Ok(invite) => {
+                                    let reply = Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "NOTICE".into(),
+                                        params: vec![
+                                            nick.into(),
+                                            format!(
+                                                "Invite code used: {} (target: {})",
+                                                invite.code, invite.target
+                                            ),
+                                        ],
+                                    };
+                                    framed.send(reply).await?;
+                                }
+                                Err(e) => {
+                                    let reply = Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "NOTICE".into(),
+                                        params: vec![
+                                            nick.into(),
+                                            format!("Invite code error: {e}"),
+                                        ],
+                                    };
+                                    framed.send(reply).await?;
+                                }
+                            }
+                        }
+                    }
+                    "LIST" => {
+                        let filter = msg.params.get(1).map(|s| s.as_str());
+                        let st = state.read().await;
+                        let invites = st.invites.list(filter);
+                        if invites.is_empty() {
+                            let reply = Message {
+                                prefix: Some(SERVER_NAME.clone()),
+                                command: "NOTICE".into(),
+                                params: vec![nick.into(), "No invite codes found.".into()],
+                            };
+                            framed.send(reply).await?;
+                        } else {
+                            for inv in invites {
+                                let reply = Message {
+                                    prefix: Some(SERVER_NAME.clone()),
+                                    command: "NOTICE".into(),
+                                    params: vec![
+                                        nick.into(),
+                                        format!(
+                                            "[{}] target={} uses={}/{} active={} expires={}",
+                                            inv.code,
+                                            inv.target,
+                                            inv.uses,
+                                            inv.max_uses
+                                                .map(|m| m.to_string())
+                                                .unwrap_or_else(|| "unlimited".into()),
+                                            inv.active,
+                                            inv.expires_at
+                                                .map(|e| e.to_rfc3339())
+                                                .unwrap_or_else(|| "never".into()),
+                                        ),
+                                    ],
+                                };
+                                framed.send(reply).await?;
+                            }
+                        }
+                    }
+                    "MODIFY" => {
+                        // INVITE MODIFY <code> <field> <value>
+                        if msg.params.len() >= 4 {
+                            let code = &msg.params[1];
+                            let field = &msg.params[2];
+                            let value = &msg.params[3];
+                            let mut st = state.write().await;
+                            let result = match field.to_lowercase().as_str() {
+                                "privileges" => {
+                                    let privs: Vec<super::invite::Privilege> = value
+                                        .split(',')
+                                        .filter_map(|s| s.parse().ok())
+                                        .collect();
+                                    st.invites.modify(code, Some(privs), None, None)
+                                }
+                                "max_uses" => {
+                                    let max: Option<u32> = value.parse().ok();
+                                    st.invites.modify(code, None, Some(max), None)
+                                }
+                                "expires" => {
+                                    let exp: Option<chrono::DateTime<chrono::Utc>> =
+                                        value.parse().ok();
+                                    st.invites.modify(code, None, None, Some(exp))
+                                }
+                                _ => Err("Unknown field. Use: privileges, max_uses, expires"
+                                    .to_string()),
+                            };
+                            match result {
+                                Ok(inv) => {
+                                    let reply = Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "NOTICE".into(),
+                                        params: vec![
+                                            nick.into(),
+                                            format!("Invite {} modified.", inv.code),
+                                        ],
+                                    };
+                                    framed.send(reply).await?;
+                                }
+                                Err(e) => {
+                                    let reply = Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "NOTICE".into(),
+                                        params: vec![
+                                            nick.into(),
+                                            format!("Modify error: {e}"),
+                                        ],
+                                    };
+                                    framed.send(reply).await?;
+                                }
+                            }
+                        }
+                    }
+                    "REVOKE" => {
+                        if let Some(code) = msg.params.get(1) {
+                            let mut st = state.write().await;
+                            match st.invites.revoke(code) {
+                                Ok(()) => {
+                                    let reply = Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "NOTICE".into(),
+                                        params: vec![
+                                            nick.into(),
+                                            format!("Invite {code} revoked."),
+                                        ],
+                                    };
+                                    framed.send(reply).await?;
+                                }
+                                Err(e) => {
+                                    let reply = Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "NOTICE".into(),
+                                        params: vec![
+                                            nick.into(),
+                                            format!("Revoke error: {e}"),
+                                        ],
+                                    };
+                                    framed.send(reply).await?;
+                                }
+                            }
+                        }
+                    }
+                    "INFO" => {
+                        if let Some(code) = msg.params.get(1) {
+                            let st = state.read().await;
+                            match st.invites.get(code) {
+                                Some(inv) => {
+                                    let privs: Vec<String> = inv
+                                        .privileges
+                                        .iter()
+                                        .map(|p| p.to_string())
+                                        .collect();
+                                    let reply = Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "NOTICE".into(),
+                                        params: vec![
+                                            nick.into(),
+                                            format!(
+                                                "Invite {}: kind={:?} target={} privileges=[{}] uses={}/{} active={} created={} expires={}",
+                                                inv.code,
+                                                inv.kind,
+                                                inv.target,
+                                                privs.join(","),
+                                                inv.uses,
+                                                inv.max_uses.map(|m| m.to_string()).unwrap_or_else(|| "unlimited".into()),
+                                                inv.active,
+                                                inv.created_at.to_rfc3339(),
+                                                inv.expires_at.map(|e| e.to_rfc3339()).unwrap_or_else(|| "never".into()),
+                                            ),
+                                        ],
+                                    };
+                                    framed.send(reply).await?;
+                                }
+                                None => {
+                                    let reply = Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "NOTICE".into(),
+                                        params: vec![
+                                            nick.into(),
+                                            format!("Unknown invite code: {code}"),
+                                        ],
+                                    };
+                                    framed.send(reply).await?;
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        let reply = Message {
+                            prefix: Some(SERVER_NAME.clone()),
+                            command: "NOTICE".into(),
+                            params: vec![
+                                nick.into(),
+                                "Usage: INVITE CREATE|USE|LIST|MODIFY|REVOKE|INFO".into(),
+                            ],
+                        };
+                        framed.send(reply).await?;
+                    }
+                }
+            }
+        }
+
+        // DEFEDERATE — block a peer by LensID or server name.
+        "DEFEDERATE" => {
+            if let Some(target) = msg.params.first() {
+                let mut st = state.write().await;
+                st.mesh.defederated.insert(target.clone());
+
+                // Disconnect active relay if any.
+                let mut to_remove = Vec::new();
+                for (host, relay) in &st.federation.relays {
+                    if host == target {
+                        let _ = relay.outgoing_tx.send(federation::RelayCommand::Shutdown);
+                        to_remove.push(host.clone());
+                    }
+                }
+                // Also check by lens_id in known_peers.
+                let mut connection_ids_to_remove = Vec::new();
+                for (lens_id, peer_info) in &st.mesh.known_peers {
+                    if lens_id == target || peer_info.server_name == *target {
+                        if let Some(relay) = st.federation.relays.get(&peer_info.server_name) {
+                            let _ = relay.outgoing_tx.send(federation::RelayCommand::Shutdown);
+                            to_remove.push(peer_info.server_name.clone());
+                        }
+                        connection_ids_to_remove.push(lens_id.clone());
+                    }
+                }
+                for host in &to_remove {
+                    if let Some(relay) = st.federation.relays.remove(host) {
+                        relay.task_handle.abort();
+                    }
+                }
+                for id in &connection_ids_to_remove {
+                    st.mesh.connections.remove(id);
+                }
+
+                // Persist defederated set.
+                let defed_path = st.data_dir.join("defederated.json");
+                if let Ok(json) = serde_json::to_string_pretty(&st.mesh.defederated) {
+                    let _ = std::fs::write(&defed_path, json);
+                }
+
+                st.notify_topology_change();
+                drop(st);
+
+                let reply = Message {
+                    prefix: Some(SERVER_NAME.clone()),
+                    command: "NOTICE".into(),
+                    params: vec![
+                        nick.into(),
+                        format!("Defederated: {target}"),
+                    ],
+                };
+                framed.send(reply).await?;
+            }
+        }
+
+        // REFEDERATE — unblock a previously defederated peer.
+        "REFEDERATE" => {
+            if let Some(target) = msg.params.first() {
+                let mut st = state.write().await;
+                let removed = st.mesh.defederated.remove(target);
+
+                if removed {
+                    // Persist defederated set.
+                    let defed_path = st.data_dir.join("defederated.json");
+                    if let Ok(json) = serde_json::to_string_pretty(&st.mesh.defederated) {
+                        let _ = std::fs::write(&defed_path, json);
+                    }
+                    st.notify_topology_change();
+                    drop(st);
+
+                    let reply = Message {
+                        prefix: Some(SERVER_NAME.clone()),
+                        command: "NOTICE".into(),
+                        params: vec![
+                            nick.into(),
+                            format!("Refederated: {target}"),
+                        ],
+                    };
+                    framed.send(reply).await?;
+                } else {
+                    drop(st);
+                    let reply = Message {
+                        prefix: Some(SERVER_NAME.clone()),
+                        command: "NOTICE".into(),
+                        params: vec![
+                            nick.into(),
+                            format!("{target} was not defederated."),
+                        ],
+                    };
+                    framed.send(reply).await?;
+                }
+            }
+        }
+
         "QUIT" => {
             return Ok(CommandResult::Quit);
         }
@@ -1560,7 +2191,7 @@ async fn cleanup_client(nick: &str, state: &SharedState) {
     // Relay nicks are invisible — suppress QUIT broadcast.
     if !federation::is_relay_nick(nick) {
         let quit_msg = Message {
-            prefix: Some(format!("{nick}!{nick}@lagoon")),
+            prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
             command: "QUIT".into(),
             params: vec!["Connection closed".into()],
         };
@@ -1581,37 +2212,10 @@ async fn cleanup_client(nick: &str, state: &SharedState) {
     }
 
     // Remove from all local channels.
-    let mut emptied_channels: Vec<String> = Vec::new();
-    st.channels.retain(|name, members| {
+    st.channels.retain(|_name, members| {
         members.remove(nick);
-        if !members.is_empty() {
-            // Check if only relay nicks remain (auto-federation cleanup).
-            if !members.keys().any(|n| !federation::is_relay_nick(n)) {
-                emptied_channels.push(name.clone());
-            }
-            true
-        } else {
-            false
-        }
+        !members.is_empty()
     });
-
-    // Auto-federation cleanup: PART relays for channels with no real users.
-    if !emptied_channels.is_empty() && !federation::PEERS.is_empty() {
-        for ch in &emptied_channels {
-            for relay in st.federation.relays.values() {
-                if relay.channels.contains_key(ch) {
-                    let _ = relay.outgoing_tx.send(
-                        federation::RelayCommand::PartChannel {
-                            remote_channel: ch.clone(),
-                        },
-                    );
-                }
-            }
-            for relay in st.federation.relays.values_mut() {
-                relay.channels.remove(ch);
-            }
-        }
-    }
 
     // Remove from all federated channels. Shut down relays with no channels left.
     let mut empty_relays = Vec::new();
@@ -1637,7 +2241,7 @@ async fn cleanup_client(nick: &str, state: &SharedState) {
         for ch in empty_channels {
             relay.channels.remove(&ch);
         }
-        if relay.channels.is_empty() {
+        if relay.channels.is_empty() && !relay.mesh_connected {
             let _ = relay.outgoing_tx.send(federation::RelayCommand::Shutdown);
             empty_relays.push(host.clone());
         }
@@ -1650,5 +2254,11 @@ async fn cleanup_client(nick: &str, state: &SharedState) {
 
     // Remove from clients.
     st.clients.remove(nick);
+
+    // Remove from web client tracking if applicable.
+    if st.mesh.web_clients.remove(nick) {
+        st.notify_topology_change();
+    }
+
     info!(nick, "cleaned up");
 }

@@ -1,0 +1,142 @@
+# 8-Node Lagoon Mesh Cluster
+#
+# Each node runs in embedded mode — single lagoon-web binary with IRC built-in.
+# No IRC ports exposed to the host. Federation happens over the Docker bridge
+# network. Users access only via web gateway.
+#
+# Usage:
+#   docker compose -f docker-compose-cluster.yml up --build
+#
+# Web UIs:     http://localhost:8081 through http://localhost:8088
+
+x-lagoon-defaults: &defaults
+  build: .
+  environment: &env-defaults
+    LAGOON_EMBEDDED: "1"
+    LAGOON_WEB_NO_TLS: "1"
+    LAGOON_WEB_ADDR: "0.0.0.0:8080"
+    LAGOON_IRC_BIND: "0.0.0.0:6667"
+    LAGOON_IRC_ADDR: "127.0.0.1:6667"
+    RUST_LOG: "info"
+  networks:
+    - mesh
+  restart: unless-stopped
+
+services:
+  node1:
+    <<: *defaults
+    hostname: node1.mesh.lagun.co
+    environment:
+      <<: *env-defaults
+      SERVER_NAME: "node1.mesh.lagun.co"
+      LAGOON_DATA_DIR: "/data"
+      LAGOON_PEERS: "node2.mesh.lagun.co,node3.mesh.lagun.co,node4.mesh.lagun.co,node5.mesh.lagun.co,node6.mesh.lagun.co,node7.mesh.lagun.co,node8.mesh.lagun.co"
+    ports:
+      - "8081:8080"
+    volumes:
+      - node1-data:/data
+
+  node2:
+    <<: *defaults
+    hostname: node2.mesh.lagun.co
+    environment:
+      <<: *env-defaults
+      SERVER_NAME: "node2.mesh.lagun.co"
+      LAGOON_DATA_DIR: "/data"
+      LAGOON_PEERS: "node1.mesh.lagun.co,node3.mesh.lagun.co,node4.mesh.lagun.co,node5.mesh.lagun.co,node6.mesh.lagun.co,node7.mesh.lagun.co,node8.mesh.lagun.co"
+    ports:
+      - "8082:8080"
+    volumes:
+      - node2-data:/data
+
+  node3:
+    <<: *defaults
+    hostname: node3.mesh.lagun.co
+    environment:
+      <<: *env-defaults
+      SERVER_NAME: "node3.mesh.lagun.co"
+      LAGOON_DATA_DIR: "/data"
+      LAGOON_PEERS: "node1.mesh.lagun.co,node2.mesh.lagun.co,node4.mesh.lagun.co,node5.mesh.lagun.co,node6.mesh.lagun.co,node7.mesh.lagun.co,node8.mesh.lagun.co"
+    ports:
+      - "8083:8080"
+    volumes:
+      - node3-data:/data
+
+  node4:
+    <<: *defaults
+    hostname: node4.mesh.lagun.co
+    environment:
+      <<: *env-defaults
+      SERVER_NAME: "node4.mesh.lagun.co"
+      LAGOON_DATA_DIR: "/data"
+      LAGOON_PEERS: "node1.mesh.lagun.co,node2.mesh.lagun.co,node3.mesh.lagun.co,node5.mesh.lagun.co,node6.mesh.lagun.co,node7.mesh.lagun.co,node8.mesh.lagun.co"
+    ports:
+      - "8084:8080"
+    volumes:
+      - node4-data:/data
+
+  node5:
+    <<: *defaults
+    hostname: node5.mesh.lagun.co
+    environment:
+      <<: *env-defaults
+      SERVER_NAME: "node5.mesh.lagun.co"
+      LAGOON_DATA_DIR: "/data"
+      LAGOON_PEERS: "node1.mesh.lagun.co,node2.mesh.lagun.co,node3.mesh.lagun.co,node4.mesh.lagun.co,node6.mesh.lagun.co,node7.mesh.lagun.co,node8.mesh.lagun.co"
+    ports:
+      - "8085:8080"
+    volumes:
+      - node5-data:/data
+
+  node6:
+    <<: *defaults
+    hostname: node6.mesh.lagun.co
+    environment:
+      <<: *env-defaults
+      SERVER_NAME: "node6.mesh.lagun.co"
+      LAGOON_DATA_DIR: "/data"
+      LAGOON_PEERS: "node1.mesh.lagun.co,node2.mesh.lagun.co,node3.mesh.lagun.co,node4.mesh.lagun.co,node5.mesh.lagun.co,node7.mesh.lagun.co,node8.mesh.lagun.co"
+    ports:
+      - "8086:8080"
+    volumes:
+      - node6-data:/data
+
+  node7:
+    <<: *defaults
+    hostname: node7.mesh.lagun.co
+    environment:
+      <<: *env-defaults
+      SERVER_NAME: "node7.mesh.lagun.co"
+      LAGOON_DATA_DIR: "/data"
+      LAGOON_PEERS: "node1.mesh.lagun.co,node2.mesh.lagun.co,node3.mesh.lagun.co,node4.mesh.lagun.co,node5.mesh.lagun.co,node6.mesh.lagun.co,node8.mesh.lagun.co"
+    ports:
+      - "8087:8080"
+    volumes:
+      - node7-data:/data
+
+  node8:
+    <<: *defaults
+    hostname: node8.mesh.lagun.co
+    environment:
+      <<: *env-defaults
+      SERVER_NAME: "node8.mesh.lagun.co"
+      LAGOON_DATA_DIR: "/data"
+      LAGOON_PEERS: "node1.mesh.lagun.co,node2.mesh.lagun.co,node3.mesh.lagun.co,node4.mesh.lagun.co,node5.mesh.lagun.co,node6.mesh.lagun.co,node7.mesh.lagun.co"
+    ports:
+      - "8088:8080"
+    volumes:
+      - node8-data:/data
+
+networks:
+  mesh:
+    driver: bridge
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+  node5-data:
+  node6-data:
+  node7-data:
+  node8-data:

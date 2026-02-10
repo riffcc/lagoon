@@ -1,0 +1,47 @@
+# Lagoon Pod — IRC server + Web gateway + Yggdrasil mesh
+#
+# Deploy this as a pod on bunny.net (or any container platform).
+# Containers share a network namespace for Yggdrasil mesh access.
+#
+# Required environment:
+#   LAGOON_DOMAIN       - Public domain (e.g., eu.lagoon.lagun.co)
+#   YGGDRASIL_PEERS     - Space-separated Yggdrasil peer URIs
+#
+# Optional:
+#   LAGOON_PEERS        - Comma-separated Lagoon federation peers (host:port)
+#   LAGOON_SERVER_NAME  - IRC server name (defaults to LAGOON_DOMAIN)
+
+services:
+  lagoon:
+    image: riffcc/lagoon:latest
+    environment:
+      - LAGOON_WEB_NO_TLS=1
+      - LAGOON_WEB_ADDR=0.0.0.0:8080
+      - LAGOON_IRC_ADDR=127.0.0.1:6667
+      - LAGOON_PEERS=${LAGOON_PEERS:-}
+      - SERVER_NAME=${LAGOON_SERVER_NAME:-${LAGOON_DOMAIN}}
+      - RUST_LOG=info
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    network_mode: "service:yggdrasil"
+    depends_on:
+      - yggdrasil
+
+  yggdrasil:
+    image: riffcc/yggdrasil:latest
+    environment:
+      - YGGDRASIL_PEERS=${YGGDRASIL_PEERS:-}
+      - YGGDRASIL_LISTEN=tcp://0.0.0.0:9001
+    ports:
+      - "9001:9001"
+    volumes:
+      - yggdrasil-config:/etc/yggdrasil
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+
+volumes:
+  yggdrasil-config:

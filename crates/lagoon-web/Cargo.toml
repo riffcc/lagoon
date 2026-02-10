@@ -1,0 +1,65 @@
+[package]
+name = "lagoon-web"
+version = "0.1.0"
+edition = "2024"
+authors = ["Riff Labs <hello@riff.cc>"]
+description = "Lagoon web gateway — passkey auth, Vue.js client, WebSocket IRC bridge."
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/riffcc/lagoon"
+
+[[bin]]
+name = "lagoon-web"
+path = "src/main.rs"
+
+[dependencies]
+# Async
+tokio = { workspace = true }
+futures = { workspace = true }
+
+# Web framework
+axum = { workspace = true }
+axum-extra = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Auth
+webauthn-rs = { workspace = true }
+webauthn-rs-proto = { workspace = true }
+
+# Crypto
+ed25519-dalek = { workspace = true }
+blake3 = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Data
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# URL parsing (re-exported by webauthn but we need it directly)
+url = "2"
+
+# TLS
+rcgen = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# IRC server (embedded)
+lagoon-server = { path = "../lagoon-server" }
+
+# Hex encoding
+hex = { workspace = true }

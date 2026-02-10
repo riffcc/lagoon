@@ -1,0 +1,8 @@
+target/
+crates/lagoon-web/web/node_modules/
+crates/lagoon-web/web/dist/
+.git/
+deploy/
+*.md
+.env
+.mcp.json

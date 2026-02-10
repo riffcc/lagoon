@@ -4,19 +4,22 @@
 /// `per.lagun.co:6667` as an IRC client, joins `#lagoon`, and relays messages
 /// bidirectionally. One relay connection per remote host — multiple federated
 /// channels to the same host share a single TCP connection.
+///
+/// Also handles MESH protocol for topology exchange between peers.
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::Arc;
 
 use futures::SinkExt;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_util::codec::Framed;
 use tracing::{info, warn};
 
 use super::codec::IrcCodec;
+use super::lens;
 use super::message::Message;
-use super::server::{broadcast, ServerState, SharedState, SERVER_NAME};
+use super::server::{broadcast, MeshConnectionState, MeshPeerInfo, SharedState, SERVER_NAME};
+use super::transport::{self, TransportConfig};
 
 /// Check if a nick belongs to relay infrastructure.
 ///
@@ -25,25 +28,6 @@ use super::server::{broadcast, ServerState, SharedState, SERVER_NAME};
 pub fn is_relay_nick(nick: &str) -> bool {
     nick.contains("~relay")
 }
-
-/// Peer servers for auto-federation (from `LAGOON_PEERS` env var).
-///
-/// When set, every local channel is automatically federated to all peers.
-/// Format: comma-separated hostnames, e.g. "lon.lagun.co,per.lagun.co,nyc.lagun.co".
-/// The local server's own hostname is automatically excluded.
-pub static PEERS: LazyLock<Vec<String>> = LazyLock::new(|| {
-    let our_name = &*SERVER_NAME;
-    let peers: Vec<String> = std::env::var("LAGOON_PEERS")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && s != our_name)
-        .collect();
-    if !peers.is_empty() {
-        info!("auto-federation peers: {}", peers.join(", "));
-    }
-    peers
-});
 
 /// Parse a federated channel name into (remote_channel, remote_host).
 ///
@@ -93,6 +77,8 @@ pub struct RelayHandle {
     pub channels: HashMap<String, FederatedChannel>,
     /// Handle to abort the relay task on cleanup.
     pub task_handle: tokio::task::JoinHandle<()>,
+    /// Whether this relay was created by the mesh connector (kept alive even with no channels).
+    pub mesh_connected: bool,
 }
 
 /// Commands sent from the server to a relay task.
@@ -110,6 +96,8 @@ pub enum RelayCommand {
     PartChannel { remote_channel: String },
     /// Send a raw pre-formatted message on the relay connection (e.g. FRELAY DM).
     Raw(Message),
+    /// Send MESH HELLO after registration.
+    MeshHello { json: String },
     /// Shut down the relay connection entirely.
     Shutdown,
 }
@@ -147,6 +135,23 @@ pub enum RelayEvent {
     Disconnected { remote_host: String },
     /// A specific channel's relay has been established.
     Connected { local_channel: String },
+    /// Received MESH HELLO from a remote peer.
+    MeshHello {
+        remote_host: String,
+        lens_id: String,
+        server_name: String,
+        public_key_hex: String,
+    },
+    /// Received MESH PEERS from a remote peer.
+    MeshPeers {
+        remote_host: String,
+        peers: Vec<MeshPeerInfo>,
+    },
+    /// Received MESH TOPOLOGY from a remote peer.
+    MeshTopology {
+        remote_host: String,
+        json: String,
+    },
 }
 
 /// Manages all federated channel relay connections.
@@ -162,35 +167,6 @@ impl FederationManager {
             relays: HashMap::new(),
         }
     }
-}
-
-/// Build the NAMES string for a local channel, including remote federated users.
-///
-/// Combines local channel members (with prefix symbols, filtering relay nicks)
-/// and remote users from all federation relays tracking this channel.
-pub fn build_channel_names(st: &ServerState, channel: &str) -> String {
-    let mut parts: Vec<String> = st
-        .channels
-        .get(channel)
-        .map(|m| {
-            m.iter()
-                .filter(|(n, _)| !is_relay_nick(n))
-                .map(|(n, p)| format!("{}{n}", p.symbol()))
-                .collect()
-        })
-        .unwrap_or_default();
-    for relay in st.federation.relays.values() {
-        if let Some(fed_ch) = relay.channels.get(channel) {
-            for rn in &fed_ch.remote_users {
-                if rn.contains('@') {
-                    parts.push(rn.clone());
-                } else {
-                    parts.push(format!("{rn}@{}", relay.remote_host));
-                }
-            }
-        }
-    }
-    parts.join(" ")
 }
 
 /// Format an IRC prefix for a remote user.
@@ -224,27 +200,13 @@ pub fn spawn_event_processor(
                     text,
                 } => {
                     let st = state.read().await;
-                    let local_nicks: Vec<String> =
-                        if parse_federated_channel(&local_channel).is_some() {
-                            // Explicit federation — notify subscribers.
-                            st.federation
-                                .relays
-                                .get(&remote_host)
-                                .and_then(|r| r.channels.get(&local_channel))
-                                .map(|fc| fc.local_users.iter().cloned().collect())
-                                .unwrap_or_default()
-                        } else {
-                            // Auto-federation — notify real channel members.
-                            st.channels
-                                .get(&local_channel)
-                                .map(|m| {
-                                    m.keys()
-                                        .filter(|n| !is_relay_nick(n))
-                                        .cloned()
-                                        .collect()
-                                })
-                                .unwrap_or_default()
-                        };
+                    let local_nicks: Vec<String> = st
+                        .federation
+                        .relays
+                        .get(&remote_host)
+                        .and_then(|r| r.channels.get(&local_channel))
+                        .map(|fc| fc.local_users.iter().cloned().collect())
+                        .unwrap_or_default();
                     if !local_nicks.is_empty() {
                         let display =
                             format_remote_prefix(&remote_nick, &remote_host);
@@ -268,26 +230,14 @@ pub fn spawn_event_processor(
                             fed_ch.remote_users.insert(remote_nick.clone());
                         }
                     }
-                    // Determine who to notify.
-                    let notify_nicks: Vec<String> =
-                        if parse_federated_channel(&local_channel).is_some() {
-                            st.federation
-                                .relays
-                                .get(&remote_host)
-                                .and_then(|r| r.channels.get(&local_channel))
-                                .map(|fc| fc.local_users.iter().cloned().collect())
-                                .unwrap_or_default()
-                        } else {
-                            st.channels
-                                .get(&local_channel)
-                                .map(|m| {
-                                    m.keys()
-                                        .filter(|n| !is_relay_nick(n))
-                                        .cloned()
-                                        .collect()
-                                })
-                                .unwrap_or_default()
-                        };
+                    // Notify local subscribers of this federated channel.
+                    let notify_nicks: Vec<String> = st
+                        .federation
+                        .relays
+                        .get(&remote_host)
+                        .and_then(|r| r.channels.get(&local_channel))
+                        .map(|fc| fc.local_users.iter().cloned().collect())
+                        .unwrap_or_default();
                     let display = format_remote_prefix(&remote_nick, &remote_host);
                     let msg = Message {
                         prefix: Some(display),
@@ -309,26 +259,14 @@ pub fn spawn_event_processor(
                             fed_ch.remote_users.remove(&remote_nick);
                         }
                     }
-                    // Determine who to notify.
-                    let notify_nicks: Vec<String> =
-                        if parse_federated_channel(&local_channel).is_some() {
-                            st.federation
-                                .relays
-                                .get(&remote_host)
-                                .and_then(|r| r.channels.get(&local_channel))
-                                .map(|fc| fc.local_users.iter().cloned().collect())
-                                .unwrap_or_default()
-                        } else {
-                            st.channels
-                                .get(&local_channel)
-                                .map(|m| {
-                                    m.keys()
-                                        .filter(|n| !is_relay_nick(n))
-                                        .cloned()
-                                        .collect()
-                                })
-                                .unwrap_or_default()
-                        };
+                    // Notify local subscribers of this federated channel.
+                    let notify_nicks: Vec<String> = st
+                        .federation
+                        .relays
+                        .get(&remote_host)
+                        .and_then(|r| r.channels.get(&local_channel))
+                        .map(|fc| fc.local_users.iter().cloned().collect())
+                        .unwrap_or_default();
                     let display = format_remote_prefix(&remote_nick, &remote_host);
                     let msg = Message {
                         prefix: Some(display),
@@ -361,43 +299,24 @@ pub fn spawn_event_processor(
                         continue;
                     }
 
-                    // Build NAMES and determine recipients.
-                    let is_explicit =
-                        parse_federated_channel(&local_channel).is_some();
-                    let (names_str, local_nicks) = if is_explicit {
-                        // Explicit federation: local_users + this relay's remote_users.
-                        let relay = st.federation.relays.get(&remote_host).unwrap();
-                        let fed_ch = relay.channels.get(&local_channel).unwrap();
-                        let mut parts: Vec<String> =
-                            fed_ch.local_users.iter().cloned().collect();
-                        for rn in &fed_ch.remote_users {
-                            if rn.contains('@') {
-                                parts.push(rn.clone());
-                            } else {
-                                parts.push(format!(
-                                    "{rn}@{}",
-                                    relay.remote_host
-                                ));
-                            }
+                    // Build NAMES: local subscribers + remote users from this relay.
+                    let relay = st.federation.relays.get(&remote_host).unwrap();
+                    let fed_ch = relay.channels.get(&local_channel).unwrap();
+                    let mut parts: Vec<String> =
+                        fed_ch.local_users.iter().cloned().collect();
+                    for rn in &fed_ch.remote_users {
+                        if rn.contains('@') {
+                            parts.push(rn.clone());
+                        } else {
+                            parts.push(format!(
+                                "{rn}@{}",
+                                relay.remote_host
+                            ));
                         }
-                        let nicks: Vec<_> =
-                            fed_ch.local_users.iter().cloned().collect();
-                        (parts.join(" "), nicks)
-                    } else {
-                        // Auto-federation: local members + ALL relays' remote_users.
-                        let names = build_channel_names(&st, &local_channel);
-                        let nicks: Vec<_> = st
-                            .channels
-                            .get(&local_channel)
-                            .map(|m| {
-                                m.keys()
-                                    .filter(|n| !is_relay_nick(n))
-                                    .cloned()
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        (names, nicks)
-                    };
+                    }
+                    let names_str = parts.join(" ");
+                    let local_nicks: Vec<_> =
+                        fed_ch.local_users.iter().cloned().collect();
 
                     // Push updated NAMES to recipients.
                     for ln in &local_nicks {
@@ -427,7 +346,9 @@ pub fn spawn_event_processor(
                     }
                 }
                 RelayEvent::Disconnected { remote_host } => {
-                    let st = state.read().await;
+                    let mut st = state.write().await;
+
+                    // Broadcast disconnect notice to federated channel users.
                     if let Some(relay) = st.federation.relays.get(&remote_host) {
                         for (local_channel, fed_ch) in &relay.channels {
                             let msg = Message {
@@ -445,6 +366,26 @@ pub fn spawn_event_processor(
                                 fed_ch.local_users.iter().cloned().collect();
                             broadcast(&st, &local_nicks, &msg);
                         }
+                    }
+
+                    // Clean up relay handle.
+                    if let Some(relay) = st.federation.relays.remove(&remote_host) {
+                        relay.task_handle.abort();
+                    }
+
+                    // Find and remove connection state by lens_id.
+                    let disconnected_ids: Vec<String> = st
+                        .mesh
+                        .known_peers
+                        .iter()
+                        .filter(|(_, p)| p.server_name == remote_host)
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    for id in &disconnected_ids {
+                        st.mesh.connections.remove(id);
+                    }
+                    if !disconnected_ids.is_empty() {
+                        st.notify_topology_change();
                     }
                 }
                 RelayEvent::Connected { local_channel } => {
@@ -470,6 +411,115 @@ pub fn spawn_event_processor(
                         }
                     }
                 }
+
+                RelayEvent::MeshHello {
+                    remote_host,
+                    lens_id,
+                    server_name,
+                    public_key_hex,
+                } => {
+                    // Verify PeerID matches public key.
+                    if let Ok(pubkey_bytes) = hex::decode(&public_key_hex) {
+                        if pubkey_bytes.len() == 32 {
+                            let mut key = [0u8; 32];
+                            key.copy_from_slice(&pubkey_bytes);
+                            if !lens::verify_peer_id(&lens_id, &key) {
+                                warn!(
+                                    remote_host,
+                                    "mesh: rejected HELLO — PeerID doesn't match pubkey"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+
+                    let mut st = state.write().await;
+
+                    // Detect self-connection (DNS alias, misconfigured peer, etc).
+                    if lens_id == st.lens.peer_id {
+                        warn!(
+                            remote_host,
+                            "mesh: self-connection detected — disconnecting"
+                        );
+                        if let Some(relay) = st.federation.relays.remove(&remote_host) {
+                            let _ = relay.outgoing_tx.send(RelayCommand::Shutdown);
+                        }
+                        st.mesh.connections.remove(&lens_id);
+                        st.notify_topology_change();
+                        continue;
+                    }
+
+                    // Check defederation.
+                    if st.mesh.defederated.contains(&lens_id)
+                        || st.mesh.defederated.contains(&server_name)
+                    {
+                        warn!(
+                            remote_host,
+                            lens_id,
+                            "mesh: rejected HELLO — peer is defederated"
+                        );
+                        continue;
+                    }
+
+                    info!(
+                        remote_host,
+                        lens_id,
+                        server_name,
+                        "mesh: received HELLO"
+                    );
+
+                    st.mesh.known_peers.insert(
+                        lens_id.clone(),
+                        MeshPeerInfo {
+                            lens_id: lens_id.clone(),
+                            server_name: server_name.clone(),
+                            public_key_hex,
+                        },
+                    );
+                    st.mesh
+                        .connections
+                        .insert(lens_id, MeshConnectionState::Connected);
+                    st.notify_topology_change();
+                }
+
+                RelayEvent::MeshPeers {
+                    remote_host,
+                    peers,
+                } => {
+                    let mut st = state.write().await;
+                    let mut changed = false;
+                    for peer in peers {
+                        if st.mesh.defederated.contains(&peer.lens_id)
+                            || st.mesh.defederated.contains(&peer.server_name)
+                        {
+                            continue;
+                        }
+                        if peer.lens_id == st.lens.peer_id {
+                            continue; // Don't add ourselves.
+                        }
+                        if !st.mesh.known_peers.contains_key(&peer.lens_id) {
+                            info!(
+                                remote_host,
+                                peer_id = %peer.lens_id,
+                                server = %peer.server_name,
+                                "mesh: discovered peer via gossip"
+                            );
+                            st.mesh.known_peers.insert(peer.lens_id.clone(), peer);
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        st.notify_topology_change();
+                    }
+                }
+
+                RelayEvent::MeshTopology {
+                    remote_host: _,
+                    json: _,
+                } => {
+                    // Topology reports are informational — we build our own view.
+                    // Future: could use for multi-hop discovery.
+                }
             }
         }
     });
@@ -479,6 +529,7 @@ pub fn spawn_event_processor(
 pub fn spawn_relay(
     remote_host: String,
     event_tx: mpsc::UnboundedSender<RelayEvent>,
+    transport_config: Arc<TransportConfig>,
 ) -> (mpsc::UnboundedSender<RelayCommand>, tokio::task::JoinHandle<()>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
@@ -486,6 +537,7 @@ pub fn spawn_relay(
         remote_host,
         cmd_rx,
         event_tx,
+        transport_config,
     ));
 
     (cmd_tx, handle)
@@ -504,6 +556,7 @@ async fn relay_task(
     remote_host: String,
     mut cmd_rx: mpsc::UnboundedReceiver<RelayCommand>,
     event_tx: mpsc::UnboundedSender<RelayEvent>,
+    transport_config: Arc<TransportConfig>,
 ) {
     let our_name = &*SERVER_NAME;
     let mut relay_nick = if let Some(prefix) = our_name.split('.').next() {
@@ -514,10 +567,7 @@ async fn relay_task(
 
     let our_suffix = format!("@{our_name}");
 
-    let addr = format!("{remote_host}:6667");
-    info!(remote_host, "federation: connecting to {addr}");
-
-    let stream = match TcpStream::connect(&addr).await {
+    let stream = match transport::connect(&remote_host, &transport_config).await {
         Ok(s) => s,
         Err(e) => {
             warn!(remote_host, "federation: failed to connect: {e}");
@@ -528,7 +578,7 @@ async fn relay_task(
         }
     };
 
-    info!(remote_host, "federation: TCP connected to {addr}");
+    info!(remote_host, "federation: connected");
     let mut framed = Framed::new(stream, IrcCodec);
 
     // Register on remote.
@@ -585,22 +635,35 @@ async fn relay_task(
                     "001" if !registered => {
                         registered = true;
                         info!(remote_host, "federation: registered on remote");
-                        // Process any JoinChannel commands queued before registration.
+                        // Process any queued commands.
                         for cmd in pre_reg_cmds.drain(..) {
-                            if let RelayCommand::JoinChannel { remote_channel, local_channel } = cmd {
-                                channels.insert(remote_channel.clone(), TaskChannel {
-                                    local_channel,
-                                    joined: false,
-                                    pending: Vec::new(),
-                                });
-                                let join_msg = Message {
-                                    prefix: None,
-                                    command: "JOIN".into(),
-                                    params: vec![remote_channel],
-                                };
-                                if framed.send(join_msg).await.is_err() {
-                                    break;
+                            match cmd {
+                                RelayCommand::JoinChannel { remote_channel, local_channel } => {
+                                    channels.insert(remote_channel.clone(), TaskChannel {
+                                        local_channel,
+                                        joined: false,
+                                        pending: Vec::new(),
+                                    });
+                                    let join_msg = Message {
+                                        prefix: None,
+                                        command: "JOIN".into(),
+                                        params: vec![remote_channel],
+                                    };
+                                    if framed.send(join_msg).await.is_err() {
+                                        break;
+                                    }
                                 }
+                                RelayCommand::MeshHello { json } => {
+                                    let mesh_msg = Message {
+                                        prefix: None,
+                                        command: "MESH".into(),
+                                        params: vec!["HELLO".into(), json],
+                                    };
+                                    if framed.send(mesh_msg).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -744,6 +807,44 @@ async fn relay_task(
                         }
                     }
 
+                    "MESH" => {
+                        // MESH HELLO <json>
+                        // MESH PEERS <json>
+                        // MESH TOPOLOGY <json>
+                        if let Some(sub_cmd) = msg.params.first() {
+                            let json = msg.params.get(1).cloned().unwrap_or_default();
+                            match sub_cmd.as_str() {
+                                "HELLO" => {
+                                    if let Ok(hello) = serde_json::from_str::<MeshHelloPayload>(&json) {
+                                        let _ = event_tx.send(RelayEvent::MeshHello {
+                                            remote_host: remote_host.clone(),
+                                            lens_id: hello.peer_id,
+                                            server_name: hello.server_name,
+                                            public_key_hex: hello.public_key_hex,
+                                        });
+                                    } else {
+                                        warn!(remote_host, "mesh: invalid HELLO payload");
+                                    }
+                                }
+                                "PEERS" => {
+                                    if let Ok(peers) = serde_json::from_str::<Vec<MeshPeerInfo>>(&json) {
+                                        let _ = event_tx.send(RelayEvent::MeshPeers {
+                                            remote_host: remote_host.clone(),
+                                            peers,
+                                        });
+                                    }
+                                }
+                                "TOPOLOGY" => {
+                                    let _ = event_tx.send(RelayEvent::MeshTopology {
+                                        remote_host: remote_host.clone(),
+                                        json,
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
                     "433" => {
                         warn!(remote_host, "federation: nick collision, retrying with suffix");
                         relay_nick = format!("{relay_nick}_");
@@ -805,6 +906,20 @@ async fn relay_task(
                             let _ = framed.send(part_msg).await;
                         }
                     }
+                    RelayCommand::MeshHello { json } => {
+                        if registered {
+                            let mesh_msg = Message {
+                                prefix: None,
+                                command: "MESH".into(),
+                                params: vec!["HELLO".into(), json],
+                            };
+                            if framed.send(mesh_msg).await.is_err() {
+                                break;
+                            }
+                        } else {
+                            pre_reg_cmds.push(RelayCommand::MeshHello { json });
+                        }
+                    }
                     RelayCommand::Raw(raw_msg) => {
                         if registered {
                             if framed.send(raw_msg).await.is_err() {
@@ -839,9 +954,95 @@ async fn relay_task(
     let _ = event_tx.send(RelayEvent::Disconnected { remote_host });
 }
 
+/// JSON payload for MESH HELLO.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct MeshHelloPayload {
+    pub peer_id: String,
+    pub server_name: String,
+    pub public_key_hex: String,
+}
+
+/// Spawn the mesh connector — proactively connects to all LAGOON_PEERS
+/// and sends MESH HELLO to establish identity exchange.
+///
+/// Mesh connections are metadata-only — they exchange MESH commands but
+/// create NO channels and inject NO users into rooms.
+pub fn spawn_mesh_connector(state: SharedState, transport_config: Arc<TransportConfig>) {
+    let peers: Vec<String> = transport_config.peers.keys().cloned().collect();
+    if peers.is_empty() {
+        return;
+    }
+
+    info!(peer_count = peers.len(), "mesh: initiating connections to peers");
+
+    tokio::spawn(async move {
+        let st = state.read().await;
+        let hello_json = serde_json::to_string(&MeshHelloPayload {
+            peer_id: st.lens.peer_id.clone(),
+            server_name: st.lens.server_name.clone(),
+            public_key_hex: st.lens.public_key_hex.clone(),
+        })
+        .unwrap_or_default();
+        let event_tx = st.federation_event_tx.clone();
+        let tc = st.transport_config.clone();
+        drop(st);
+
+        for peer_host in peers {
+            // Skip self — don't connect to our own server name.
+            if peer_host == *SERVER_NAME {
+                info!(peer = %peer_host, "mesh: skipping self");
+                continue;
+            }
+
+            let mut st = state.write().await;
+
+            // Skip if already connected (e.g. from a user JOIN).
+            if st.federation.relays.contains_key(&peer_host) {
+                // Send MESH HELLO on existing relay.
+                if let Some(relay) = st.federation.relays.get(&peer_host) {
+                    let _ = relay.outgoing_tx.send(RelayCommand::MeshHello {
+                        json: hello_json.clone(),
+                    });
+                }
+                continue;
+            }
+
+            // Skip defederated peers.
+            if st.mesh.defederated.contains(&peer_host) {
+                info!(peer = %peer_host, "mesh: skipping defederated peer");
+                continue;
+            }
+
+            info!(peer = %peer_host, "mesh: connecting");
+
+            let (cmd_tx, task_handle) = spawn_relay(
+                peer_host.clone(),
+                event_tx.clone(),
+                Arc::clone(&tc),
+            );
+
+            // Send MESH HELLO (will be queued until registered).
+            let _ = cmd_tx.send(RelayCommand::MeshHello {
+                json: hello_json.clone(),
+            });
+
+            st.federation.relays.insert(
+                peer_host.clone(),
+                RelayHandle {
+                    outgoing_tx: cmd_tx,
+                    remote_host: peer_host,
+                    channels: HashMap::new(),
+                    task_handle,
+                    mesh_connected: true,
+                },
+            );
+        }
+    });
+}
+
 /// Send a FRELAY command to the remote server. Returns true on success.
 async fn send_frelay(
-    framed: &mut Framed<TcpStream, IrcCodec>,
+    framed: &mut Framed<transport::RelayStream, IrcCodec>,
     cmd: RelayCommand,
     our_name: &str,
 ) -> bool {

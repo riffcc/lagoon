@@ -1,0 +1,4 @@
+lagoon_web_binary_dest: /usr/local/bin/lagoon-web
+lagoon_web_dir: /opt/lagoon-web
+lagoon_service_file: /etc/systemd/system/lagoon-web.service
+rust_log: info

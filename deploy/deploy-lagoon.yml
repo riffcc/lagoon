@@ -1,0 +1,67 @@
+---
+- name: Deploy Lagoon IRC Server
+  groups:
+    - lagoon-servers
+  ssh_user: wings
+
+  tasks:
+    - !shell
+      name: Set FQDN hostname
+      cmd: hostnamectl set-hostname {{ fqdn }}
+      with:
+        sudo: root
+
+    - !shell
+      name: Add peer hosts entries for federation
+      cmd: grep -q 'sanctuary.lon.riff.cc' /etc/hosts || echo '10.7.1.37 sanctuary.lon.riff.cc sanctuary' >> /etc/hosts; grep -q 'tealc.lon.riff.cc' /etc/hosts || echo '10.7.1.195 tealc.lon.riff.cc tealc' >> /etc/hosts
+      with:
+        sudo: root
+
+    - !shell
+      name: Stop existing lagoon service if running
+      cmd: systemctl stop lagoon || true
+      with:
+        sudo: root
+
+    - !copy
+      name: Deploy lagoon binary
+      src: lagoon
+      dest: "{{ lagoon_binary_dest }}"
+      attributes:
+        owner: root
+        group: root
+        mode: "0o755"
+      with:
+        sudo: root
+
+    - !copy
+      name: Install systemd unit
+      src: lagoon.service
+      dest: "{{ lagoon_service_file }}"
+      attributes:
+        owner: root
+        group: root
+        mode: "0o644"
+      with:
+        sudo: root
+
+    - !shell
+      name: Reload systemd daemon
+      cmd: systemctl daemon-reload
+      with:
+        sudo: root
+
+    - !sd_service
+      name: Enable and start lagoon
+      service: lagoon
+      enabled: "true"
+      started: "true"
+      restart: "true"
+      with:
+        sudo: root
+
+    - !shell
+      name: Verify lagoon is listening
+      cmd: ss -tlnp | grep {{ lagoon_port }}
+      with:
+        sudo: root

@@ -1,0 +1,29 @@
+# Yggdrasil mesh networking daemon — sidecar for Lagoon pods.
+#
+# Shares network namespace with the lagoon container so both services
+# can communicate over the Yggdrasil IPv6 overlay (200::/7).
+#
+# Environment variables:
+#   YGGDRASIL_PEERS      - Space-separated list of peer URIs
+#   YGGDRASIL_LISTEN     - Listen address (default: tcp://0.0.0.0:0)
+#   YGGDRASIL_ADMIN      - Admin listen address (default: unix:///var/run/yggdrasil.sock)
+#   YGGDRASIL_CONFIG     - Path to config file (auto-generated if missing)
+
+FROM golang:1.24-bookworm AS build
+WORKDIR /build
+RUN git clone --depth 1 https://github.com/yggdrasil-network/yggdrasil-go.git . && \
+    CGO_ENABLED=0 ./build && \
+    ls -la /build
+
+FROM debian:trixie-slim
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /build/yggdrasil /usr/local/bin/yggdrasil
+COPY --from=build /build/yggdrasilctl /usr/local/bin/yggdrasilctl
+
+COPY yggdrasil-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/yggdrasil-entrypoint.sh
+
+VOLUME /etc/yggdrasil
+
+ENTRYPOINT ["yggdrasil-entrypoint.sh"]

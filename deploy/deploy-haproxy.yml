@@ -1,0 +1,56 @@
+---
+- name: Deploy HAProxy TLS Termination
+  groups:
+    - lagoon-gateway
+  ssh_user: wings
+
+  tasks:
+    - !shell
+      name: Install HAProxy
+      cmd: apt-get update && apt-get install -y --no-install-recommends haproxy
+      with:
+        sudo: root
+
+    - !shell
+      name: Create certificate directory
+      cmd: mkdir -p /etc/haproxy/certs
+      with:
+        sudo: root
+
+    - !copy
+      name: Deploy HAProxy configuration
+      src: haproxy.cfg
+      dest: /etc/haproxy/haproxy.cfg
+      attributes:
+        owner: root
+        group: root
+        mode: "0o644"
+      with:
+        sudo: root
+
+    - !shell
+      name: Validate HAProxy configuration
+      cmd: haproxy -c -f /etc/haproxy/haproxy.cfg 2>&1 || echo "WARNING - config check failed (cert may not be deployed yet)"
+      with:
+        sudo: root
+
+    - !shell
+      name: Reload systemd daemon
+      cmd: systemctl daemon-reload
+      with:
+        sudo: root
+
+    - !sd_service
+      name: Enable and start HAProxy
+      service: haproxy
+      enabled: "true"
+      started: "true"
+      restart: "true"
+      with:
+        sudo: root
+
+    - !shell
+      name: Verify HAProxy is listening on 443
+      cmd: ss -tlnp | grep ':443' || echo "WARNING - HAProxy not listening on 443 (cert may be missing)"
+      with:
+        sudo: root
