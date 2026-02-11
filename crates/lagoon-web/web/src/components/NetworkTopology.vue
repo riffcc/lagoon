@@ -9,6 +9,8 @@ const container = ref(null)
 const mode = ref('') // '3d', '2d', or '' (loading)
 let graph = null
 let ws = null
+let showBeams = true
+let showNodes = true
 
 // Color palette — Tokyo Night theme.
 const COLORS = {
@@ -16,7 +18,7 @@ const COLORS = {
   connected: '#9ece6a',  // Green — connected peer
   offline: '#f7768e',    // Red — known but not connected
   browser: '#bb9af7',    // Purple — browser/web peer
-  link: '#565f89',       // Muted — link color
+  link: '#565f89',       // Muted — default link color (no metrics)
   background: '#1a1b26', // Dark background
   text: '#c0caf5',       // Light text
 }
@@ -33,6 +35,118 @@ function nodeLabel(node) {
   return node.server_name
 }
 
+// ---------------------------------------------------------------------------
+// Link metric visualization helpers
+// ---------------------------------------------------------------------------
+
+/** Link width = upload bandwidth (logarithmic scale).
+ *  Min 1.5 (idle/no data), max ~3.5 at 100MB/s. */
+function linkWidthByUpload(link) {
+  if (!link.upload_bps || link.upload_bps <= 0) return 1.5
+  // Log scale: 1KB/s -> ~1.7, 1MB/s -> ~2.4, 100MB/s -> ~3.5
+  return Math.max(1.5, 1.0 + Math.log10(link.upload_bps / 1000 + 1) * 0.625)
+}
+
+/** Link color = download bandwidth (gradient from muted -> green -> blue). */
+function linkColorByDownload(link) {
+  if (!link.download_bps || link.download_bps <= 0) return COLORS.link
+  const low = 1000       // 1 KB/s
+  const high = 10_000_000 // 10 MB/s
+  const t = Math.min(1, Math.max(0,
+    (Math.log10(link.download_bps) - Math.log10(low)) /
+    (Math.log10(high) - Math.log10(low))
+  ))
+  if (t < 0.5) return lerpColor('#565f89', '#9ece6a', t * 2)   // muted -> green
+  return lerpColor('#9ece6a', '#7aa2f7', (t - 0.5) * 2)        // green -> blue
+}
+
+/** Linear color interpolation between two hex colors. */
+function lerpColor(a, b, t) {
+  const parse = c => [
+    parseInt(c.slice(1, 3), 16),
+    parseInt(c.slice(3, 5), 16),
+    parseInt(c.slice(5, 7), 16),
+  ]
+  const [ar, ag, ab] = parse(a)
+  const [br, bg, bb] = parse(b)
+  const r = Math.round(ar + (br - ar) * t)
+  const g = Math.round(ag + (bg - ag) * t)
+  const bl = Math.round(ab + (bb - ab) * t)
+  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${bl.toString(16).padStart(2, '0')}`
+}
+
+/** Format bytes per second as human-readable string. */
+function formatBps(bps) {
+  if (bps >= 1_000_000) return `${(bps / 1_000_000).toFixed(1)} MB/s`
+  if (bps >= 1_000) return `${(bps / 1_000).toFixed(1)} KB/s`
+  return `${Math.round(bps)} B/s`
+}
+
+/** Link tooltip with bandwidth and latency metrics. */
+function linkTooltip(link) {
+  const parts = []
+  if (link.link_type === 'spiral') parts.push('SPIRAL geometric neighbor')
+  if (link.latency_ms) parts.push(`Latency: ${link.latency_ms.toFixed(1)}ms`)
+  if (link.upload_bps) parts.push(`Up: ${formatBps(link.upload_bps)}`)
+  if (link.download_bps) parts.push(`Down: ${formatBps(link.download_bps)}`)
+  return parts.join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// Two-layer link rendering (SPIRAL structural + relay data links)
+// ---------------------------------------------------------------------------
+
+/** Link width by type: thin structural for spiral, metric-based for relay. */
+function linkWidthByType(link) {
+  if (link.link_type === 'spiral') return 0.8
+  if (link.link_type === 'proof') return 1.0
+  return linkWidthByUpload(link)
+}
+
+/** Link color by latency: green (low) → yellow (moderate) → red (high). */
+function linkColorByLatency(link) {
+  if (!link.latency_ms || link.latency_ms <= 0) return COLORS.link
+  const low = 1     // 1ms
+  const high = 200   // 200ms
+  const t = Math.min(1, Math.max(0, (link.latency_ms - low) / (high - low)))
+  if (t < 0.5) return lerpColor('#9ece6a', '#e0af68', t * 2)   // green → yellow
+  return lerpColor('#e0af68', '#f7768e', (t - 0.5) * 2)         // yellow → red
+}
+
+/** Link color by type: very muted for spiral, latency-based for relay. */
+function linkColorByType(link) {
+  if (link.link_type === 'spiral') return '#3b4261'
+  // Prefer latency color for relay links; fall back to download-based.
+  if (link.latency_ms && link.latency_ms > 0) return linkColorByLatency(link)
+  return linkColorByDownload(link)
+}
+
+/** Link opacity by type: faint for spiral, dimmer for proof, normal for relay. */
+function linkOpacityByType(link) {
+  if (link.link_type === 'spiral') return 0.3
+  if (link.link_type === 'proof') return 0.4
+  return 0.6
+}
+
+/** Configure d3 link force distance based on latency (PoLP).
+ *  Link length reflects measured RTT: short = low latency, long = high latency. */
+function configureLinkDistance(g) {
+  const linkForce = g.d3Force('link')
+  if (linkForce && linkForce.distance) {
+    linkForce.distance(link => {
+      if (link.latency_ms && link.latency_ms > 0) {
+        // Scale: 1ms → 30px, 500ms → 500px
+        return Math.max(30, Math.min(500, link.latency_ms))
+      }
+      return 100 // Default for links without latency data
+    })
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Graph initialization
+// ---------------------------------------------------------------------------
+
 async function try3D() {
   let ForceGraph3D, THREE
   try {
@@ -47,6 +161,7 @@ async function try3D() {
   }
 
   try {
+    if (!container.value) return false
     const g = ForceGraph3D({
       rendererConfig: { antialias: true, alpha: false },
     })(container.value)
@@ -60,9 +175,12 @@ async function try3D() {
       .nodeColor(nodeColor)
       .nodeVal(node => node.is_self ? 4 : node.node_type === 'browser' ? 1 : 2)
       .nodeOpacity(0.9)
-      .linkColor(() => COLORS.link)
-      .linkOpacity(0.6)
-      .linkWidth(1.5)
+      .nodeVisibility(() => showNodes)
+      .linkVisibility(() => showBeams)
+      .linkColor(linkColorByType)
+      .linkOpacity(linkOpacityByType)
+      .linkWidth(linkWidthByType)
+      .linkLabel(linkTooltip)
       .nodeThreeObject(node => {
         const group = new THREE.Group()
         const isBrowser = node.node_type === 'browser'
@@ -95,6 +213,18 @@ async function try3D() {
         group.add(sprite)
         return group
       })
+      .linkDirectionalParticles(link => link.link_type === 'relay' ? 2 : 0)
+      .linkDirectionalParticleSpeed(link => {
+        if (link.latency_ms && link.latency_ms > 0) {
+          return Math.max(0.001, 0.02 / Math.max(1, link.latency_ms / 10))
+        }
+        return 0.005
+      })
+      .linkDirectionalParticleWidth(1.5)
+      .linkDirectionalParticleColor(link => linkColorByType(link))
+
+    // Latency-based link distance.
+    configureLinkDistance(g)
 
     graph = g
     mode.value = '3d'
@@ -115,6 +245,7 @@ async function try2D() {
     return false
   }
 
+  if (!container.value) return false
   const g = ForceGraph()(container.value)
 
   g.backgroundColor(COLORS.background)
@@ -125,8 +256,11 @@ async function try2D() {
     })
     .nodeColor(nodeColor)
     .nodeVal(node => node.is_self ? 6 : node.node_type === 'browser' ? 1.5 : 3)
-    .linkColor(() => COLORS.link)
-    .linkWidth(2)
+    .nodeVisibility(() => showNodes)
+    .linkVisibility(() => showBeams)
+    .linkColor(linkColorByType)
+    .linkWidth(linkWidthByType)
+    .linkLabel(linkTooltip)
     .nodeCanvasObject((node, ctx, globalScale) => {
       const isBrowser = node.node_type === 'browser'
       const size = node.is_self ? 8 : isBrowser ? 3 : 5
@@ -172,6 +306,18 @@ async function try2D() {
       ctx.fillStyle = color
       ctx.fill()
     })
+    .linkDirectionalParticles(link => link.link_type === 'relay' ? 2 : 0)
+    .linkDirectionalParticleSpeed(link => {
+      if (link.latency_ms && link.latency_ms > 0) {
+        return Math.max(0.001, 0.02 / Math.max(1, link.latency_ms / 10))
+      }
+      return 0.005
+    })
+    .linkDirectionalParticleWidth(1.5)
+    .linkDirectionalParticleColor(link => linkColorByType(link))
+
+  // Latency-based link distance.
+  configureLinkDistance(g)
 
   graph = g
   mode.value = '2d'
@@ -195,21 +341,115 @@ async function initGraph() {
 function updateGraph(snapshot) {
   if (!graph) return
 
-  const nodes = snapshot.nodes.map(n => ({
-    id: n.lens_id,
-    server_name: n.server_name,
-    lens_id: n.lens_id,
-    is_self: n.is_self,
-    connected: n.connected,
-    node_type: n.node_type || 'server',
-  }))
+  const current = graph.graphData()
+  const currentNodeMap = new Map(current.nodes.map(n => [n.id, n]))
 
-  const links = snapshot.links.map(l => ({
+  // Build a link key for identity comparison.
+  // force-graph mutates source/target from string IDs to node object refs
+  // after the first graphData() call, so we must handle both forms.
+  const linkKey = l => {
+    const s = typeof l.source === 'object' ? l.source.id : l.source
+    const t = typeof l.target === 'object' ? l.target.id : l.target
+    return `${s}\0${t}`
+  }
+  const currentLinkMap = new Map(current.links.map(l => [linkKey(l), l]))
+
+  // Incoming node/link sets.
+  const incomingNodeIds = new Set(snapshot.nodes.map(n => n.lens_id))
+  const incomingLinks = snapshot.links.map(l => ({
     source: l.source,
     target: l.target,
+    upload_bps: l.upload_bps || 0,
+    download_bps: l.download_bps || 0,
+    latency_ms: l.latency_ms || null,
+    link_type: l.link_type || 'relay',
   }))
+  const incomingLinkKeys = new Set(incomingLinks.map(l => `${l.source}\0${l.target}`))
 
-  graph.graphData({ nodes, links })
+  let structureChanged = false
+
+  // --- Update or add nodes ---
+  for (const n of snapshot.nodes) {
+    const existing = currentNodeMap.get(n.lens_id)
+    if (existing) {
+      // Mutate in-place — no simulation reset.
+      existing.server_name = n.server_name
+      existing.lens_id = n.lens_id
+      existing.is_self = n.is_self
+      existing.connected = n.connected
+      existing.node_type = n.node_type || 'server'
+    } else {
+      // New node — must rebuild.
+      structureChanged = true
+    }
+  }
+
+  // Check for removed nodes.
+  if (current.nodes.length !== incomingNodeIds.size) {
+    structureChanged = true
+  }
+  for (const node of current.nodes) {
+    if (!incomingNodeIds.has(node.id)) {
+      structureChanged = true
+      break
+    }
+  }
+
+  // --- Update or add links ---
+  for (const l of incomingLinks) {
+    const key = `${l.source}\0${l.target}`
+    const existing = currentLinkMap.get(key)
+    if (existing) {
+      // Mutate metrics in-place — accessor functions pick up changes per-frame.
+      existing.upload_bps = l.upload_bps
+      existing.download_bps = l.download_bps
+      existing.latency_ms = l.latency_ms
+      existing.link_type = l.link_type
+    } else {
+      structureChanged = true
+    }
+  }
+
+  // Check for removed links.
+  if (current.links.length !== incomingLinks.length) {
+    structureChanged = true
+  }
+  for (const link of current.links) {
+    if (!incomingLinkKeys.has(linkKey(link))) {
+      structureChanged = true
+      break
+    }
+  }
+
+  // Only call graphData() when topology structure changed (add/remove).
+  // This avoids resetting d3 simulation alpha, preventing the re-heat glitch.
+  if (structureChanged) {
+    const nodes = snapshot.nodes.map(n => {
+      // Preserve existing position for nodes that already exist.
+      const prev = currentNodeMap.get(n.lens_id)
+      const base = {
+        id: n.lens_id,
+        server_name: n.server_name,
+        lens_id: n.lens_id,
+        is_self: n.is_self,
+        connected: n.connected,
+        node_type: n.node_type || 'server',
+      }
+      // Preserve previous position so d3 doesn't reset the simulation.
+      if (prev) {
+        base.x = prev.x
+        base.y = prev.y
+        base.z = prev.z
+        base.vx = prev.vx
+        base.vy = prev.vy
+        base.vz = prev.vz
+      }
+      return base
+    })
+
+    graph.graphData({ nodes, links: incomingLinks })
+    configureLinkDistance(graph)
+  }
 }
 
 function connectWs() {
@@ -229,6 +469,25 @@ function connectWs() {
 
 let resizeObserver = null
 
+/** Re-apply visibility accessors after a toggle. No simulation reset. */
+function refreshGraph() {
+  if (!graph) return
+  graph.nodeVisibility(() => showNodes)
+  graph.linkVisibility(() => showBeams)
+}
+
+function onKeyDown(event) {
+  // Ignore if typing in an input/textarea.
+  if (event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') return
+  if (event.key === 'b' || event.key === 'B') {
+    showBeams = !showBeams
+    refreshGraph()
+  } else if (event.key === 'n' || event.key === 'N') {
+    showNodes = !showNodes
+    refreshGraph()
+  }
+}
+
 onMounted(async () => {
   await initGraph()
   if (graph && container.value) {
@@ -241,9 +500,11 @@ onMounted(async () => {
     resizeObserver.observe(container.value)
   }
   connectWs()
+  window.addEventListener('keydown', onKeyDown)
 })
 
 onUnmounted(() => {
+  window.removeEventListener('keydown', onKeyDown)
   if (ws) ws.close()
   if (resizeObserver) resizeObserver.disconnect()
   if (graph) graph._destructor?.()

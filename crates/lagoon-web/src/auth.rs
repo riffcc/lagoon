@@ -142,6 +142,11 @@ pub async fn register_complete(
     let token = generate_session_token();
     state.sessions.write().await.insert(token.clone(), username.clone());
 
+    // Auto-join the default community.
+    if let Some(irc) = state.irc_state.as_ref() {
+        irc.write().await.communities.auto_join_default(&username);
+    }
+
     Ok(Json(AuthResponse { token, username }))
 }
 
@@ -231,6 +236,11 @@ pub async fn login_complete(
 
     let token = generate_session_token();
     state.sessions.write().await.insert(token.clone(), username.clone());
+
+    // Auto-join the default community on login too (in case they registered before communities existed).
+    if let Some(irc) = state.irc_state.as_ref() {
+        irc.write().await.communities.auto_join_default(&username);
+    }
 
     Ok(Json(AuthResponse { token, username }))
 }

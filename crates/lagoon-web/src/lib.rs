@@ -1,5 +1,6 @@
 mod auth;
 mod bridge;
+mod communities;
 mod invites;
 pub mod state;
 mod tls;
@@ -42,6 +43,14 @@ fn build_router(state: AppState) -> Router {
         .route("/api/invite/list", get(invites::list_invites))
         .route("/api/invite/{code}", patch(invites::modify_invite))
         .route("/api/invite/{code}", delete(invites::revoke_invite))
+        // Community (circle) endpoints
+        .route("/api/communities", get(communities::list).post(communities::create))
+        .route("/api/communities/{id}", get(communities::get_one).patch(communities::update).delete(communities::delete))
+        .route("/api/communities/{id}/join", post(communities::join))
+        .route("/api/communities/{id}/leave", post(communities::leave))
+        .route("/api/communities/{id}/members", get(communities::members))
+        .route("/api/communities/{id}/channels", post(communities::add_channel))
+        .route("/api/communities/{id}/channels/{name}", delete(communities::remove_channel))
         // Serve Vue.js SPA (static files)
         .fallback_service(ServeDir::new("web/dist").append_index_html_on_directories(true))
         .layer(CorsLayer::permissive())
@@ -73,16 +82,25 @@ pub async fn run_with_irc() -> Result<(), Box<dyn std::error::Error + Send + Syn
     let bind_addr =
         std::env::var("LAGOON_IRC_BIND").unwrap_or_else(|_| "127.0.0.1:6667".to_string());
     let bind_static: &'static str = Box::leak(bind_addr.into_boxed_str());
-    let addrs: Vec<&str> = vec![bind_static];
+    let mut addrs: Vec<&str> = vec![bind_static];
 
-    // In gateway mode we do NOT bind Yggdrasil for IRC. The web gateway is the
-    // sole user-facing entry point. Federation happens via outbound TLS
-    // connections only (or inbound via HAProxy → loopback for London nodes).
-    if lagoon_server::irc::transport::detect_yggdrasil_addr().is_some() {
-        info!("Yggdrasil detected but suppressed in gateway mode — federation is outbound-only");
+    // Bind Yggdrasil for mesh federation — any peer can reach us via overlay.
+    // Skip when using yggstack (SOCKS5 proxy mode) — the Ygg address lives
+    // inside the userspace netstack, not on a local interface. yggstack's
+    // -remote-tcp forwards inbound Ygg connections to localhost:6667.
+    let is_wildcard =
+        bind_static.starts_with("[::]:") || bind_static.starts_with("0.0.0.0:");
+    let yggstack_mode = std::env::var("YGG_SOCKS_PROXY").is_ok();
+    if !is_wildcard && !yggstack_mode {
+        if let Some(ygg_addr) = lagoon_server::irc::transport::detect_yggdrasil_addr() {
+            info!("detected Yggdrasil address: {ygg_addr}");
+            let addr: &'static str =
+                Box::leak(format!("[{ygg_addr}]:6667").into_boxed_str());
+            addrs.push(addr);
+        }
     }
 
-    let (irc_state, topology_rx, _irc_handles) =
+    let (irc_state, topology_rx, _irc_handles, _vdf_shutdown) =
         lagoon_server::irc::server::start(&addrs).await?;
 
     let state = AppState::new()?.with_irc(irc_state, topology_rx);

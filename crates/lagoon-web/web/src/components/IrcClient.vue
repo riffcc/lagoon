@@ -1,45 +1,69 @@
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
+import { ref, computed, watch, nextTick } from 'vue'
 import NetworkTopology from './NetworkTopology.vue'
 
 const props = defineProps({
-  token: String,
-  username: String,
-  serverUrl: String,
+  connection: Object,
+  community: Object,
+  activeCommunity: Object,
 })
 const emit = defineEmits(['logout'])
 
-// View mode: 'chat' or 'mesh'.
 const viewMode = ref('chat')
-
-// Connection state.
-const connected = ref(false)
-const status = ref('Connecting...')
-let ws = null
-
-// IRC state.
-const channels = reactive(new Map())   // name → { messages: [], users: [], topic: '' }
-const activeChannel = ref('')
 const inputText = ref('')
-const serverMessages = reactive([])    // messages not tied to a channel
 const messagesEl = ref(null)
+const contextMenu = ref(null) // { x, y, user }
 
-// Current channel data.
+// Access connection state via computed to guarantee Vue reactivity tracking.
+const conn = computed(() => props.connection)
+const connected = computed(() => conn.value.connected.value)
+const status = computed(() => conn.value.status.value)
+const username = computed(() => conn.value.username.value)
+const communityName = computed(() => conn.value.communityName.value)
+const channels = computed(() => conn.value.channels)
+const serverMessages = computed(() => conn.value.serverMessages)
+const activeChannel = computed({
+  get: () => conn.value.activeChannel.value,
+  set: (v) => { conn.value.activeChannel.value = v },
+})
+
 const currentChannel = computed(() => {
   if (!activeChannel.value) return null
-  return channels.get(activeChannel.value) || null
+  return channels.value.get(activeChannel.value) || null
 })
 
 const channelList = computed(() => {
-  return ['Server', ...channels.keys()]
+  const allChannels = [...channels.value.keys()]
+  if (props.activeCommunity?.channels?.length) {
+    const communitySet = new Set(props.activeCommunity.channels)
+    // Community channels first, then any other channels the user has joined.
+    const inCommunity = allChannels.filter(ch => communitySet.has(ch))
+    const other = allChannels.filter(ch => !communitySet.has(ch))
+    return ['Server', ...inCommunity, ...other]
+  }
+  return ['Server', ...allChannels]
 })
 
 const displayMessages = computed(() => {
   if (activeChannel.value === 'Server' || !activeChannel.value) {
-    return serverMessages
+    return serverMessages.value
   }
   return currentChannel.value?.messages || []
 })
+
+const displayName = computed(() => {
+  if (props.activeCommunity?.name) return props.activeCommunity.name
+  return communityName.value || props.community?.name || hostFromUrl(props.community?.url) || 'Lagoon'
+})
+
+function hostFromUrl(url) {
+  if (!url) return ''
+  try {
+    return new URL(url).hostname
+  } catch {
+    return url
+  }
+}
 
 function scrollToBottom() {
   nextTick(() => {
@@ -52,274 +76,46 @@ function scrollToBottom() {
 watch(displayMessages, scrollToBottom, { deep: true })
 watch(activeChannel, scrollToBottom)
 
-function connect() {
-  const url = new URL(props.serverUrl || window.location.origin)
-  const proto = url.protocol === 'https:' ? 'wss:' : 'ws:'
-  ws = new WebSocket(`${proto}//${url.host}/api/ws`)
-
-  ws.onopen = () => {
-    // Authenticate.
-    ws.send(JSON.stringify({ type: 'auth', token: props.token }))
-  }
-
-  ws.onmessage = (event) => {
-    const msg = JSON.parse(event.data)
-    handleServerMessage(msg)
-  }
-
-  ws.onclose = () => {
-    connected.value = false
-    status.value = 'Disconnected'
-    addServerMessage('--- Disconnected from server ---')
-  }
-
-  ws.onerror = () => {
-    status.value = 'Connection error'
-  }
-}
-
-function handleServerMessage(msg) {
-  switch (msg.type) {
-    case 'auth_ok':
-      status.value = `Authenticated as ${msg.username}`
-      break
-
-    case 'auth_fail':
-      status.value = `Auth failed: ${msg.reason}`
-      emit('logout')
-      break
-
-    case 'status':
-      connected.value = msg.connected
-      status.value = msg.message
-      if (msg.connected) {
-        // Auto-join #lagoon after connecting.
-        sendIrc('JOIN #lagoon')
-      }
-      break
-
-    case 'irc':
-      parseIrcLine(msg.line)
-      break
-  }
-}
-
-function parseIrcLine(line) {
-  // Parse IRC protocol line.
-  let prefix = ''
-  let command = ''
-  let params = []
-
-  let rest = line
-  if (rest.startsWith(':')) {
-    const spaceIdx = rest.indexOf(' ')
-    prefix = rest.substring(1, spaceIdx)
-    rest = rest.substring(spaceIdx + 1)
-  }
-
-  const trailingIdx = rest.indexOf(' :')
-  let trailing = null
-  if (trailingIdx >= 0) {
-    trailing = rest.substring(trailingIdx + 2)
-    rest = rest.substring(0, trailingIdx)
-  }
-
-  const parts = rest.split(' ').filter(Boolean)
-  command = parts[0] || ''
-  params = parts.slice(1)
-  if (trailing !== null) params.push(trailing)
-
-  const nick = prefix.split('!')[0]
-  const now = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
-
-  switch (command) {
-    case 'PRIVMSG': {
-      const target = params[0]
-      const text = params[1] || ''
-      if (target.startsWith('#')) {
-        ensureChannel(target)
-        channels.get(target).messages.push({ time: now, nick, text, type: 'msg' })
-      } else {
-        // DM — create a pseudo-channel for the sender.
-        ensureChannel(nick)
-        channels.get(nick).messages.push({ time: now, nick, text, type: 'msg' })
-      }
-      break
-    }
-
-    case 'JOIN': {
-      const chan = params[0]
-      ensureChannel(chan)
-      channels.get(chan).messages.push({ time: now, nick, text: 'has joined', type: 'event' })
-      // Add to member list.
-      const joinUsers = channels.get(chan).users
-      if (!joinUsers.includes(nick)) {
-        joinUsers.push(nick)
-        joinUsers.sort((a, b) => a.replace(/^[~&@%+]/, '').localeCompare(b.replace(/^[~&@%+]/, '')))
-      }
-      if (nick === props.username && !activeChannel.value) {
-        activeChannel.value = chan
-      }
-      break
-    }
-
-    case 'PART': {
-      const chan = params[0]
-      if (channels.has(chan)) {
-        channels.get(chan).messages.push({ time: now, nick, text: params[1] || 'has left', type: 'event' })
-        // Remove from member list (match with or without prefix).
-        const partUsers = channels.get(chan).users
-        const partIdx = partUsers.findIndex(u => u.replace(/^[~&@%+]/, '') === nick)
-        if (partIdx !== -1) partUsers.splice(partIdx, 1)
-      }
-      break
-    }
-
-    case 'QUIT': {
-      const reason = params[0] || 'Quit'
-      for (const [, ch] of channels) {
-        // Remove from all channel member lists.
-        const quitIdx = ch.users.findIndex(u => u.replace(/^[~&@%+]/, '') === nick)
-        if (quitIdx !== -1) {
-          ch.users.splice(quitIdx, 1)
-          ch.messages.push({ time: now, nick, text: `has quit (${reason})`, type: 'event' })
-        }
-      }
-      break
-    }
-
-    case 'NICK': {
-      const newNick = params[0]
-      for (const [, ch] of channels) {
-        const nickIdx = ch.users.findIndex(u => u.replace(/^[~&@%+]/, '') === nick)
-        if (nickIdx !== -1) {
-          // Preserve prefix (e.g. @, +) when renaming.
-          const prefix = ch.users[nickIdx].match(/^[~&@%+]/)?.[0] || ''
-          ch.users[nickIdx] = prefix + newNick
-          ch.messages.push({ time: now, nick, text: `is now known as ${newNick}`, type: 'event' })
-        }
-      }
-      break
-    }
-
-    case '332': // RPL_TOPIC
-      if (params.length >= 3) {
-        const chan = params[1]
-        ensureChannel(chan)
-        channels.get(chan).topic = params[2]
-      }
-      break
-
-    case '353': { // RPL_NAMREPLY
-      const chan = params[2]
-      const names = (params[3] || '').split(' ').filter(Boolean)
-      ensureChannel(chan)
-      channels.get(chan).users = names
-      break
-    }
-
-    case '366': // RPL_ENDOFNAMES
-      break
-
-    case 'PING':
-      sendIrc(`PONG ${params[0] || ''}`)
-      break
-
-    case 'MODE':
-      // Silently handle mode changes.
-      break
-
-    default:
-      // Numerics and other messages go to server buffer.
-      addServerMessage(`${prefix ? prefix + ' ' : ''}${command} ${params.join(' ')}`)
-  }
-}
-
-function ensureChannel(name) {
-  if (!channels.has(name)) {
-    channels.set(name, { messages: [], users: [], topic: '' })
-  }
-}
-
-function addServerMessage(text) {
-  const now = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
-  serverMessages.push({ time: now, nick: '*', text, type: 'server' })
-}
-
-function sendIrc(line) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'irc', line }))
-  }
-}
-
 function sendMessage() {
   const text = inputText.value.trim()
   if (!text) return
   inputText.value = ''
-
-  if (text.startsWith('/')) {
-    // Command.
-    const parts = text.substring(1).split(' ')
-    const cmd = parts[0].toUpperCase()
-    const args = parts.slice(1).join(' ')
-
-    switch (cmd) {
-      case 'JOIN':
-        sendIrc(`JOIN ${args}`)
-        break
-      case 'PART':
-        sendIrc(`PART ${args || activeChannel.value}`)
-        if (!args && activeChannel.value) {
-          channels.delete(activeChannel.value)
-          activeChannel.value = channelList.value[1] || 'Server'
-        }
-        break
-      case 'MSG':
-      case 'PRIVMSG': {
-        const [target, ...rest] = args.split(' ')
-        sendIrc(`PRIVMSG ${target} :${rest.join(' ')}`)
-        break
-      }
-      case 'NICK':
-        sendIrc(`NICK ${args}`)
-        break
-      case 'QUIT':
-        sendIrc(`QUIT :${args || 'Leaving'}`)
-        break
-      default:
-        sendIrc(`${cmd} ${args}`)
-    }
-  } else if (activeChannel.value && activeChannel.value !== 'Server') {
-    // Regular message to current channel.
-    sendIrc(`PRIVMSG ${activeChannel.value} :${text}`)
-    const now = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
-    channels.get(activeChannel.value)?.messages.push({
-      time: now,
-      nick: props.username,
-      text,
-      type: 'msg',
-    })
-  }
+  props.connection.sendMessage(text)
 }
 
-onMounted(() => {
-  connect()
-})
+function openUserMenu(event, user) {
+  const bareNick = user.replace(/^[~&@%+]/, '')
+  contextMenu.value = { x: event.clientX, y: event.clientY, user: bareNick }
+}
 
-onUnmounted(() => {
-  if (ws) ws.close()
-})
+function closeUserMenu() {
+  contextMenu.value = null
+}
+
+function selectChannel(name) {
+  viewMode.value = 'chat'
+  conn.value.activeChannel.value = name
+}
+
+function startDm(nick) {
+  contextMenu.value = null
+  props.connection.ensureChannel(nick)
+  conn.value.activeChannel.value = nick
+}
 </script>
 
 <template>
   <div class="irc-layout">
-    <!-- Sidebar -->
+    <!-- Channel sidebar -->
     <div class="sidebar">
       <div class="sidebar-header">
-        <span class="username">{{ username }}</span>
-        <button class="logout-btn" @click="$emit('logout')" title="Logout">x</button>
+        <div class="header-info">
+          <span class="community-name">{{ displayName }}</span>
+          <span class="username-label">{{ username }}</span>
+        </div>
+        <button class="logout-btn" @click="$emit('logout')" title="Leave community">x</button>
       </div>
-      <div class="status-bar" :class="{ connected }">
+      <div v-if="!connected" class="status-bar">
         {{ status }}
       </div>
       <div class="channel-list">
@@ -328,7 +124,7 @@ onUnmounted(() => {
           :key="name"
           class="channel-item"
           :class="{ active: viewMode === 'chat' && (activeChannel === name || (name === 'Server' && !activeChannel)) }"
-          @click="viewMode = 'chat'; activeChannel = name"
+          @click="selectChannel(name)"
         >
           {{ name }}
         </div>
@@ -377,7 +173,6 @@ onUnmounted(() => {
             v-model="inputText"
             @keydown.enter="sendMessage"
             :placeholder="activeChannel && activeChannel !== 'Server' ? `Message ${activeChannel}` : 'Type a command...'"
-            :disabled="!connected"
           />
         </div>
       </div>
@@ -385,15 +180,35 @@ onUnmounted(() => {
       <!-- User list -->
       <div class="userlist" v-if="currentChannel?.users?.length">
         <div class="userlist-header">Users ({{ currentChannel.users.length }})</div>
-        <div v-for="user in currentChannel.users" :key="user" class="user-item">
+        <div
+          v-for="user in currentChannel.users"
+          :key="user"
+          class="user-item"
+          @contextmenu.prevent="openUserMenu($event, user)"
+        >
           {{ user }}
         </div>
       </div>
+
+      <!-- User context menu -->
+      <Teleport to="body">
+        <div
+          v-if="contextMenu"
+          class="context-menu"
+          :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
+          @click.stop
+        >
+          <div class="context-menu-header">{{ contextMenu.user }}</div>
+          <div class="context-menu-item" @click="startDm(contextMenu.user)">Send Message</div>
+          <div class="context-menu-item" @click="closeUserMenu">Cancel</div>
+        </div>
+        <div v-if="contextMenu" class="context-menu-overlay" @click="closeUserMenu" @contextmenu.prevent="closeUserMenu"></div>
+      </Teleport>
     </template>
 
     <!-- Main area: Mesh Network view -->
     <div v-else class="main mesh-view">
-      <NetworkTopology :serverUrl="serverUrl" />
+      <NetworkTopology :serverUrl="community?.url || ''" />
     </div>
   </div>
 </template>
@@ -401,12 +216,13 @@ onUnmounted(() => {
 <style scoped>
 .irc-layout {
   display: flex;
+  flex: 1;
   height: 100vh;
   overflow: hidden;
 }
 
 .sidebar {
-  width: 200px;
+  width: 220px;
   background: var(--bg-secondary);
   border-right: 1px solid var(--bg-tertiary);
   display: flex;
@@ -422,9 +238,25 @@ onUnmounted(() => {
   border-bottom: 1px solid var(--bg-tertiary);
 }
 
-.username {
+.header-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.community-name {
   color: var(--accent);
   font-weight: bold;
+  font-size: 0.95rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.username-label {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
 }
 
 .logout-btn {
@@ -434,6 +266,7 @@ onUnmounted(() => {
   cursor: pointer;
   font-family: inherit;
   font-size: 1rem;
+  flex-shrink: 0;
 }
 
 .logout-btn:hover {
@@ -445,10 +278,6 @@ onUnmounted(() => {
   font-size: 0.75rem;
   color: var(--accent-red);
   border-bottom: 1px solid var(--bg-tertiary);
-}
-
-.status-bar.connected {
-  color: var(--accent-green);
 }
 
 .channel-list {
@@ -595,5 +424,53 @@ onUnmounted(() => {
   padding: 0.25rem 1rem;
   font-size: 0.85rem;
   color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.user-item:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+</style>
+
+<style>
+.context-menu-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 999;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 1000;
+  background: var(--bg-secondary);
+  border: 1px solid var(--bg-tertiary);
+  border-radius: 6px;
+  padding: 4px 0;
+  min-width: 160px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.context-menu-header {
+  padding: 6px 12px;
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  border-bottom: 1px solid var(--bg-tertiary);
+  margin-bottom: 2px;
+}
+
+.context-menu-item {
+  padding: 6px 12px;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.context-menu-item:hover {
+  background: var(--accent);
+  color: var(--bg-primary);
 }
 </style>

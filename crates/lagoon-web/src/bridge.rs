@@ -270,8 +270,8 @@ async fn wait_for_auth(
     ws_rx: &mut (impl StreamExt<Item = Result<Message, axum::Error>> + Unpin),
     state: &AppState,
 ) -> Option<String> {
-    // Give the client a reasonable window to authenticate.
-    let timeout = tokio::time::Duration::from_secs(30);
+    // Generous window for high-latency connections (CDN edge, intercontinental).
+    let timeout = tokio::time::Duration::from_secs(120);
     match tokio::time::timeout(timeout, ws_rx.next()).await {
         Ok(Some(Ok(Message::Text(text)))) => {
             let msg: ClientMessage = serde_json::from_str(&text).ok()?;
