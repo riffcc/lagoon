@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=/usr/local/bin/lagoon
 Environment=RUST_LOG=info
+Environment=LAGOON_FULL_TELEMETRY=1
 Restart=on-failure
 RestartSec=5
 

@@ -1,5 +1,10 @@
 # Stage 1: Build Rust binaries
 FROM rust:1-bookworm AS rust-build
+
+# Clone citadel (path dependency) at the same absolute path Cargo.toml expects
+RUN git clone --depth 1 -b zorlin/v2-rewrite https://github.com/rifflabs/citadel.git \
+    /mnt/riffcastle/lagun-project/citadel
+
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
@@ -35,6 +40,7 @@ ENV LAGOON_IRC_ADDR=127.0.0.1:6667
 ENV LAGOON_DATA_DIR=/data
 ENV LAGOON_PEERS=lon.lagun.co:443
 ENV SERVER_NAME=lagun.co
+ENV LAGOON_FULL_TELEMETRY=1
 ENV RUST_LOG=info
 
 EXPOSE 8080

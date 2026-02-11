@@ -1,2 +1,4 @@
 jet_ssh_hostname: 10.7.1.37
 fqdn: sanctuary.lon.riff.cc
+server_name: sanctuary.lagun.co
+lagoon_peers: "lon.lagun.co"

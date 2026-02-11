@@ -13,13 +13,25 @@
 
     - !shell
       name: Add peer hosts entries for federation
-      cmd: grep -q 'sanctuary.lon.riff.cc' /etc/hosts || echo '10.7.1.37 sanctuary.lon.riff.cc sanctuary' >> /etc/hosts; grep -q 'tealc.lon.riff.cc' /etc/hosts || echo '10.7.1.195 tealc.lon.riff.cc tealc' >> /etc/hosts
+      cmd: grep -q 'sanctuary.lon.riff.cc' /etc/hosts || echo '10.7.1.37 sanctuary.lon.riff.cc sanctuary' >> /etc/hosts; grep -q 'tealc.lon.riff.cc' /etc/hosts || echo '10.7.1.195 tealc.lon.riff.cc tealc' >> /etc/hosts; grep -q 'lon.lagun.co' /etc/hosts || echo '10.7.1.200 lon.lagun.co' >> /etc/hosts; grep -q 'sanctuary.lagun.co' /etc/hosts || echo '10.7.1.37 sanctuary.lagun.co' >> /etc/hosts; grep -q 'tealc.lagun.co' /etc/hosts || echo '10.7.1.195 tealc.lagun.co' >> /etc/hosts
+      with:
+        sudo: root
+
+    - !shell
+      name: Create data directory
+      cmd: mkdir -p /var/lib/lagoon
       with:
         sudo: root
 
     - !shell
       name: Stop existing lagoon service if running
       cmd: systemctl stop lagoon || true
+      with:
+        sudo: root
+
+    - !shell
+      name: Clear node state for fresh start
+      cmd: rm -rf /var/lib/lagoon/*
       with:
         sudo: root
 
@@ -34,14 +46,29 @@
       with:
         sudo: root
 
-    - !copy
-      name: Install systemd unit
-      src: lagoon.service
-      dest: "{{ lagoon_service_file }}"
-      attributes:
-        owner: root
-        group: root
-        mode: "0o644"
+    - !shell
+      name: Install systemd unit with federation config
+      cmd: |
+        cat > {{ lagoon_service_file }} << 'UNIT'
+        [Unit]
+        Description=Lagoon IRC Server
+        After=network-online.target yggdrasil.service
+        Wants=network-online.target
+
+        [Service]
+        Type=simple
+        ExecStart=/usr/local/bin/lagoon
+        Environment=SERVER_NAME={{ server_name }}
+        Environment=LAGOON_PEERS={{ lagoon_peers }}
+        Environment=LAGOON_DATA_DIR=/var/lib/lagoon
+        Environment=RUST_LOG={{ rust_log }}
+        Environment=LAGOON_FULL_TELEMETRY=1
+        Restart=on-failure
+        RestartSec=5
+
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
       with:
         sudo: root
 

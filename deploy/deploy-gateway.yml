@@ -23,6 +23,12 @@
       with:
         sudo: root
 
+    - !shell
+      name: Clear node state for fresh start
+      cmd: rm -rf /var/lib/lagoon/*
+      with:
+        sudo: root
+
     - !copy
       name: Deploy lagoon-web binary
       src: lagoon-web
@@ -64,11 +70,12 @@
         Environment=SERVER_NAME={{ server_name }}
         Environment=LAGOON_WEB_NO_TLS=1
         Environment=LAGOON_WEB_ADDR=127.0.0.1:8080
-        Environment=LAGOON_IRC_BIND=127.0.0.1:6667
+        Environment=LAGOON_IRC_BIND=[::]:6667
         Environment=LAGOON_IRC_ADDR=127.0.0.1:6667
         Environment=LAGOON_PEERS={{ lagoon_peers }}
         Environment=LAGOON_DATA_DIR=/var/lib/lagoon
         Environment=RUST_LOG=info
+        Environment=LAGOON_FULL_TELEMETRY=1
         Restart=on-failure
         RestartSec=5
 

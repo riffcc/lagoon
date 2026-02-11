@@ -1,0 +1,27 @@
+# yggstack — TUN-less Yggdrasil using gVisor's userspace TCP/IP stack.
+#
+# Provides SOCKS5 proxy and TCP port forwarding without requiring
+# /dev/net/tun, NET_ADMIN, or privileged mode. Runs in any container.
+#
+# Environment variables:
+#   YGG_PEERS           - Space-separated list of peer URIs (tcp://host:port)
+#   YGG_SOCKS_LISTEN    - SOCKS5 proxy listen address (default: 127.0.0.1:1080)
+#   YGG_FORWARD_TARGET  - Where to forward inbound Ygg TCP (default: 127.0.0.1:6667)
+#   YGG_FORWARD_PORT    - Which port on the Ygg overlay to expose (default: 6667)
+#   YGG_ADMIN_LISTEN    - Admin socket listen address (default: tcp://0.0.0.0:9001)
+#   YGG_CONFIG          - Path to config file (auto-generated if missing)
+
+FROM golang:1.24-bookworm AS build
+WORKDIR /build
+RUN git clone --depth 1 https://github.com/yggdrasil-network/yggstack.git . && \
+    CGO_ENABLED=0 go build -o yggstack ./cmd/yggstack
+
+FROM debian:trixie-slim
+
+COPY --from=build /build/yggstack /usr/local/bin/yggstack
+COPY yggstack-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/yggstack-entrypoint.sh
+
+VOLUME /etc/yggdrasil
+
+ENTRYPOINT ["yggstack-entrypoint.sh"]
