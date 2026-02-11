@@ -58,6 +58,12 @@ pub struct TransportConfig {
     pub peers: HashMap<String, PeerEntry>,
     /// Whether this node has Yggdrasil connectivity (detected at startup).
     pub yggdrasil_available: bool,
+    /// Optional SOCKS5 proxy for routing Yggdrasil connections (yggstack mode).
+    /// Set via `YGG_SOCKS_PROXY` env var (e.g. `127.0.0.1:1080`).
+    pub ygg_socks_proxy: Option<SocketAddr>,
+    /// Yggdrasil admin socket path for querying peer data.
+    /// Detected from `YGGDRASIL_ADMIN_SOCKET` env var or default locations.
+    pub ygg_admin_socket: Option<String>,
 }
 
 impl TransportConfig {
@@ -65,6 +71,8 @@ impl TransportConfig {
         Self {
             peers: HashMap::new(),
             yggdrasil_available: false,
+            ygg_socks_proxy: None,
+            ygg_admin_socket: None,
         }
     }
 }
@@ -247,10 +255,134 @@ pub async fn connect(
     } else {
         // Plain TCP (Yggdrasil, local network).
         let addr = resolve(remote_host, config, port).await?;
+
+        // Try to route through Yggdrasil mesh via SOCKS5 proxy.
+        if let Some(proxy) = config.ygg_socks_proxy {
+            // If the resolved address is already a Ygg address, route directly.
+            if is_yggdrasil_addr(&addr) {
+                info!(remote_host, ?addr, ?proxy, "transport: connecting via SOCKS5");
+                let stream = socks5_connect(proxy, addr).await?;
+                return Ok(Box::new(stream));
+            }
+
+            // Otherwise, query yggstack peers to see if the target's public IP
+            // matches any Ygg peer — if so, route through the Ygg overlay.
+            if let Some(ref admin_socket) = config.ygg_admin_socket {
+                match super::yggdrasil::query_peers(admin_socket).await {
+                    Ok(peers) => {
+                        if let Some(ygg_addr) =
+                            super::yggdrasil::find_peer_by_remote_ip(&peers, &addr.ip())
+                        {
+                            let ygg_target = SocketAddr::new(IpAddr::V6(ygg_addr), port);
+                            info!(
+                                remote_host,
+                                ?addr,
+                                ?ygg_target,
+                                ?proxy,
+                                "transport: Ygg route discovered, connecting via SOCKS5"
+                            );
+                            let stream = socks5_connect(proxy, ygg_target).await?;
+                            return Ok(Box::new(stream));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "transport: getPeers query failed, falling back to TCP"
+                        );
+                    }
+                }
+            }
+        }
+
         info!(remote_host, ?addr, "transport: connecting via TCP");
         let stream = TcpStream::connect(addr).await?;
+        set_tcp_keepalive(&stream)?;
         Ok(Box::new(stream))
     }
+}
+
+/// Apply aggressive TCP keepalive for fast dead peer detection.
+///
+/// time=2s (start probing after 2s idle), interval=2s (probe every 2s),
+/// retries=3 (give up after 3 failures). Total detection: 2 + 2×3 = 8s.
+pub(crate) fn set_tcp_keepalive(stream: &TcpStream) -> io::Result<()> {
+    let sock = socket2::SockRef::from(stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(std::time::Duration::from_secs(2))
+        .with_interval(std::time::Duration::from_secs(2))
+        .with_retries(3);
+    sock.set_tcp_keepalive(&keepalive)?;
+    Ok(())
+}
+
+/// Minimal SOCKS5 CONNECT — routes a TCP connection through a SOCKS5 proxy.
+///
+/// Implements just enough of RFC 1928 to establish a proxied connection:
+/// no-auth negotiation → CONNECT request → bidirectional stream.
+/// Used for routing Yggdrasil overlay connections through yggstack.
+async fn socks5_connect(proxy: SocketAddr, target: SocketAddr) -> io::Result<TcpStream> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = TcpStream::connect(proxy).await?;
+    set_tcp_keepalive(&stream)?;
+
+    // Auth negotiation: version 5, 1 method, no auth (0x00).
+    stream.write_all(&[0x05, 0x01, 0x00]).await?;
+    let mut auth_resp = [0u8; 2];
+    stream.read_exact(&mut auth_resp).await?;
+    if auth_resp != [0x05, 0x00] {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "SOCKS5 auth rejected",
+        ));
+    }
+
+    // CONNECT request: version=5, cmd=CONNECT(1), reserved=0, then address.
+    let mut req = vec![0x05, 0x01, 0x00];
+    match target.ip() {
+        IpAddr::V4(ip) => {
+            req.push(0x01); // IPv4
+            req.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            req.push(0x04); // IPv6
+            req.extend_from_slice(&ip.octets());
+        }
+    }
+    req.extend_from_slice(&target.port().to_be_bytes());
+    stream.write_all(&req).await?;
+
+    // Response header: version, status, reserved, addr_type.
+    let mut resp = [0u8; 4];
+    stream.read_exact(&mut resp).await?;
+    if resp[1] != 0x00 {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("SOCKS5 CONNECT failed: status {:#04x}", resp[1]),
+        ));
+    }
+    // Drain the bound address (we don't need it).
+    match resp[3] {
+        0x01 => {
+            let mut skip = [0u8; 6];
+            stream.read_exact(&mut skip).await?;
+        } // IPv4 + port
+        0x04 => {
+            let mut skip = [0u8; 18];
+            stream.read_exact(&mut skip).await?;
+        } // IPv6 + port
+        0x03 => {
+            // Domain name: 1-byte length + domain + 2-byte port.
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await?;
+            let mut skip = vec![0u8; len[0] as usize + 2];
+            stream.read_exact(&mut skip).await?;
+        }
+        _ => {}
+    }
+
+    Ok(stream)
 }
 
 /// Resolve a hostname to a SocketAddr using the peer table, direct parse,
@@ -335,22 +467,42 @@ pub fn detect_yggdrasil_addr() -> Option<Ipv6Addr> {
     }
 
     // Fallback: try `ip` command.
-    let output = std::process::Command::new("ip")
+    if let Ok(output) = std::process::Command::new("ip")
         .args(["-6", "addr", "show", "scope", "global"])
         .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("inet6 ") {
-            let addr_str = rest.split('/').next()?;
-            if let Ok(addr) = addr_str.parse::<Ipv6Addr>() {
-                if is_yggdrasil_ipv6(&addr) {
-                    return Some(addr);
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("inet6 ") {
+                if let Some(addr_str) = rest.split('/').next() {
+                    if let Ok(addr) = addr_str.parse::<Ipv6Addr>() {
+                        if is_yggdrasil_ipv6(&addr) {
+                            return Some(addr);
+                        }
+                    }
                 }
             }
         }
     }
+
+    // Admin socket fallback — yggstack mode (no TUN interface, address only
+    // reachable via the userspace Yggdrasil node's admin API).
+    if let Some(socket_path) = super::yggdrasil::detect_admin_socket() {
+        match super::yggdrasil::query_self_sync(&socket_path) {
+            Ok(Some(addr)) => {
+                info!("transport: Yggdrasil address from admin socket: {addr}");
+                return Some(addr);
+            }
+            Ok(None) => {
+                tracing::debug!("transport: admin socket reachable but no Ygg address");
+            }
+            Err(e) => {
+                tracing::debug!("transport: admin socket query failed: {e}");
+            }
+        }
+    }
+
     None
 }
 
@@ -446,6 +598,22 @@ pub fn build_config() -> TransportConfig {
 
     if config.yggdrasil_available {
         info!("transport: Yggdrasil connectivity detected");
+    }
+
+    // Admin socket for querying yggstack/Yggdrasil peer data.
+    config.ygg_admin_socket = super::yggdrasil::detect_admin_socket();
+
+    // SOCKS5 proxy for yggstack mode (Ygg connections via userspace netstack).
+    if let Ok(proxy_str) = std::env::var("YGG_SOCKS_PROXY") {
+        match proxy_str.parse::<SocketAddr>() {
+            Ok(addr) => {
+                info!(proxy = %addr, "transport: Yggdrasil SOCKS5 proxy configured");
+                config.ygg_socks_proxy = Some(addr);
+            }
+            Err(e) => {
+                warn!(proxy = %proxy_str, error = %e, "transport: invalid YGG_SOCKS_PROXY");
+            }
+        }
     }
 
     if let Ok(peers_str) = std::env::var("LAGOON_PEERS") {

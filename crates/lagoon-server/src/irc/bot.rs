@@ -26,6 +26,7 @@ pub async fn spawn(state: SharedState) {
                 realname: Some("Lagoon Channel Services".into()),
                 addr: ([0, 0, 0, 0], 0u16).into(),
                 tx,
+                away_message: None,
             },
         );
 

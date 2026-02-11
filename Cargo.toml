@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/lagoon-server",
     "crates/lagoon-web",
+    "crates/lagoon-vdf",
 ]
 
 [workspace.package]
@@ -62,6 +63,19 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 webpki-roots = "0.26"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
+
+# Citadel
+citadel-topology = { path = "/mnt/riffcastle/lagun-project/citadel/crates/citadel-topology", features = ["serde"] }
+citadel-gossip = { path = "/mnt/riffcastle/lagun-project/citadel/crates/citadel-gossip" }
+citadel-spore = { path = "/mnt/riffcastle/lagun-project/citadel/crates/citadel-spore" }
+bincode = "1.3"
+serde_bytes = "0.11"
+
+# VDF
+lagoon-vdf = { path = "crates/lagoon-vdf" }
+
+# Networking
+socket2 = { version = "0.5", features = ["all"] }
 
 # Dev
 pretty_assertions = "1"

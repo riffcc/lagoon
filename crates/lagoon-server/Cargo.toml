@@ -28,7 +28,16 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
 tokio-tungstenite = { workspace = true }
+citadel-topology = { workspace = true }
+citadel-gossip = { workspace = true }
+citadel-spore = { workspace = true }
+bincode = { workspace = true }
+serde_bytes = { workspace = true }
+lagoon-vdf = { workspace = true }
+socket2 = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

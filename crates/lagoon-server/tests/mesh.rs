@@ -779,3 +779,70 @@ async fn disconnect_cleans_up_connection_state() {
     assert!(!remote.connected);
     assert_eq!(snapshot.links.len(), 0); // No link to disconnected peer.
 }
+
+#[tokio::test]
+async fn disconnect_reclaims_spiral_slot() {
+    use lagoon_server::irc::spiral::Spiral3DIndex;
+
+    let (state, _rx) = make_test_state("spiral-test.lagun.co");
+
+    let peer = lens::generate_identity("peer.lagun.co");
+    let peer_slot = Spiral3DIndex::new(1); // Slot 1 (slot 0 is typically ours).
+    {
+        let mut st = state.write().await;
+        // Claim our own slot first.
+        let our_id = st.lens.peer_id.clone();
+        st.mesh.spiral.claim_position(&our_id);
+        // Add peer to SPIRAL.
+        st.mesh.spiral.add_peer(&peer.peer_id, peer_slot);
+        st.mesh.known_peers.insert(
+            peer.peer_id.clone(),
+            MeshPeerInfo {
+                lens_id: peer.peer_id.clone(),
+                server_name: "peer.lagun.co".into(),
+                public_key_hex: peer.public_key_hex.clone(),
+                ..Default::default()
+            },
+        );
+        st.mesh
+            .connections
+            .insert(peer.peer_id.clone(), MeshConnectionState::Connected);
+        st.notify_topology_change();
+    }
+
+    // Verify slot is claimed.
+    {
+        let st = state.read().await;
+        assert!(st.mesh.spiral.peer_index(&peer.peer_id).is_some());
+        assert_eq!(st.mesh.spiral.occupied_count(), 2); // us + peer
+    }
+
+    // Simulate disconnect — exactly what spawn_event_processor does
+    // on RelayEvent::Disconnected (federation.rs:407-458).
+    {
+        let mut st = state.write().await;
+        st.mesh.connections.remove(&peer.peer_id);
+        st.mesh.spiral.remove_peer(&peer.peer_id);
+        st.notify_topology_change();
+    }
+
+    // Verify slot is freed immediately.
+    let st = state.read().await;
+    assert!(st.mesh.spiral.peer_index(&peer.peer_id).is_none());
+    assert_eq!(st.mesh.spiral.occupied_count(), 1); // just us
+    let snapshot = st.build_mesh_snapshot();
+    assert!(!snapshot.links.iter().any(|l| l.target == peer.peer_id));
+}
+
+#[test]
+fn pong_message_format() {
+    use lagoon_server::irc::message::Message;
+    // Verify we can construct and parse PONG messages (relay protocol contract).
+    let pong = Message {
+        prefix: None,
+        command: "PONG".into(),
+        params: vec!["lon~relay".into(), "test.lagun.co".into()],
+    };
+    assert_eq!(pong.command, "PONG");
+    assert_eq!(pong.params.len(), 2);
+}

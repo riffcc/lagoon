@@ -20,6 +20,18 @@ pub struct LensIdentity {
     pub peer_id: String,
     /// The server name this identity was generated for.
     pub server_name: String,
+    /// Site identity for supernode clustering (derived from server_name).
+    #[serde(default)]
+    pub site_name: String,
+    /// Node identity within site (derived from server_name).
+    #[serde(default)]
+    pub node_name: String,
+    /// Claimed SPIRAL slot index (None = unclaimed fresh node).
+    #[serde(default)]
+    pub spiral_index: Option<u64>,
+    /// Cumulative VDF steps persisted across restarts.
+    #[serde(default)]
+    pub vdf_total_steps: u64,
 }
 
 /// Compute a PeerID from an ed25519 public key.
@@ -53,6 +65,10 @@ pub fn generate_identity(server_name: &str) -> LensIdentity {
         public_key_hex,
         peer_id,
         server_name: server_name.to_owned(),
+        site_name: super::server::SITE_NAME.clone(),
+        node_name: super::server::NODE_NAME.clone(),
+        spiral_index: None,
+        vdf_total_steps: 0,
     }
 }
 
@@ -77,6 +93,11 @@ pub fn load_or_create(data_dir: &Path, server_name: &str) -> LensIdentity {
                     {
                         warn!("lens identity file is inconsistent, regenerating");
                     } else {
+                        // Always sync node_name/site_name from runtime statics
+                        // (env vars or hostname may differ from what was persisted).
+                        let mut identity = identity;
+                        identity.site_name = super::server::SITE_NAME.clone();
+                        identity.node_name = super::server::NODE_NAME.clone();
                         info!(
                             peer_id = %identity.peer_id,
                             "loaded lens identity from {}",
@@ -126,6 +147,34 @@ pub fn load_or_create(data_dir: &Path, server_name: &str) -> LensIdentity {
     }
 
     identity
+}
+
+/// Persist an updated LensIdentity to disk (e.g. after claiming a SPIRAL slot).
+///
+/// Uses atomic write (tmp + rename) to avoid corruption.
+pub fn persist_identity(data_dir: &Path, identity: &LensIdentity) {
+    let identity_path = data_dir.join("lens_identity.json");
+    let tmp_path = data_dir.join("lens_identity.json.tmp");
+    match serde_json::to_string_pretty(identity) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&tmp_path, &json) {
+                warn!("failed to write lens identity tmp file: {e}");
+            } else if let Err(e) = std::fs::rename(&tmp_path, &identity_path) {
+                warn!("failed to rename lens identity file: {e}");
+            } else {
+                info!(
+                    peer_id = %identity.peer_id,
+                    spiral_index = ?identity.spiral_index,
+                    vdf_total_steps = identity.vdf_total_steps,
+                    "persisted lens identity to {}",
+                    identity_path.display()
+                );
+            }
+        }
+        Err(e) => {
+            warn!("failed to serialize lens identity: {e}");
+        }
+    }
 }
 
 /// Extract the public key bytes from a LensIdentity.

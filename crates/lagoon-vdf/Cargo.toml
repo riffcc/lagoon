@@ -1,0 +1,13 @@
+[package]
+name = "lagoon-vdf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "VDF (Verifiable Delay Function) chain with ZK proofs via Fiat-Shamir + Merkle trees."
+
+[dependencies]
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

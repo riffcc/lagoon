@@ -7,17 +7,21 @@ use std::sync::{Arc, LazyLock};
 use futures::SinkExt;
 use serde::Serialize;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::codec::Framed;
 use tracing::{info, warn};
 
+use base64::Engine as _;
+
 use super::codec::IrcCodec;
+use super::community::CommunityStore;
 use super::federation::{self, FederatedChannel, FederationManager, RelayEvent};
 use super::invite::InviteStore;
 use super::lens::LensIdentity;
 use super::message::Message;
+use super::modes::{self, BanEntry, ChannelModes, WhowasBuffer};
 use super::transport::{self, TransportConfig};
 
 /// Normalize a string for case-insensitive IRC comparison (CASEMAPPING=ascii).
@@ -39,7 +43,76 @@ pub static SERVER_NAME: LazyLock<String> = LazyLock::new(|| {
         .unwrap_or_else(|| "lagoon.lagun.co".into())
 });
 
-/// Human-friendly display name for the welcome message.
+/// Site identity — the logical domain for supernode clustering.
+///
+/// Derived from SERVER_NAME by stripping the first subdomain:
+///   `lon.lagun.co` → `lagun.co`
+///   `lagun.co` → `lagun.co` (bare domain = site itself)
+///
+/// Override with `SITE_NAME` env var.
+pub static SITE_NAME: LazyLock<String> = LazyLock::new(|| {
+    if let Ok(val) = std::env::var("SITE_NAME") {
+        if !val.is_empty() && val.contains('.') {
+            return val;
+        }
+    }
+    let sn = &*SERVER_NAME;
+    // 2+ dots means there's a subdomain to strip.
+    if sn.matches('.').count() >= 2 {
+        // "lon.lagun.co" → "lagun.co"
+        sn.splitn(2, '.').nth(1).unwrap_or(sn).to_string()
+    } else {
+        // "lagun.co" → "lagun.co" (the whole thing IS the site)
+        sn.to_string()
+    }
+});
+
+/// Node identity — unique name within a site.
+///
+/// Derived from SERVER_NAME by extracting the first subdomain:
+///   `lon.lagun.co` → `lon`
+///   `lagun.co` → auto-derived from system hostname
+///
+/// Override with `LAGOON_NODE_NAME` env var (or `NODE_NAME` for backward compat).
+pub static NODE_NAME: LazyLock<String> = LazyLock::new(|| {
+    for var in ["LAGOON_NODE_NAME", "NODE_NAME"] {
+        if let Ok(val) = std::env::var(var) {
+            if !val.is_empty() {
+                return val;
+            }
+        }
+    }
+    let sn = &*SERVER_NAME;
+    if sn.matches('.').count() >= 2 {
+        // "lon.lagun.co" → "lon"
+        sn.splitn(2, '.').next().unwrap_or(sn).to_string()
+    } else {
+        // Bare domain — derive from system hostname.
+        hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "node".to_string())
+    }
+});
+
+/// Derive site_name from a server_name string (same logic as SITE_NAME static).
+pub fn derive_site_name(server_name: &str) -> String {
+    if server_name.matches('.').count() >= 2 {
+        server_name.splitn(2, '.').nth(1).unwrap_or(server_name).to_string()
+    } else {
+        server_name.to_string()
+    }
+}
+
+/// Derive node_name from a server_name string (same logic as NODE_NAME static).
+pub fn derive_node_name(server_name: &str) -> String {
+    if server_name.matches('.').count() >= 2 {
+        server_name.splitn(2, '.').next().unwrap_or(server_name).to_string()
+    } else {
+        server_name.to_string()
+    }
+}
+
 /// Human-friendly display name for the welcome message.
 pub static DISPLAY_NAME: LazyLock<String> = LazyLock::new(|| {
     let host = &*SERVER_NAME;
@@ -112,6 +185,27 @@ pub struct MeshPeerInfo {
     /// Unix timestamp of last contact with this peer.
     #[serde(default)]
     pub last_seen: u64,
+    /// Claimed SPIRAL slot index (None = peer hasn't claimed yet).
+    #[serde(default)]
+    pub spiral_index: Option<u64>,
+    /// VDF genesis hash (hex-encoded, derived from peer's public key).
+    #[serde(default)]
+    pub vdf_genesis: Option<String>,
+    /// VDF current chain tip hash (hex-encoded).
+    #[serde(default)]
+    pub vdf_hash: Option<String>,
+    /// VDF total steps (cumulative across sessions).
+    #[serde(default)]
+    pub vdf_step: Option<u64>,
+    /// This peer's Yggdrasil IPv6 address (None if no Yggdrasil).
+    #[serde(default)]
+    pub yggdrasil_addr: Option<String>,
+    /// Site identity for supernode clustering (derived from server_name if absent).
+    #[serde(default)]
+    pub site_name: String,
+    /// Node identity within site (derived from server_name if absent).
+    #[serde(default)]
+    pub node_name: String,
 }
 
 fn default_peer_port() -> u16 {
@@ -127,6 +221,13 @@ impl Default for MeshPeerInfo {
             port: 6667,
             tls: false,
             last_seen: 0,
+            spiral_index: None,
+            vdf_genesis: None,
+            vdf_hash: None,
+            vdf_step: None,
+            yggdrasil_addr: None,
+            site_name: String::new(),
+            node_name: String::new(),
         }
     }
 }
@@ -153,16 +254,40 @@ pub struct MeshState {
     pub web_clients: HashSet<String>,
     /// Remote peers' topology snapshots — for debug composite view.
     pub remote_topologies: HashMap<String, MeshSnapshot>,
+    /// SPIRAL topology engine for peer selection.
+    pub spiral: super::spiral::SpiralTopology,
+    /// VDF state watch channel — latest VDF engine snapshot.
+    pub vdf_state_rx: Option<watch::Receiver<super::vdf::VdfState>>,
+    /// VDF chain — shared with engine for ZK proof generation on demand.
+    pub vdf_chain: Option<Arc<RwLock<lagoon_vdf::VdfChain>>>,
+    /// Yggdrasil admin socket metrics store.
+    pub ygg_metrics: super::yggdrasil::YggMetricsStore,
+    /// SPORE gossip router for mesh-wide message replication.
+    pub gossip: super::gossip::GossipRouter,
+    /// SPORE-indexed latency proof store (PoLP Phase 2).
+    pub proof_store: super::proof_store::ProofStore,
+    /// SPIRAL-scoped latency proof gossip coordinator.
+    pub latency_gossip: super::latency_gossip::LatencyGossip,
 }
 
 impl MeshState {
-    pub fn new() -> Self {
+    pub fn new(public_key_bytes: &[u8; 32], our_peer_id: &str) -> Self {
         Self {
             known_peers: HashMap::new(),
             connections: HashMap::new(),
             defederated: HashSet::new(),
             web_clients: HashSet::new(),
             remote_topologies: HashMap::new(),
+            spiral: super::spiral::SpiralTopology::new(),
+            vdf_state_rx: None,
+            vdf_chain: None,
+            ygg_metrics: super::yggdrasil::YggMetricsStore::new(),
+            gossip: super::gossip::GossipRouter::new(public_key_bytes),
+            proof_store: super::proof_store::ProofStore::new(300_000), // 5 min TTL
+            latency_gossip: super::latency_gossip::LatencyGossip::new(
+                our_peer_id.to_owned(),
+                10_000, // 10s sync interval
+            ),
         }
     }
 }
@@ -175,6 +300,28 @@ pub struct MeshNodeReport {
     pub is_self: bool,
     pub connected: bool,
     pub node_type: String,
+    /// SPIRAL slot index (None if unclaimed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub spiral_index: Option<u64>,
+    /// Whether this node is a SPIRAL neighbor of the reporter.
+    #[serde(default)]
+    pub is_spiral_neighbor: bool,
+    /// VDF total steps (None if VDF not active on this peer).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub vdf_step: Option<u64>,
+    /// SPIRAL world coordinates [x, y, z] for geometric positioning.
+    /// None if the node hasn't claimed a SPIRAL slot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub spiral_coord: Option<[f64; 3]>,
+    /// Site identity for supernode clustering.
+    #[serde(default)]
+    pub site_name: String,
+    /// Node identity within site.
+    #[serde(default)]
+    pub node_name: String,
 }
 
 /// A single link in a mesh topology snapshot.
@@ -182,6 +329,25 @@ pub struct MeshNodeReport {
 pub struct MeshLinkReport {
     pub source: String,
     pub target: String,
+    /// Upload bandwidth in bytes per second (None if metrics unavailable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub upload_bps: Option<f64>,
+    /// Download bandwidth in bytes per second (None if metrics unavailable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub download_bps: Option<f64>,
+    /// Latency in milliseconds (None if metrics unavailable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub latency_ms: Option<f64>,
+    /// Link type: "relay" (active IRC connection) or "spiral" (geometric neighbor).
+    #[serde(default = "default_link_type")]
+    pub link_type: String,
+}
+
+fn default_link_type() -> String {
+    "relay".into()
 }
 
 /// Complete mesh topology snapshot — pushed via watch channel.
@@ -189,6 +355,8 @@ pub struct MeshLinkReport {
 pub struct MeshSnapshot {
     pub self_lens_id: String,
     pub self_server_name: String,
+    #[serde(default)]
+    pub self_site_name: String,
     pub nodes: Vec<MeshNodeReport>,
     pub links: Vec<MeshLinkReport>,
     pub timestamp: u64,
@@ -199,6 +367,7 @@ impl MeshSnapshot {
         Self {
             self_lens_id: String::new(),
             self_server_name: String::new(),
+            self_site_name: String::new(),
             nodes: Vec::new(),
             links: Vec::new(),
             timestamp: 0,
@@ -243,8 +412,22 @@ pub struct ServerState {
     pub mesh_topology_tx: watch::Sender<MeshSnapshot>,
     /// Invite code store.
     pub invites: InviteStore,
+    /// Community (circle) store.
+    pub communities: CommunityStore,
     /// Data directory for persistence.
     pub data_dir: PathBuf,
+    /// Per-channel mode flags (created with defaults on first JOIN).
+    pub channel_modes: HashMap<String, ChannelModes>,
+    /// Per-channel ban lists.
+    pub channel_bans: HashMap<String, Vec<BanEntry>>,
+    /// Per-channel invite lists (invited nick_keys, for +i enforcement).
+    pub channel_invites: HashMap<String, HashSet<String>>,
+    /// Ring buffer of disconnected user records for WHOWAS.
+    pub whowas: WhowasBuffer,
+    /// Full-telemetry mode: push composite global topology (all peers' views merged)
+    /// instead of local-only view.  Controlled by LAGOON_FULL_TELEMETRY env var.
+    /// Default: ON.  Set LAGOON_FULL_TELEMETRY=0 to disable.
+    pub full_telemetry: bool,
 }
 
 /// Handle to send messages to a connected client.
@@ -255,6 +438,7 @@ pub struct ClientHandle {
     pub realname: Option<String>,
     pub addr: SocketAddr,
     pub tx: mpsc::UnboundedSender<Message>,
+    pub away_message: Option<String>,
 }
 
 impl ServerState {
@@ -266,6 +450,18 @@ impl ServerState {
         data_dir: PathBuf,
     ) -> Self {
         let invites = InviteStore::load_or_create(&data_dir);
+        let communities = CommunityStore::load_or_create(&data_dir);
+        let pubkey = super::lens::pubkey_bytes(&lens).expect("valid lens identity");
+        let mut mesh = MeshState::new(&pubkey, &lens.peer_id);
+
+        // Restore persisted SPIRAL position if available.
+        if let Some(idx) = lens.spiral_index {
+            mesh.spiral.set_position(
+                &lens.peer_id,
+                citadel_topology::Spiral3DIndex::new(idx),
+            );
+        }
+
         Self {
             clients: HashMap::new(),
             channels: HashMap::new(),
@@ -275,10 +471,18 @@ impl ServerState {
             federation_event_tx,
             transport_config,
             lens,
-            mesh: MeshState::new(),
+            mesh,
             mesh_topology_tx,
             invites,
+            communities,
             data_dir,
+            channel_modes: HashMap::new(),
+            channel_bans: HashMap::new(),
+            channel_invites: HashMap::new(),
+            whowas: WhowasBuffer::new(100),
+            full_telemetry: std::env::var("LAGOON_FULL_TELEMETRY")
+                .map(|v| v != "0")
+                .unwrap_or(true), // ON by default
         }
     }
 
@@ -293,12 +497,19 @@ impl ServerState {
         let mut links = Vec::new();
 
         // Add self.
+        let our_vdf_step = self.mesh.vdf_state_rx.as_ref().map(|rx| rx.borrow().total_steps);
         nodes.push(MeshNodeReport {
             lens_id: self.lens.peer_id.clone(),
             server_name: self.lens.server_name.clone(),
             is_self: true,
             connected: true,
             node_type: "server".into(),
+            spiral_index: self.mesh.spiral.our_index().map(|i| i.value()),
+            is_spiral_neighbor: false,
+            vdf_step: our_vdf_step,
+            spiral_coord: self.mesh.spiral.our_world_coord(),
+            site_name: self.lens.site_name.clone(),
+            node_name: self.lens.node_name.clone(),
         });
 
         // Add known peers.
@@ -315,11 +526,38 @@ impl ServerState {
                 is_self: false,
                 connected,
                 node_type: "server".into(),
+                spiral_index: peer_info.spiral_index,
+                is_spiral_neighbor: self.mesh.spiral.is_neighbor(lens_id),
+                vdf_step: peer_info.vdf_step,
+                spiral_coord: self.mesh.spiral.peer_world_coord(lens_id),
+                site_name: peer_info.site_name.clone(),
+                node_name: peer_info.node_name.clone(),
             });
             if connected {
+                // Latency priority: proof_store → relay PING/PONG → Yggdrasil.
+                let proof_rtt = self.mesh.proof_store
+                    .get(&self.lens.peer_id, lens_id)
+                    .map(|e| e.rtt_ms);
+                let relay_rtt = self.federation.relays.get(&peer_info.node_name)
+                    .and_then(|r| r.last_rtt_ms);
+
+                // Yggdrasil metrics (bandwidth + latency fallback).
+                let ygg = peer_info
+                    .yggdrasil_addr
+                    .as_ref()
+                    .and_then(|addr| self.mesh.ygg_metrics.get(addr));
+
+                let upload_bps = ygg.map(|m| m.upload_bps);
+                let download_bps = ygg.map(|m| m.download_bps);
+                let latency_ms = proof_rtt.or(relay_rtt).or(ygg.map(|m| m.latency_ms));
+
                 links.push(MeshLinkReport {
                     source: self.lens.peer_id.clone(),
                     target: lens_id.clone(),
+                    upload_bps,
+                    download_bps,
+                    latency_ms,
+                    link_type: "relay".into(),
                 });
             }
         }
@@ -332,69 +570,105 @@ impl ServerState {
                 is_self: false,
                 connected: true,
                 node_type: "browser".into(),
+                spiral_index: None,
+                is_spiral_neighbor: false,
+                vdf_step: None,
+                spiral_coord: None,
+                site_name: self.lens.site_name.clone(),
+                node_name: self.lens.node_name.clone(),
             });
             links.push(MeshLinkReport {
                 source: self.lens.peer_id.clone(),
                 target: format!("web/{web_nick}"),
+                upload_bps: None,
+                download_bps: None,
+                latency_ms: None,
+                link_type: "relay".into(),
             });
+        }
+
+        // Add SPIRAL geometric neighbor links for neighbors not already connected via relay.
+        let relay_targets: HashSet<String> = links.iter().map(|l| l.target.clone()).collect();
+        for neighbor_id in self.mesh.spiral.all_neighbor_ids() {
+            if !relay_targets.contains(&neighbor_id) {
+                links.push(MeshLinkReport {
+                    source: self.lens.peer_id.clone(),
+                    target: neighbor_id,
+                    upload_bps: None,
+                    download_bps: None,
+                    latency_ms: None,
+                    link_type: "spiral".into(),
+                });
+            }
+        }
+
+        // Transitive latency: proof-derived links between remote peers (via gossip).
+        {
+            let existing_edges: HashSet<(String, String)> = links
+                .iter()
+                .map(|l| {
+                    if l.source < l.target {
+                        (l.source.clone(), l.target.clone())
+                    } else {
+                        (l.target.clone(), l.source.clone())
+                    }
+                })
+                .collect();
+            let latency_map = self.mesh.proof_store.latency_map((now * 1000) as i64);
+            for ((peer_a, peer_b), rtt_ms) in &latency_map {
+                let edge = if peer_a < peer_b {
+                    (peer_a.clone(), peer_b.clone())
+                } else {
+                    (peer_b.clone(), peer_a.clone())
+                };
+                if !existing_edges.contains(&edge) {
+                    links.push(MeshLinkReport {
+                        source: peer_a.clone(),
+                        target: peer_b.clone(),
+                        upload_bps: None,
+                        download_bps: None,
+                        latency_ms: Some(*rtt_ms),
+                        link_type: "proof".into(),
+                    });
+                }
+            }
         }
 
         MeshSnapshot {
             self_lens_id: self.lens.peer_id.clone(),
             self_server_name: self.lens.server_name.clone(),
+            self_site_name: self.lens.site_name.clone(),
             nodes,
             links,
             timestamp: now,
         }
     }
 
-    /// Build a debug topology snapshot with composite view from all peers.
+    /// Build a debug topology snapshot with composite view.
+    ///
+    /// Since proof gossip makes latency data transitive, the local view
+    /// already contains the full mesh latency graph. No more merging of
+    /// remote_topologies needed.
     pub fn build_debug_snapshot(&self) -> MeshDebugSnapshot {
         let local = self.build_mesh_snapshot();
-
-        // Merge all perspectives into a global view.
-        let mut all_nodes: HashMap<String, MeshNodeReport> = HashMap::new();
-        let mut all_links: HashSet<(String, String)> = HashSet::new();
-
-        // Add our own view.
-        for node in &local.nodes {
-            all_nodes.entry(node.lens_id.clone()).or_insert_with(|| node.clone());
-        }
-        for link in &local.links {
-            all_links.insert((link.source.clone(), link.target.clone()));
-        }
-
-        // Merge each remote peer's view.
-        for snapshot in self.mesh.remote_topologies.values() {
-            for node in &snapshot.nodes {
-                all_nodes.entry(node.lens_id.clone()).or_insert_with(|| node.clone());
-            }
-            for link in &snapshot.links {
-                all_links.insert((link.source.clone(), link.target.clone()));
-            }
-        }
-
-        let global = MeshSnapshot {
-            self_lens_id: self.lens.peer_id.clone(),
-            self_server_name: self.lens.server_name.clone(),
-            nodes: all_nodes.into_values().collect(),
-            links: all_links
-                .into_iter()
-                .map(|(source, target)| MeshLinkReport { source, target })
-                .collect(),
-            timestamp: local.timestamp,
-        };
-
         MeshDebugSnapshot {
+            global: local.clone(),
             local,
-            peer_views: self.mesh.remote_topologies.clone(),
-            global,
+            peer_views: HashMap::new(),
         }
     }
 
     /// Update the topology watch channel with current state.
+    ///
+    /// When `full_telemetry` is enabled (default), sends the composite global
+    /// view merging all peers' perspectives — every node in the mesh is visible.
+    /// Set `LAGOON_FULL_TELEMETRY=0` to revert to local-only view.
     pub fn notify_topology_change(&self) {
-        let snapshot = self.build_mesh_snapshot();
+        let snapshot = if self.full_telemetry {
+            self.build_debug_snapshot().global
+        } else {
+            self.build_mesh_snapshot()
+        };
         let _ = self.mesh_topology_tx.send(snapshot);
     }
 }
@@ -409,7 +683,7 @@ pub type SharedState = Arc<RwLock<ServerState>>;
 /// to the mesh topology watch channel.
 pub async fn start(
     addrs: &[&str],
-) -> Result<(SharedState, watch::Receiver<MeshSnapshot>, Vec<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>>), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(SharedState, watch::Receiver<MeshSnapshot>, Vec<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>>, broadcast::Sender<()>), Box<dyn std::error::Error + Send + Sync>> {
     let transport_config = Arc::new(transport::build_config());
     let (event_tx, event_rx) = mpsc::unbounded_channel::<RelayEvent>();
 
@@ -421,6 +695,8 @@ pub async fn start(
     info!(
         peer_id = %lens.peer_id,
         server_name = %lens.server_name,
+        site_name = %*SITE_NAME,
+        node_name = %*NODE_NAME,
         "lens identity active"
     );
 
@@ -433,6 +709,32 @@ pub async fn start(
         topology_tx,
         data_dir,
     )));
+
+    // Start VDF engine.
+    let (_vdf_shutdown_tx, _vdf_shutdown_rx) = broadcast::channel::<()>(1);
+    {
+        let mut st = state.write().await;
+        let pubkey = super::lens::pubkey_bytes(&st.lens).expect("valid lens identity");
+        let genesis = super::vdf::derive_genesis(&pubkey);
+        let restored_total = st.lens.vdf_total_steps;
+        let chain = Arc::new(RwLock::new(lagoon_vdf::VdfChain::new(genesis)));
+        let (vdf_state_tx, vdf_state_rx) = watch::channel(super::vdf::VdfState {
+            genesis,
+            current_hash: genesis,
+            session_steps: 0,
+            total_steps: restored_total,
+        });
+        st.mesh.vdf_state_rx = Some(vdf_state_rx);
+        st.mesh.vdf_chain = Some(Arc::clone(&chain));
+        let shutdown_rx = _vdf_shutdown_tx.subscribe();
+        tokio::spawn(super::vdf::run_vdf_engine(
+            genesis,
+            restored_total,
+            chain,
+            vdf_state_tx,
+            shutdown_rx,
+        ));
+    }
 
     // Load defederated peers.
     {
@@ -447,6 +749,16 @@ pub async fn start(
             }
         }
         st.notify_topology_change();
+    }
+
+    // Log telemetry mode.
+    {
+        let st = state.read().await;
+        if st.full_telemetry {
+            info!("FULL TELEMETRY mode ON — topology shows global composite view (set LAGOON_FULL_TELEMETRY=0 to disable)");
+        } else {
+            info!("telemetry: local-only topology view (set LAGOON_FULL_TELEMETRY=1 for global)");
+        }
     }
 
     // Spawn federation event processor.
@@ -473,7 +785,7 @@ pub async fn start(
         handles.push(tokio::spawn(accept_loop(listener, state)));
     }
 
-    Ok((state, topology_rx, handles))
+    Ok((state, topology_rx, handles, _vdf_shutdown_tx))
 }
 
 /// Run the IRC server on the given addresses.
@@ -481,11 +793,52 @@ pub async fn start(
 /// Binds to every address in the slice and accepts connections on all of them.
 /// This enables dual-stack: TCP on `0.0.0.0:6667` + Yggdrasil on `[200:...]:6667`.
 pub async fn run(addrs: &[&str]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (_state, _topology_rx, handles) = start(addrs).await?;
+    let (state, _topology_rx, handles, vdf_shutdown_tx) = start(addrs).await?;
 
-    // Wait for any listener to exit (they shouldn't).
-    for handle in handles {
-        handle.await??;
+    // Wait for shutdown signal (SIGTERM/SIGINT) or any listener to exit.
+    let shutdown_signal = async {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            ).expect("failed to register SIGTERM handler");
+            tokio::select! {
+                _ = ctrl_c => info!("received SIGINT, shutting down"),
+                _ = sigterm.recv() => info!("received SIGTERM, shutting down"),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            ctrl_c.await.ok();
+            info!("received SIGINT, shutting down");
+        }
+    };
+
+    tokio::select! {
+        _ = shutdown_signal => {
+            // Persist VDF state before exiting.
+            let st = state.read().await;
+            let mut updated_lens = (*st.lens).clone();
+            if let Some(ref rx) = st.mesh.vdf_state_rx {
+                updated_lens.vdf_total_steps = rx.borrow().total_steps;
+            }
+            super::lens::persist_identity(&st.data_dir, &updated_lens);
+            info!(
+                vdf_total_steps = updated_lens.vdf_total_steps,
+                "persisted VDF state on shutdown"
+            );
+            // Signal VDF engine to stop.
+            let _ = vdf_shutdown_tx.send(());
+        }
+        result = async {
+            for handle in handles {
+                handle.await??;
+            }
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        } => {
+            result?;
+        }
     }
 
     Ok(())
@@ -498,6 +851,10 @@ async fn accept_loop(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     loop {
         let (socket, addr) = listener.accept().await?;
+        // Best-effort — don't fail the connection if keepalive can't be set.
+        if let Err(e) = super::transport::set_tcp_keepalive(&socket) {
+            tracing::debug!(%addr, "failed to set TCP keepalive: {e}");
+        }
         info!(%addr, "new connection");
         let state = Arc::clone(&state);
         tokio::spawn(async move {
@@ -521,7 +878,7 @@ async fn handle_client(
     addr: SocketAddr,
     state: SharedState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut framed = Framed::new(socket, IrcCodec);
+    let mut framed = Framed::new(socket, IrcCodec::default());
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
 
     let mut pending = PendingRegistration {
@@ -529,6 +886,7 @@ async fn handle_client(
         user: None,
     };
     let mut registered_nick: Option<String> = None;
+    let mut quit_reason: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -590,6 +948,7 @@ async fn handle_client(
                                     realname: Some(realname.clone()),
                                     addr,
                                     tx: tx.clone(),
+                                    away_message: None,
                                 });
                                 if user.starts_with("web~") {
                                     st.mesh.web_clients.insert(irc_lower(&nick));
@@ -599,6 +958,49 @@ async fn handle_client(
 
                             // Send welcome numerics.
                             send_welcome(&mut framed, &nick).await?;
+
+                            // Send LUSERS on connect.
+                            {
+                                let st = state.read().await;
+                                let total_users = st.clients.len();
+                                let total_channels = st.channels.len();
+                                let mesh_peers = st.mesh.connections.values()
+                                    .filter(|s| **s == MeshConnectionState::Connected)
+                                    .count();
+                                drop(st);
+                                let lusers = [
+                                    Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "251".into(),
+                                        params: vec![
+                                            nick.clone(),
+                                            format!("There are {total_users} users and 0 invisible on {} servers", mesh_peers + 1),
+                                        ],
+                                    },
+                                    Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "252".into(),
+                                        params: vec![nick.clone(), "0".into(), "operator(s) online".into()],
+                                    },
+                                    Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "254".into(),
+                                        params: vec![nick.clone(), total_channels.to_string(), "channels formed".into()],
+                                    },
+                                    Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "255".into(),
+                                        params: vec![
+                                            nick.clone(),
+                                            format!("I have {total_users} clients and {mesh_peers} servers"),
+                                        ],
+                                    },
+                                ];
+                                for m in lusers {
+                                    framed.send(m).await?;
+                                }
+                            }
+
                             registered_nick = Some(nick);
                         }
                     }
@@ -606,7 +1008,10 @@ async fn handle_client(
                         // Registered — handle normal commands.
                         match handle_command(&mut framed, nick, &msg, &state).await? {
                             CommandResult::Ok => {}
-                            CommandResult::Quit => break,
+                            CommandResult::Quit(reason) => {
+                                quit_reason = Some(reason);
+                                break;
+                            }
                             CommandResult::NickChanged(new_nick) => {
                                 registered_nick = Some(new_nick);
                             }
@@ -624,7 +1029,8 @@ async fn handle_client(
 
     // Clean up on disconnect.
     if let Some(nick) = registered_nick {
-        cleanup_client(&nick, &state).await;
+        let reason = quit_reason.as_deref().unwrap_or("Connection closed");
+        cleanup_client(&nick, reason, &state).await;
     }
 
     Ok(())
@@ -719,7 +1125,7 @@ async fn send_welcome(
                 SERVER_NAME.clone(),
                 "lagoon-0.1.0".into(),
                 "qaov".into(),
-                "o".into(),
+                "biiklmnst".into(),
             ],
         },
         Message {
@@ -729,7 +1135,7 @@ async fn send_welcome(
                 nick.into(),
                 "PREFIX=(qaov)~&@+".into(),
                 "CHANTYPES=#&".into(),
-                "CHANMODES=,,,o".into(),
+                "CHANMODES=b,k,l,imnst".into(),
                 "MODES=4".into(),
                 format!("NETWORK={}", *NETWORK_TAG),
                 "are supported by this server".into(),
@@ -744,6 +1150,7 @@ async fn send_welcome(
                 "CHANNELLEN=50".into(),
                 "TOPICLEN=390".into(),
                 "KICKLEN=390".into(),
+                "AWAYLEN=200".into(),
                 "CASEMAPPING=ascii".into(),
                 "are supported by this server".into(),
             ],
@@ -786,7 +1193,7 @@ async fn send_welcome(
 /// Result of handling a command.
 enum CommandResult {
     Ok,
-    Quit,
+    Quit(String),
     NickChanged(String),
 }
 
@@ -965,10 +1372,11 @@ async fn handle_command(
                         federation::parse_federated_channel(&channel)
                     {
                         let mut st = state.write().await;
-                        let relay_exists = st.federation.relays.contains_key(remote_host);
+                        let relay_key = derive_node_name(remote_host);
+                        let relay_exists = st.federation.relays.contains_key(&relay_key);
 
                         if relay_exists {
-                            let relay = st.federation.relays.get_mut(remote_host).unwrap();
+                            let relay = st.federation.relays.get_mut(&relay_key).unwrap();
                             if relay.channels.contains_key(&channel) {
                                 // Channel already tracked — just add user.
                                 let fed_ch = relay.channels.get_mut(&channel).unwrap();
@@ -1008,6 +1416,7 @@ async fn handle_command(
                             // New relay connection to this host.
                             let event_tx = st.federation_event_tx.clone();
                             let (cmd_tx, task_handle) = federation::spawn_relay(
+                                relay_key.clone(),
                                 remote_host.to_owned(),
                                 event_tx,
                                 Arc::clone(&st.transport_config),
@@ -1034,18 +1443,20 @@ async fn handle_command(
                                 },
                             );
                             st.federation.relays.insert(
-                                remote_host.to_owned(),
+                                relay_key.clone(),
                                 federation::RelayHandle {
                                     outgoing_tx: cmd_tx,
-                                    remote_host: remote_host.to_owned(),
+                                    remote_host: relay_key.clone(),
                                     channels,
                                     task_handle,
                                     mesh_connected: false,
+                                    is_bootstrap: false,
+                                    last_rtt_ms: None,
                                 },
                             );
                         }
 
-                        let names = if let Some(relay) = st.federation.relays.get(remote_host) {
+                        let names = if let Some(relay) = st.federation.relays.get(&relay_key) {
                             if let Some(fed_ch) = relay.channels.get(&channel) {
                                 let mut parts: Vec<String> = fed_ch
                                     .local_users
@@ -1096,16 +1507,113 @@ async fn handle_command(
                         // Local channel.
                         let mut st = state.write().await;
 
+                        // Already in channel — skip silently.
+                        if st.channels.get(&channel).is_some_and(|m| m.contains_key(&nick_key)) {
+                            continue;
+                        }
+
+                        // Parse key from JOIN params (JOIN #chan key).
+                        let supplied_key = msg.params.get(1).cloned();
+
+                        // Enforce channel modes on join.
+                        let chan_modes = st.channel_modes.get(&channel);
+                        if let Some(modes) = chan_modes {
+                            // +b — check ban list.
+                            let user_ident = st.clients.get(&nick_key)
+                                .map(|h| h.user.as_deref().unwrap_or(&h.nick))
+                                .unwrap_or(nick);
+                            let full_hostmask = format!("{nick}!{user_ident}@{}", *SERVER_NAME);
+                            if let Some(bans) = st.channel_bans.get(&channel) {
+                                if bans.iter().any(|b| modes::match_hostmask(&b.mask, &full_hostmask)) {
+                                    // Check if invited (overrides ban).
+                                    let invited = st.channel_invites.get(&channel)
+                                        .is_some_and(|inv| inv.contains(&nick_key));
+                                    if !invited {
+                                        drop(st);
+                                        let err = Message {
+                                            prefix: Some(SERVER_NAME.clone()),
+                                            command: "474".into(),
+                                            params: vec![nick.into(), channel.clone(), "Cannot join channel (+b)".into()],
+                                        };
+                                        framed.send(err).await?;
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            // +k — check key.
+                            if let Some(ref required_key) = modes.key {
+                                let ok = supplied_key.as_deref() == Some(required_key.as_str());
+                                if !ok {
+                                    drop(st);
+                                    let err = Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "475".into(),
+                                        params: vec![nick.into(), channel.clone(), "Cannot join channel (+k)".into()],
+                                    };
+                                    framed.send(err).await?;
+                                    continue;
+                                }
+                            }
+
+                            // +i — invite only.
+                            if modes.invite_only {
+                                let invited = st.channel_invites.get(&channel)
+                                    .is_some_and(|inv| inv.contains(&nick_key));
+                                if !invited {
+                                    drop(st);
+                                    let err = Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "473".into(),
+                                        params: vec![nick.into(), channel.clone(), "Cannot join channel (+i)".into()],
+                                    };
+                                    framed.send(err).await?;
+                                    continue;
+                                }
+                            }
+
+                            // +l — user limit.
+                            if let Some(limit) = modes.limit {
+                                let current = st.channels.get(&channel).map(|m| m.len()).unwrap_or(0);
+                                if current >= limit {
+                                    drop(st);
+                                    let err = Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "471".into(),
+                                        params: vec![nick.into(), channel.clone(), "Cannot join channel (+l)".into()],
+                                    };
+                                    framed.send(err).await?;
+                                    continue;
+                                }
+                            }
+                        }
+
                         let prefix = st
                             .channel_roles
                             .get(&channel)
                             .and_then(|r| r.get(&nick_key).copied())
                             .unwrap_or(MemberPrefix::Normal);
 
+                        // Create channel modes with defaults (+n) for new channels.
+                        st.channel_modes
+                            .entry(channel.clone())
+                            .or_insert_with(ChannelModes::default);
+
+                        let is_new_channel = !st.channels.contains_key(&channel);
                         st.channels
                             .entry(channel.clone())
                             .or_default()
                             .insert(nick_key.clone(), prefix);
+
+                        // Subscribe to gossip cluster topic for new local channels.
+                        if is_new_channel {
+                            st.mesh.gossip.subscribe_cluster_channel(&channel);
+                        }
+
+                        // Clear invite on successful join.
+                        if let Some(inv) = st.channel_invites.get_mut(&channel) {
+                            inv.remove(&nick_key);
+                        }
 
                         let join_msg = Message {
                             prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
@@ -1179,6 +1687,13 @@ async fn handle_command(
                         framed.send(end_msg).await?;
                     }
                 }
+            } else {
+                let err = Message {
+                    prefix: Some(SERVER_NAME.clone()),
+                    command: "461".into(),
+                    params: vec![nick.into(), "JOIN".into(), "Not enough parameters".into()],
+                };
+                framed.send(err).await?;
             }
         }
 
@@ -1193,12 +1708,13 @@ async fn handle_command(
                 {
                     // Federated channel — remove user, maybe tear down relay.
                     let mut st = state.write().await;
+                    let relay_key = derive_node_name(remote_host);
 
                     // Collect nicks for broadcast before mutating.
                     let local_nicks: Vec<String> = st
                         .federation
                         .relays
-                        .get(remote_host)
+                        .get(&relay_key)
                         .and_then(|r| r.channels.get(&channel))
                         .map(|fc| fc.local_users.iter().cloned().collect())
                         .unwrap_or_default();
@@ -1211,7 +1727,7 @@ async fn handle_command(
                     broadcast(&st, &local_nicks, &part_msg);
 
                     let mut remove_relay = false;
-                    if let Some(relay) = st.federation.relays.get_mut(remote_host) {
+                    if let Some(relay) = st.federation.relays.get_mut(&relay_key) {
                         // Notify remote that this user is leaving.
                         let _ = relay.outgoing_tx.send(
                             federation::RelayCommand::Part {
@@ -1245,7 +1761,7 @@ async fn handle_command(
 
                     if remove_relay {
                         if let Some(relay) =
-                            st.federation.relays.remove(remote_host)
+                            st.federation.relays.remove(&relay_key)
                         {
                             relay.task_handle.abort();
                         }
@@ -1272,6 +1788,10 @@ async fn handle_command(
                         members.remove(&nick_key);
                         if members.is_empty() {
                             st.channels.remove(&channel);
+                            st.channel_modes.remove(&channel);
+                            st.channel_bans.remove(&channel);
+                            st.channel_invites.remove(&channel);
+                            st.mesh.gossip.unsubscribe_cluster_channel(&channel);
                         }
                     }
                 }
@@ -1279,7 +1799,14 @@ async fn handle_command(
         }
 
         "PRIVMSG" | "NOTICE" => {
-            if msg.params.len() >= 2 {
+            if msg.params.len() < 2 {
+                let err = Message {
+                    prefix: Some(SERVER_NAME.clone()),
+                    command: "461".into(),
+                    params: vec![nick.into(), msg.command.clone(), "Not enough parameters".into()],
+                };
+                framed.send(err).await?;
+            } else {
                 let target = &msg.params[0];
                 let target_lower = irc_lower(target);
                 let nick_key = irc_lower(nick);
@@ -1294,7 +1821,8 @@ async fn handle_command(
                 } {
                     // Federated channel — route through relay.
                     let st = state.read().await;
-                    if let Some(relay) = st.federation.relays.get(remote_host) {
+                    let relay_key = derive_node_name(remote_host);
+                    if let Some(relay) = st.federation.relays.get(&relay_key) {
                         // Send to the remote via relay.
                         let _ = relay.outgoing_tx.send(
                             federation::RelayCommand::Privmsg {
@@ -1320,27 +1848,114 @@ async fn handle_command(
                         }
                     }
                 } else if target.starts_with('#') || target.starts_with('&') {
-                    // Local channel message — broadcast to all members except sender.
-                    let relay_msg = Message {
-                        prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
-                        command: msg.command.clone(),
-                        params: vec![target_lower.clone(), text.clone()],
-                    };
+                    // Local channel message — enforce +n and +m modes.
                     let st = state.read().await;
-                    if let Some(members) = st.channels.get(&target_lower) {
-                        let others: Vec<_> = members
-                            .keys()
-                            .filter(|n| *n != &nick_key)
-                            .cloned()
-                            .collect();
-                        broadcast(&st, &others, &relay_msg);
+
+                    // 403: channel doesn't exist.
+                    if !st.channels.contains_key(&target_lower) {
+                        drop(st);
+                        let err = Message {
+                            prefix: Some(SERVER_NAME.clone()),
+                            command: "403".into(),
+                            params: vec![nick.into(), target_lower.clone(), "No such channel".into()],
+                        };
+                        framed.send(err).await?;
+                    } else {
+
+                    // +n: no external messages — sender must be in channel.
+                    let in_channel = st.channels.get(&target_lower)
+                        .is_some_and(|m| m.contains_key(&nick_key));
+                    if !in_channel {
+                        let no_ext = st.channel_modes.get(&target_lower)
+                            .is_some_and(|m| m.no_external);
+                        if no_ext {
+                            drop(st);
+                            let err = Message {
+                                prefix: Some(SERVER_NAME.clone()),
+                                command: "404".into(),
+                                params: vec![nick.into(), target_lower.clone(), "Cannot send to channel (+n)".into()],
+                            };
+                            framed.send(err).await?;
+                        }
+                    } else {
+                        // +m: moderated — sender must be Voice+ to speak.
+                        let moderated = st.channel_modes.get(&target_lower)
+                            .is_some_and(|m| m.moderated);
+                        if moderated {
+                            let sender_prefix = st.channels.get(&target_lower)
+                                .and_then(|m| m.get(&nick_key).copied())
+                                .unwrap_or(MemberPrefix::Normal);
+                            if sender_prefix < MemberPrefix::Voice {
+                                drop(st);
+                                let err = Message {
+                                    prefix: Some(SERVER_NAME.clone()),
+                                    command: "404".into(),
+                                    params: vec![nick.into(), target_lower.clone(), "Cannot send to channel (+m)".into()],
+                                };
+                                framed.send(err).await?;
+                            } else {
+                                let relay_msg = Message {
+                                    prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
+                                    command: msg.command.clone(),
+                                    params: vec![target_lower.clone(), text.clone()],
+                                };
+                                if let Some(members) = st.channels.get(&target_lower) {
+                                    let others: Vec<_> = members
+                                        .keys()
+                                        .filter(|n| *n != &nick_key)
+                                        .cloned()
+                                        .collect();
+                                    broadcast(&st, &others, &relay_msg);
+                                }
+                                // Gossip broadcast to mesh peers.
+                                let _ = st.federation_event_tx.send(
+                                    RelayEvent::GossipBroadcast {
+                                        event: super::gossip::GossipIrcEvent::Message {
+                                            nick: nick.to_owned(),
+                                            origin: SERVER_NAME.clone(),
+                                            channel: target_lower.clone(),
+                                            text: text.clone(),
+                                            command: msg.command.clone(),
+                                        },
+                                    },
+                                );
+                            }
+                        } else {
+                            let relay_msg = Message {
+                                prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
+                                command: msg.command.clone(),
+                                params: vec![target_lower.clone(), text.clone()],
+                            };
+                            if let Some(members) = st.channels.get(&target_lower) {
+                                let others: Vec<_> = members
+                                    .keys()
+                                    .filter(|n| *n != &nick_key)
+                                    .cloned()
+                                    .collect();
+                                broadcast(&st, &others, &relay_msg);
+                            }
+                            // Gossip broadcast to mesh peers.
+                            let _ = st.federation_event_tx.send(
+                                RelayEvent::GossipBroadcast {
+                                    event: super::gossip::GossipIrcEvent::Message {
+                                        nick: nick.to_owned(),
+                                        origin: SERVER_NAME.clone(),
+                                        channel: target_lower.clone(),
+                                        text: text.clone(),
+                                        command: msg.command.clone(),
+                                    },
+                                },
+                            );
+                        }
                     }
+                    } // close the 403/exists else
                 } else if target.contains('@') {
                     // Federated DM: nick@remote.host
                     if let Some((target_nick, remote_host)) = target.split_once('@') {
                         if remote_host.contains('.') {
                             let st = state.read().await;
-                            if let Some(relay) = st.federation.relays.get(remote_host) {
+                            let relay_key = derive_node_name(remote_host);
+                            if let Some(relay) = st.federation.relays.get(&relay_key) {
                                 // Route DM through existing relay connection.
                                 let dm = Message {
                                     prefix: None,
@@ -1388,6 +2003,16 @@ async fn handle_command(
                     let st = state.read().await;
                     if let Some(handle) = st.clients.get(&target_lower) {
                         let _ = handle.tx.send(relay_msg);
+                        // RPL_AWAY (301) — notify sender if target is away.
+                        if let Some(ref away_msg) = handle.away_message {
+                            let r301 = Message {
+                                prefix: Some(SERVER_NAME.clone()),
+                                command: "301".into(),
+                                params: vec![nick.into(), handle.nick.clone(), away_msg.clone()],
+                            };
+                            drop(st);
+                            framed.send(r301).await?;
+                        }
                     } else {
                         drop(st);
                         let err = Message {
@@ -1405,27 +2030,84 @@ async fn handle_command(
             if let Some(raw_channel) = msg.params.first() {
                 let channel = irc_lower(raw_channel);
                 if msg.params.len() >= 2 {
-                    // Enforce TOPICLEN=390.
-                    let raw_topic = &msg.params[1];
-                    let topic: &str = if raw_topic.len() > 390 { &raw_topic[..390] } else { raw_topic };
-                    let topic_msg = Message {
-                        prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
-                        command: "TOPIC".into(),
-                        params: vec![channel.clone(), topic.to_owned()],
-                    };
-                    let mut st = state.write().await;
-                    // Store the topic.
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs();
-                    st.channel_topics.insert(
-                        channel.clone(),
-                        (topic.to_owned(), nick.to_owned(), now),
-                    );
-                    if let Some(members) = st.channels.get(&channel) {
-                        let member_list: Vec<_> = members.keys().cloned().collect();
-                        broadcast(&st, &member_list, &topic_msg);
+                    let nick_key = irc_lower(nick);
+
+                    // Check user is in channel (442 ERR_NOTONCHANNEL).
+                    let st = state.read().await;
+                    let in_channel = st.channels.get(&channel)
+                        .is_some_and(|m| m.contains_key(&nick_key));
+                    if !in_channel {
+                        drop(st);
+                        let err = Message {
+                            prefix: Some(SERVER_NAME.clone()),
+                            command: "442".into(),
+                            params: vec![nick.into(), channel.clone(), "You're not on that channel".into()],
+                        };
+                        framed.send(err).await?;
+                    } else {
+                        // Enforce +t: only Op+ can set topic.
+                        let topic_locked = st.channel_modes.get(&channel)
+                            .is_some_and(|m| m.topic_locked);
+                        if topic_locked {
+                            let sender_prefix = st.channels.get(&channel)
+                                .and_then(|m| m.get(&nick_key).copied())
+                                .unwrap_or(MemberPrefix::Normal);
+                            if sender_prefix < MemberPrefix::Op {
+                                drop(st);
+                                let err = Message {
+                                    prefix: Some(SERVER_NAME.clone()),
+                                    command: "482".into(),
+                                    params: vec![nick.into(), channel.clone(), "You're not channel operator".into()],
+                                };
+                                framed.send(err).await?;
+                            } else {
+                                drop(st);
+                                // Enforce TOPICLEN=390.
+                                let raw_topic = &msg.params[1];
+                                let topic: &str = if raw_topic.len() > 390 { &raw_topic[..390] } else { raw_topic };
+                                let topic_msg = Message {
+                                    prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
+                                    command: "TOPIC".into(),
+                                    params: vec![channel.clone(), topic.to_owned()],
+                                };
+                                let mut st = state.write().await;
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                st.channel_topics.insert(
+                                    channel.clone(),
+                                    (topic.to_owned(), nick.to_owned(), now),
+                                );
+                                if let Some(members) = st.channels.get(&channel) {
+                                    let member_list: Vec<_> = members.keys().cloned().collect();
+                                    broadcast(&st, &member_list, &topic_msg);
+                                }
+                            }
+                        } else {
+                            drop(st);
+                            // Enforce TOPICLEN=390.
+                            let raw_topic = &msg.params[1];
+                            let topic: &str = if raw_topic.len() > 390 { &raw_topic[..390] } else { raw_topic };
+                            let topic_msg = Message {
+                                prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
+                                command: "TOPIC".into(),
+                                params: vec![channel.clone(), topic.to_owned()],
+                            };
+                            let mut st = state.write().await;
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            st.channel_topics.insert(
+                                channel.clone(),
+                                (topic.to_owned(), nick.to_owned(), now),
+                            );
+                            if let Some(members) = st.channels.get(&channel) {
+                                let member_list: Vec<_> = members.keys().cloned().collect();
+                                broadcast(&st, &member_list, &topic_msg);
+                            }
+                        }
                     }
                 } else {
                     // Topic query — return stored topic or 331.
@@ -1541,8 +2223,18 @@ async fn handle_command(
                     members.remove(&target_key);
                     if members.is_empty() {
                         st.channels.remove(&channel);
+                        st.channel_modes.remove(&channel);
+                        st.channel_bans.remove(&channel);
+                        st.channel_invites.remove(&channel);
                     }
                 }
+            } else {
+                let err = Message {
+                    prefix: Some(SERVER_NAME.clone()),
+                    command: "461".into(),
+                    params: vec![nick.into(), "KICK".into(), "Not enough parameters".into()],
+                };
+                framed.send(err).await?;
             }
         }
 
@@ -1613,6 +2305,7 @@ async fn handle_command(
         }
 
         "LIST" => {
+            let nick_key = irc_lower(nick);
             let st = state.read().await;
             // RPL_LISTSTART (321)
             let start = Message {
@@ -1623,6 +2316,12 @@ async fn handle_command(
             framed.send(start).await?;
 
             for (channel, members) in &st.channels {
+                // +s: skip secret channels unless requester is a member.
+                let secret = st.channel_modes.get(channel)
+                    .is_some_and(|m| m.secret);
+                if secret && !members.contains_key(&nick_key) {
+                    continue;
+                }
                 // RPL_LIST (322): channel, visible member count, topic
                 let topic_text = st.channel_topics.get(channel)
                     .map(|(t, _, _)| t.clone())
@@ -1658,7 +2357,8 @@ async fn handle_command(
                 {
                     // Federated channel — combine local + remote users.
                     let st = state.read().await;
-                    let names = if let Some(relay) = st.federation.relays.get(remote_host) {
+                    let relay_key = derive_node_name(remote_host);
+                    let names = if let Some(relay) = st.federation.relays.get(&relay_key) {
                         if let Some(fed_ch) = relay.channels.get(&channel) {
                             let mut parts: Vec<String> = fed_ch
                                 .local_users
@@ -1734,64 +2434,208 @@ async fn handle_command(
             if let Some(raw_target) = msg.params.first() {
                 let target = irc_lower(raw_target);
                 if target.starts_with('#') || target.starts_with('&') {
-                    if msg.params.len() >= 3 {
-                        // Channel mode change — apply if sender is op or owner.
+                    if msg.params.len() >= 2 {
+                        // Channel mode change.
                         let mode_str = &msg.params[1];
-                        let mode_target = &msg.params[2];
-                        let mode_target_key = irc_lower(mode_target);
+                        let mode_params: Vec<String> = msg.params[2..].to_vec();
                         let nick_key = irc_lower(nick);
-                        let st = state.read().await;
+
+                        let changes = modes::parse_mode_string(mode_str, &mode_params);
+
+                        let mut st = state.write().await;
                         let sender_prefix = st
                             .channels
                             .get(&target)
                             .and_then(|m| m.get(&nick_key).copied())
                             .unwrap_or(MemberPrefix::Normal);
-                        drop(st);
 
-                        if sender_prefix >= MemberPrefix::Op {
-                            let new_prefix = match mode_str.as_str() {
-                                "+q" => Some(MemberPrefix::Owner),
-                                "+a" => Some(MemberPrefix::Admin),
-                                "+o" => Some(MemberPrefix::Op),
-                                "+v" => Some(MemberPrefix::Voice),
-                                "-q" | "-a" | "-o" | "-v" => Some(MemberPrefix::Normal),
-                                _ => None,
-                            };
-                            if let Some(prefix) = new_prefix {
-                                let mut st = state.write().await;
-                                if let Some(members) = st.channels.get_mut(&target) {
-                                    if let Some(p) = members.get_mut(&mode_target_key) {
-                                        *p = prefix;
+                        // Track applied changes for broadcast.
+                        let mut applied_modes = String::new();
+                        let mut applied_params: Vec<String> = Vec::new();
+                        let mut last_setting: Option<bool> = None;
+
+                        for change in &changes {
+                            match change.mode {
+                                // Membership modes (q/a/o/v).
+                                'q' | 'a' | 'o' | 'v' => {
+                                    if sender_prefix < MemberPrefix::Op {
+                                        continue;
+                                    }
+                                    let new_prefix = if change.setting {
+                                        match change.mode {
+                                            'q' => MemberPrefix::Owner,
+                                            'a' => MemberPrefix::Admin,
+                                            'o' => MemberPrefix::Op,
+                                            'v' => MemberPrefix::Voice,
+                                            _ => unreachable!(),
+                                        }
+                                    } else {
+                                        MemberPrefix::Normal
+                                    };
+                                    if let Some(ref target_nick) = change.param {
+                                        let target_key = irc_lower(target_nick);
+                                        if let Some(members) = st.channels.get_mut(&target) {
+                                            if let Some(p) = members.get_mut(&target_key) {
+                                                *p = new_prefix;
+                                            }
+                                        }
+                                        st.channel_roles
+                                            .entry(target.clone())
+                                            .or_default()
+                                            .insert(target_key, new_prefix);
+                                        if last_setting != Some(change.setting) {
+                                            applied_modes.push(if change.setting { '+' } else { '-' });
+                                            last_setting = Some(change.setting);
+                                        }
+                                        applied_modes.push(change.mode);
+                                        applied_params.push(target_nick.clone());
                                     }
                                 }
-                                // Persist role so it survives PART/QUIT.
-                                st.channel_roles
-                                    .entry(target.clone())
-                                    .or_default()
-                                    .insert(mode_target_key, prefix);
-                                // Broadcast MODE change.
-                                let mode_msg = Message {
-                                    prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
-                                    command: "MODE".into(),
-                                    params: vec![
-                                        target.clone(),
-                                        mode_str.clone(),
-                                        mode_target.clone(),
-                                    ],
-                                };
-                                if let Some(members) = st.channels.get(&target) {
-                                    let member_list: Vec<_> =
-                                        members.keys().cloned().collect();
-                                    broadcast(&st, &member_list, &mode_msg);
+                                // Ban mode (b) — handled in Phase 4 (Step 8).
+                                'b' => {
+                                    if change.param.is_none() && change.setting {
+                                        // +b with no param = list bans.
+                                        let bans = st.channel_bans.get(&target);
+                                        let ban_list: Vec<_> = bans
+                                            .map(|b| b.iter().map(|e| (e.mask.clone(), e.set_by.clone(), e.set_at)).collect())
+                                            .unwrap_or_default();
+                                        for (mask, set_by, set_at) in ban_list {
+                                            let r367 = Message {
+                                                prefix: Some(SERVER_NAME.clone()),
+                                                command: "367".into(),
+                                                params: vec![
+                                                    nick.into(),
+                                                    target.clone(),
+                                                    mask,
+                                                    set_by,
+                                                    set_at.to_string(),
+                                                ],
+                                            };
+                                            framed.send(r367).await?;
+                                        }
+                                        let r368 = Message {
+                                            prefix: Some(SERVER_NAME.clone()),
+                                            command: "368".into(),
+                                            params: vec![nick.into(), target.clone(), "End of Channel Ban List".into()],
+                                        };
+                                        framed.send(r368).await?;
+                                        continue;
+                                    }
+                                    if sender_prefix < MemberPrefix::Op {
+                                        continue;
+                                    }
+                                    if let Some(ref mask) = change.param {
+                                        if change.setting {
+                                            let now = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .map(|d| d.as_secs())
+                                                .unwrap_or(0);
+                                            st.channel_bans
+                                                .entry(target.clone())
+                                                .or_default()
+                                                .push(BanEntry {
+                                                    mask: mask.clone(),
+                                                    set_by: nick.to_owned(),
+                                                    set_at: now,
+                                                });
+                                        } else {
+                                            if let Some(bans) = st.channel_bans.get_mut(&target) {
+                                                bans.retain(|b| b.mask != *mask);
+                                            }
+                                        }
+                                        if last_setting != Some(change.setting) {
+                                            applied_modes.push(if change.setting { '+' } else { '-' });
+                                            last_setting = Some(change.setting);
+                                        }
+                                        applied_modes.push('b');
+                                        applied_params.push(mask.clone());
+                                    }
+                                }
+                                // Channel flag modes (i/m/n/s/t/k/l).
+                                'i' | 'm' | 'n' | 's' | 't' | 'k' | 'l' => {
+                                    if sender_prefix < MemberPrefix::Op {
+                                        continue;
+                                    }
+                                    let chan_modes = st.channel_modes
+                                        .entry(target.clone())
+                                        .or_insert_with(ChannelModes::default);
+
+                                    match change.mode {
+                                        'i' => chan_modes.invite_only = change.setting,
+                                        'm' => chan_modes.moderated = change.setting,
+                                        'n' => chan_modes.no_external = change.setting,
+                                        's' => chan_modes.secret = change.setting,
+                                        't' => chan_modes.topic_locked = change.setting,
+                                        'k' => {
+                                            if change.setting {
+                                                chan_modes.key = change.param.clone();
+                                            } else {
+                                                chan_modes.key = None;
+                                            }
+                                        }
+                                        'l' => {
+                                            if change.setting {
+                                                chan_modes.limit = change.param
+                                                    .as_ref()
+                                                    .and_then(|p| p.parse().ok());
+                                            } else {
+                                                chan_modes.limit = None;
+                                            }
+                                        }
+                                        _ => unreachable!(),
+                                    }
+
+                                    if last_setting != Some(change.setting) {
+                                        applied_modes.push(if change.setting { '+' } else { '-' });
+                                        last_setting = Some(change.setting);
+                                    }
+                                    applied_modes.push(change.mode);
+                                    if let Some(ref p) = change.param {
+                                        applied_params.push(p.clone());
+                                    }
+                                }
+                                // Unknown mode.
+                                unknown => {
+                                    let err = Message {
+                                        prefix: Some(SERVER_NAME.clone()),
+                                        command: "472".into(),
+                                        params: vec![
+                                            nick.into(),
+                                            unknown.to_string(),
+                                            "is unknown mode char to me".into(),
+                                        ],
+                                    };
+                                    framed.send(err).await?;
                                 }
                             }
                         }
+
+                        // Broadcast applied changes to all members.
+                        if !applied_modes.is_empty() {
+                            let mut mode_params_out = vec![target.clone(), applied_modes];
+                            mode_params_out.extend(applied_params);
+                            let mode_msg = Message {
+                                prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
+                                command: "MODE".into(),
+                                params: mode_params_out,
+                            };
+                            if let Some(members) = st.channels.get(&target) {
+                                let member_list: Vec<_> =
+                                    members.keys().cloned().collect();
+                                broadcast(&st, &member_list, &mode_msg);
+                            }
+                        }
                     } else {
-                        // Channel mode query — return current mode.
+                        // Channel mode query — return current mode string.
+                        let st = state.read().await;
+                        let mode_string = st.channel_modes.get(&target)
+                            .map(|m| m.to_mode_string())
+                            .unwrap_or_else(|| "+".into());
+                        drop(st);
                         let reply = Message {
                             prefix: Some(SERVER_NAME.clone()),
                             command: "324".into(),
-                            params: vec![nick.into(), target.clone(), "+".into()],
+                            params: vec![nick.into(), target.clone(), mode_string],
                         };
                         framed.send(reply).await?;
                     }
@@ -1970,10 +2814,17 @@ async fn handle_command(
                         ],
                     };
                     framed.send(r312).await?;
-                    // 319 RPL_WHOISCHANNELS
+                    // 319 RPL_WHOISCHANNELS (skip +s channels unless requester is a member)
+                    let requester_key = irc_lower(nick);
                     let mut chans = Vec::new();
                     for (ch_name, members) in &st.channels {
                         if let Some(prefix) = members.get(&target_key) {
+                            // Hide +s channels from non-members.
+                            let secret = st.channel_modes.get(ch_name)
+                                .is_some_and(|m| m.secret);
+                            if secret && !members.contains_key(&requester_key) {
+                                continue;
+                            }
                             chans.push(format!("{}{ch_name}", prefix.symbol()));
                         }
                     }
@@ -1984,6 +2835,15 @@ async fn handle_command(
                             params: vec![nick.into(), display_nick.clone(), chans.join(" ")],
                         };
                         framed.send(r319).await?;
+                    }
+                    // 301 RPL_AWAY (if away)
+                    if let Some(ref away_msg) = handle.away_message {
+                        let r301 = Message {
+                            prefix: Some(SERVER_NAME.clone()),
+                            command: "301".into(),
+                            params: vec![nick.into(), display_nick.clone(), away_msg.clone()],
+                        };
+                        framed.send(r301).await?;
                     }
                 } else {
                     // 401 ERR_NOSUCHNICK
@@ -2008,7 +2868,97 @@ async fn handle_command(
         // MESH — mesh networking protocol (Lagoon extension).
         // Received from relay nicks — forwarded to federation event processor.
         "MESH" => {
-            if msg.params.len() >= 2 {
+            if msg.params.first().map(|s| s.as_str()) == Some("SPIRAL") {
+                // MESH SPIRAL — show our SPIRAL topology status.
+                let st = state.read().await;
+                let sn = &*SERVER_NAME;
+                let mut replies = Vec::new();
+                if let (Some(idx), Some(coord)) = (st.mesh.spiral.our_index(), st.mesh.spiral.our_coord()) {
+                    let shell = idx.shell();
+                    let neighbor_count = st.mesh.spiral.neighbors().len();
+                    let occupied = st.mesh.spiral.occupied_count();
+                    replies.push(format!("SPIRAL slot {}, shell {}", idx.value(), shell));
+                    replies.push(format!("Coordinate ({}, {}, {})", coord.q, coord.r, coord.z));
+                    replies.push(format!("{} occupied slots, {} SPIRAL neighbors", occupied, neighbor_count));
+                    for neighbor_id in st.mesh.spiral.neighbors() {
+                        let server = st.mesh.known_peers.get(neighbor_id)
+                            .map(|p| p.server_name.as_str())
+                            .unwrap_or("?");
+                        let peer_idx = st.mesh.spiral.peer_index(neighbor_id)
+                            .map(|i| i.value().to_string())
+                            .unwrap_or_else(|| "?".into());
+                        replies.push(format!("  neighbor: {} (slot {}, {})", neighbor_id, peer_idx, server));
+                    }
+                } else {
+                    replies.push("SPIRAL: no position claimed yet".into());
+                }
+                drop(st);
+                for line in replies {
+                    let notice = Message {
+                        prefix: Some(sn.clone()),
+                        command: "NOTICE".into(),
+                        params: vec![nick.to_owned(), line],
+                    };
+                    framed.send(notice).await?;
+                }
+            } else if msg.params.first().map(|s| s.as_str()) == Some("VDF") {
+                // MESH VDF — show our VDF engine status.
+                let st = state.read().await;
+                let sn = &*SERVER_NAME;
+                let mut replies = Vec::new();
+                if let Some(ref rx) = st.mesh.vdf_state_rx {
+                    let vdf = rx.borrow().clone();
+                    replies.push(format!("VDF Genesis:      {}", lagoon_vdf::to_hex_short(&vdf.genesis, 16)));
+                    replies.push(format!("VDF Current:      {}", lagoon_vdf::to_hex_short(&vdf.current_hash, 16)));
+                    replies.push(format!("Session Steps:    {}", vdf.session_steps));
+                    replies.push(format!("Total Steps:      {}", vdf.total_steps));
+                    let tick_rate: u64 = std::env::var("LAGOON_VDF_RATE")
+                        .ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+                    replies.push(format!("Tick Rate:        {} Hz", tick_rate));
+                    if let Some(ref chain) = st.mesh.vdf_chain {
+                        let chain_len = chain.read().await.hashes.len();
+                        let bytes = chain_len * 32;
+                        replies.push(format!("Chain Size:       {} hashes (~{} KB)", chain_len, bytes / 1024));
+                    }
+                } else {
+                    replies.push("VDF: engine not active".into());
+                }
+                drop(st);
+                for line in replies {
+                    let notice = Message {
+                        prefix: Some(sn.clone()),
+                        command: "NOTICE".into(),
+                        params: vec![nick.to_owned(), line],
+                    };
+                    framed.send(notice).await?;
+                }
+            } else if msg.params.first().map(|s| s.as_str()) == Some("SYNC") {
+                // MESH SYNC — request full peer table from all connected mesh relays.
+                let st = state.read().await;
+                let sn = &*SERVER_NAME;
+                let relay_count = st.federation.relays.values()
+                    .filter(|r| r.mesh_connected)
+                    .count();
+                for relay in st.federation.relays.values() {
+                    if relay.mesh_connected {
+                        let _ = relay.outgoing_tx.send(federation::RelayCommand::Raw(Message {
+                            prefix: None,
+                            command: "MESH".into(),
+                            params: vec!["SYNC".into()],
+                        }));
+                    }
+                }
+                drop(st);
+                let notice = Message {
+                    prefix: Some(sn.clone()),
+                    command: "NOTICE".into(),
+                    params: vec![
+                        nick.to_owned(),
+                        format!("MESH SYNC requested from {} peer(s)", relay_count),
+                    ],
+                };
+                framed.send(notice).await?;
+            } else if msg.params.len() >= 2 {
                 let sub_cmd = &msg.params[0];
                 let json = &msg.params[1];
                 let st = state.read().await;
@@ -2020,30 +2970,88 @@ async fn handle_command(
                             peer_id: String,
                             server_name: String,
                             public_key_hex: String,
+                            #[serde(default)]
+                            spiral_index: Option<u64>,
+                            #[serde(default)]
+                            vdf_genesis: Option<String>,
+                            #[serde(default)]
+                            vdf_hash: Option<String>,
+                            #[serde(default)]
+                            vdf_step: Option<u64>,
+                            #[serde(default)]
+                            yggdrasil_addr: Option<String>,
+                            #[serde(default)]
+                            site_name: String,
+                            #[serde(default)]
+                            node_name: String,
                         }
                         if let Ok(hello) = serde_json::from_str::<HelloPayload>(json) {
+                            // Use node_name from HELLO if present, else derive from server_name.
+                            let node_name = if hello.node_name.is_empty() {
+                                derive_node_name(&hello.server_name)
+                            } else {
+                                hello.node_name
+                            };
+                            let site_name = if hello.site_name.is_empty() {
+                                derive_site_name(&hello.server_name)
+                            } else {
+                                hello.site_name
+                            };
                             let _ = st.federation_event_tx.send(
                                 federation::RelayEvent::MeshHello {
-                                    remote_host: hello.server_name.clone(),
+                                    remote_host: node_name.clone(),
                                     lens_id: hello.peer_id,
-                                    server_name: hello.server_name,
+                                    server_name: hello.server_name.clone(),
                                     public_key_hex: hello.public_key_hex,
+                                    spiral_index: hello.spiral_index,
+                                    vdf_genesis: hello.vdf_genesis,
+                                    vdf_hash: hello.vdf_hash,
+                                    vdf_step: hello.vdf_step,
+                                    yggdrasil_addr: hello.yggdrasil_addr,
+                                    site_name,
+                                    node_name,
                                 },
                             );
 
-                            // Respond with our own HELLO.
+                            // Respond with our own HELLO (include SPIRAL + VDF).
+                            let (our_vdf_genesis, our_vdf_hash, our_vdf_step) = st
+                                .mesh
+                                .vdf_state_rx
+                                .as_ref()
+                                .map(|rx| {
+                                    let vdf = rx.borrow();
+                                    (
+                                        Some(hex::encode(vdf.genesis)),
+                                        Some(hex::encode(vdf.current_hash)),
+                                        Some(vdf.total_steps),
+                                    )
+                                })
+                                .unwrap_or((None, None, None));
+
                             let our_hello = serde_json::json!({
                                 "peer_id": st.lens.peer_id,
                                 "server_name": st.lens.server_name,
                                 "public_key_hex": st.lens.public_key_hex,
+                                "spiral_index": st.lens.spiral_index,
+                                "vdf_genesis": our_vdf_genesis,
+                                "vdf_hash": our_vdf_hash,
+                                "vdf_step": our_vdf_step,
+                                "site_name": st.lens.site_name,
+                                "node_name": st.lens.node_name,
                             });
 
                             // Collect peer list for MESH PEERS exchange.
                             let peers_list: Vec<MeshPeerInfo> =
                                 st.mesh.known_peers.values().cloned().collect();
 
-                            // Collect topology snapshot for MESH TOPOLOGY exchange.
-                            let topo_snapshot = st.build_mesh_snapshot();
+                            // Prepare LATENCY_HAVE payload while we still hold the read lock.
+                            let spore_bytes = bincode::serialize(st.mesh.proof_store.spore())
+                                .unwrap_or_default();
+                            let sync_msg = super::latency_gossip::SyncMessage::HaveList {
+                                spore_bytes,
+                            };
+                            let latency_have_b64 = base64::engine::general_purpose::STANDARD
+                                .encode(bincode::serialize(&sync_msg).unwrap_or_default());
 
                             drop(st);
 
@@ -2066,15 +3074,14 @@ async fn handle_command(
                                 }
                             }
 
-                            // Send MESH TOPOLOGY — our full mesh view.
-                            if let Ok(topo_json) = serde_json::to_string(&topo_snapshot) {
-                                let topo_msg = Message {
-                                    prefix: Some(SERVER_NAME.clone()),
-                                    command: "MESH".into(),
-                                    params: vec!["TOPOLOGY".into(), topo_json],
-                                };
-                                framed.send(topo_msg).await?;
-                            }
+                            // Send MESH LATENCY_HAVE — our proof SPORE for delta sync.
+                            // (replaces monolithic MESH TOPOLOGY which overflows at 10+ nodes)
+                            let have_msg = Message {
+                                prefix: Some(SERVER_NAME.clone()),
+                                command: "MESH".into(),
+                                params: vec!["LATENCY_HAVE".into(), latency_have_b64],
+                            };
+                            framed.send(have_msg).await?;
                         }
                     }
                     "PEERS" => {
@@ -2097,6 +3104,51 @@ async fn handle_command(
                             },
                         );
                     }
+                    "GOSSIP" => {
+                        let _ = st.federation_event_tx.send(
+                            federation::RelayEvent::GossipReceive {
+                                remote_host: nick.to_owned(),
+                                message_json: json.clone(),
+                            },
+                        );
+                    }
+                    "GOSSIP_SPORE" => {
+                        let _ = st.federation_event_tx.send(
+                            federation::RelayEvent::GossipSpore {
+                                remote_host: nick.to_owned(),
+                                spore_json: json.clone(),
+                            },
+                        );
+                    }
+                    "GOSSIP_DIFF" => {
+                        let _ = st.federation_event_tx.send(
+                            federation::RelayEvent::GossipDiff {
+                                remote_host: nick.to_owned(),
+                                messages_json: json.clone(),
+                            },
+                        );
+                    }
+                    "LATENCY_HAVE" => {
+                        // Resolve nick → node_name (strip ~relay suffix).
+                        let node_name = nick.strip_suffix("~relay")
+                            .unwrap_or(nick).to_owned();
+                        let _ = st.federation_event_tx.send(
+                            federation::RelayEvent::LatencyHaveList {
+                                remote_host: node_name,
+                                payload_b64: json.clone(),
+                            },
+                        );
+                    }
+                    "LATENCY_DELTA" => {
+                        let node_name = nick.strip_suffix("~relay")
+                            .unwrap_or(nick).to_owned();
+                        let _ = st.federation_event_tx.send(
+                            federation::RelayEvent::LatencyProofDelta {
+                                remote_host: node_name,
+                                payload_b64: json.clone(),
+                            },
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -2104,7 +3156,98 @@ async fn handle_command(
 
         // INVITE — invite code management commands.
         "INVITE" => {
-            if let Some(sub_cmd) = msg.params.first() {
+            // Disambiguate: if params[1] starts with # or &, it's standard IRC INVITE.
+            // Otherwise, fall through to the Lagoon invite subcommand system.
+            let is_irc_invite = msg.params.get(1)
+                .is_some_and(|p| p.starts_with('#') || p.starts_with('&'));
+
+            if is_irc_invite {
+                // Standard IRC INVITE: INVITE <nick> <#channel>
+                let target_nick = &msg.params[0];
+                let raw_channel = &msg.params[1];
+                let channel = irc_lower(raw_channel);
+                let nick_key = irc_lower(nick);
+                let target_key = irc_lower(target_nick);
+
+                let st = state.read().await;
+
+                // 442: sender must be in channel.
+                let in_channel = st.channels.get(&channel)
+                    .is_some_and(|m| m.contains_key(&nick_key));
+                if !in_channel {
+                    drop(st);
+                    let err = Message {
+                        prefix: Some(SERVER_NAME.clone()),
+                        command: "442".into(),
+                        params: vec![nick.into(), channel.clone(), "You're not on that channel".into()],
+                    };
+                    framed.send(err).await?;
+                } else {
+                    // 482: if +i, sender must be Op+.
+                    let invite_only = st.channel_modes.get(&channel)
+                        .is_some_and(|m| m.invite_only);
+                    let sender_prefix = st.channels.get(&channel)
+                        .and_then(|m| m.get(&nick_key).copied())
+                        .unwrap_or(MemberPrefix::Normal);
+
+                    if invite_only && sender_prefix < MemberPrefix::Op {
+                        drop(st);
+                        let err = Message {
+                            prefix: Some(SERVER_NAME.clone()),
+                            command: "482".into(),
+                            params: vec![nick.into(), channel.clone(), "You're not channel operator".into()],
+                        };
+                        framed.send(err).await?;
+                    } else {
+                        // 443: target must not already be in channel.
+                        let target_in_channel = st.channels.get(&channel)
+                            .is_some_and(|m| m.contains_key(&target_key));
+                        if target_in_channel {
+                            drop(st);
+                            let err = Message {
+                                prefix: Some(SERVER_NAME.clone()),
+                                command: "443".into(),
+                                params: vec![nick.into(), target_nick.clone(), channel.clone(), "is already on channel".into()],
+                            };
+                            framed.send(err).await?;
+                        } else if let Some(target_handle) = st.clients.get(&target_key) {
+                            // Send INVITE to target.
+                            let invite_msg = Message {
+                                prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
+                                command: "INVITE".into(),
+                                params: vec![target_handle.nick.clone(), channel.clone()],
+                            };
+                            let _ = target_handle.tx.send(invite_msg);
+                            drop(st);
+
+                            // Track in channel_invites.
+                            let mut st = state.write().await;
+                            st.channel_invites
+                                .entry(channel.clone())
+                                .or_default()
+                                .insert(target_key);
+
+                            // 341 RPL_INVITING to sender.
+                            drop(st);
+                            let r341 = Message {
+                                prefix: Some(SERVER_NAME.clone()),
+                                command: "341".into(),
+                                params: vec![nick.into(), target_nick.clone(), channel],
+                            };
+                            framed.send(r341).await?;
+                        } else {
+                            drop(st);
+                            // 401: target doesn't exist.
+                            let err = Message {
+                                prefix: Some(SERVER_NAME.clone()),
+                                command: "401".into(),
+                                params: vec![nick.into(), target_nick.clone(), "No such nick/channel".into()],
+                            };
+                            framed.send(err).await?;
+                        }
+                    }
+                }
+            } else if let Some(sub_cmd) = msg.params.first() {
                 match sub_cmd.to_uppercase().as_str() {
                     "CREATE" => {
                         // INVITE CREATE <kind> <target> [privileges] [max_uses] [expires]
@@ -2416,10 +3559,12 @@ async fn handle_command(
                 // Also check by lens_id in known_peers.
                 let mut connection_ids_to_remove = Vec::new();
                 for (lens_id, peer_info) in &st.mesh.known_peers {
-                    if lens_id == target || peer_info.server_name == *target {
-                        if let Some(relay) = st.federation.relays.get(&peer_info.server_name) {
+                    if lens_id == target || peer_info.server_name == *target
+                        || peer_info.node_name == *target
+                    {
+                        if let Some(relay) = st.federation.relays.get(&peer_info.node_name) {
                             let _ = relay.outgoing_tx.send(federation::RelayCommand::Shutdown);
-                            to_remove.push(peer_info.server_name.clone());
+                            to_remove.push(peer_info.node_name.clone());
                         }
                         connection_ids_to_remove.push(lens_id.clone());
                     }
@@ -2493,8 +3638,139 @@ async fn handle_command(
             }
         }
 
+        "LUSERS" => {
+            let st = state.read().await;
+            let total_users = st.clients.len();
+            let total_channels = st.channels.len();
+            let mesh_peers = st.mesh.connections.values()
+                .filter(|s| **s == MeshConnectionState::Connected)
+                .count();
+            drop(st);
+
+            // 251 RPL_LUSERCLIENT
+            let r251 = Message {
+                prefix: Some(SERVER_NAME.clone()),
+                command: "251".into(),
+                params: vec![
+                    nick.into(),
+                    format!("There are {total_users} users and 0 invisible on {servers} servers",
+                        servers = mesh_peers + 1),
+                ],
+            };
+            framed.send(r251).await?;
+
+            // 252 RPL_LUSEROP
+            let r252 = Message {
+                prefix: Some(SERVER_NAME.clone()),
+                command: "252".into(),
+                params: vec![nick.into(), "0".into(), "operator(s) online".into()],
+            };
+            framed.send(r252).await?;
+
+            // 254 RPL_LUSERCHANNELS
+            let r254 = Message {
+                prefix: Some(SERVER_NAME.clone()),
+                command: "254".into(),
+                params: vec![nick.into(), total_channels.to_string(), "channels formed".into()],
+            };
+            framed.send(r254).await?;
+
+            // 255 RPL_LUSERME
+            let r255 = Message {
+                prefix: Some(SERVER_NAME.clone()),
+                command: "255".into(),
+                params: vec![
+                    nick.into(),
+                    format!("I have {total_users} clients and {mesh_peers} servers"),
+                ],
+            };
+            framed.send(r255).await?;
+        }
+
+        "AWAY" => {
+            if let Some(away_text) = msg.params.first().filter(|t| !t.is_empty()) {
+                // Set away (enforce AWAYLEN=200).
+                let truncated: String = away_text.chars().take(200).collect();
+                let nick_key = irc_lower(nick);
+                let mut st = state.write().await;
+                if let Some(handle) = st.clients.get_mut(&nick_key) {
+                    handle.away_message = Some(truncated);
+                }
+                drop(st);
+                // 306 RPL_NOWAWAY
+                let reply = Message {
+                    prefix: Some(SERVER_NAME.clone()),
+                    command: "306".into(),
+                    params: vec![nick.into(), "You have been marked as being away".into()],
+                };
+                framed.send(reply).await?;
+            } else {
+                // Unset away.
+                let nick_key = irc_lower(nick);
+                let mut st = state.write().await;
+                if let Some(handle) = st.clients.get_mut(&nick_key) {
+                    handle.away_message = None;
+                }
+                drop(st);
+                // 305 RPL_UNAWAY
+                let reply = Message {
+                    prefix: Some(SERVER_NAME.clone()),
+                    command: "305".into(),
+                    params: vec![nick.into(), "You are no longer marked as being away".into()],
+                };
+                framed.send(reply).await?;
+            }
+        }
+
+        "WHOWAS" => {
+            if let Some(target_nick) = msg.params.first() {
+                let st = state.read().await;
+                let entries = st.whowas.lookup(target_nick);
+                if entries.is_empty() {
+                    drop(st);
+                    // 406 ERR_WASNOSUCHNICK
+                    let err = Message {
+                        prefix: Some(SERVER_NAME.clone()),
+                        command: "406".into(),
+                        params: vec![nick.into(), target_nick.clone(), "There was no such nickname".into()],
+                    };
+                    framed.send(err).await?;
+                } else {
+                    // Send up to 5 most recent entries.
+                    let to_send: Vec<_> = entries.into_iter().take(5).map(|e| {
+                        (e.nick.clone(), e.user.clone(), e.host.clone(), e.realname.clone())
+                    }).collect();
+                    drop(st);
+                    for (e_nick, e_user, e_host, e_realname) in to_send {
+                        // 314 RPL_WHOWASUSER
+                        let r314 = Message {
+                            prefix: Some(SERVER_NAME.clone()),
+                            command: "314".into(),
+                            params: vec![
+                                nick.into(),
+                                e_nick,
+                                e_user,
+                                e_host,
+                                "*".into(),
+                                e_realname,
+                            ],
+                        };
+                        framed.send(r314).await?;
+                    }
+                }
+                // 369 RPL_ENDOFWHOWAS (always sent)
+                let end = Message {
+                    prefix: Some(SERVER_NAME.clone()),
+                    command: "369".into(),
+                    params: vec![nick.into(), target_nick.clone(), "End of WHOWAS".into()],
+                };
+                framed.send(end).await?;
+            }
+        }
+
         "QUIT" => {
-            return Ok(CommandResult::Quit);
+            let reason = msg.params.first().cloned().unwrap_or_else(|| "Client Quit".into());
+            return Ok(CommandResult::Quit(reason));
         }
 
         other => {
@@ -2521,7 +3797,7 @@ pub fn broadcast(state: &ServerState, nicks: &[String], msg: &Message) {
 }
 
 /// Clean up when a client disconnects.
-async fn cleanup_client(nick: &str, state: &SharedState) {
+async fn cleanup_client(nick: &str, reason: &str, state: &SharedState) {
     let nick_key = irc_lower(nick);
     let mut st = state.write().await;
 
@@ -2530,7 +3806,7 @@ async fn cleanup_client(nick: &str, state: &SharedState) {
         let quit_msg = Message {
             prefix: Some(format!("{nick}!{nick}@{}", *SERVER_NAME)),
             command: "QUIT".into(),
-            params: vec!["Connection closed".into()],
+            params: vec![reason.to_owned()],
         };
 
         let mut notified: HashSet<String> = HashSet::new();
@@ -2548,11 +3824,23 @@ async fn cleanup_client(nick: &str, state: &SharedState) {
         }
     }
 
-    // Remove from all local channels.
-    st.channels.retain(|_name, members| {
+    // Remove from all local channels; clean up modes/bans/invites for emptied channels.
+    let mut emptied_channels = Vec::new();
+    st.channels.retain(|name, members| {
         members.remove(&nick_key);
-        !members.is_empty()
+        if members.is_empty() {
+            emptied_channels.push(name.clone());
+            false
+        } else {
+            true
+        }
     });
+    for ch in &emptied_channels {
+        st.channel_modes.remove(ch);
+        st.channel_bans.remove(ch);
+        st.channel_invites.remove(ch);
+        st.mesh.gossip.unsubscribe_cluster_channel(ch);
+    }
 
     // Remove from all federated channels. Shut down relays with no channels left.
     let mut empty_relays = Vec::new();
@@ -2563,7 +3851,7 @@ async fn cleanup_client(nick: &str, state: &SharedState) {
                 let _ = relay.outgoing_tx.send(federation::RelayCommand::Part {
                     nick: nick.to_owned(),
                     remote_channel: fed_ch.remote_channel.clone(),
-                    reason: "Connection closed".into(),
+                    reason: reason.to_owned(),
                 });
                 if fed_ch.local_users.is_empty() {
                     let _ = relay.outgoing_tx.send(
@@ -2587,6 +3875,24 @@ async fn cleanup_client(nick: &str, state: &SharedState) {
         if let Some(relay) = st.federation.relays.remove(&host) {
             relay.task_handle.abort();
         }
+    }
+
+    // Record WHOWAS entry before removing.
+    let whowas_entry = st.clients.get(&nick_key).map(|handle| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        modes::WhowasEntry {
+            nick: handle.nick.clone(),
+            user: handle.user.clone().unwrap_or_default(),
+            host: SERVER_NAME.clone(),
+            realname: handle.realname.clone().unwrap_or_default(),
+            disconnect_time: now,
+        }
+    });
+    if let Some(entry) = whowas_entry {
+        st.whowas.push(entry);
     }
 
     // Remove from clients.

@@ -2,8 +2,13 @@
 ///
 /// Splits on `\r\n` (per RFC 2812), parses each line into a [`Message`],
 /// and serializes outgoing messages with `\r\n` termination.
+///
+/// Oversized lines (> 8191 bytes) are silently skipped rather than
+/// killing the connection — this is scaffolding for the IRC transport
+/// layer until TGFP replaces it.
 use bytes::{Buf, BufMut, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
+use tracing::warn;
 
 use super::message::{Message, ParseError};
 
@@ -23,20 +28,56 @@ pub enum CodecError {
 }
 
 /// A tokio codec that frames IRC messages on `\r\n` boundaries.
+///
+/// Oversized lines are skipped (logged + discarded) instead of returning
+/// a fatal error. This keeps connections alive when MESH protocol messages
+/// exceed the IRC line limit.
 #[derive(Debug, Default)]
-pub struct IrcCodec;
+pub struct IrcCodec {
+    /// True when we're discarding an oversized line and waiting for `\r\n`.
+    skipping: bool,
+}
 
 impl Decoder for IrcCodec {
     type Item = Message;
     type Error = CodecError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // If we're in skip mode (discarding an oversized line that didn't
+        // have its \r\n terminator yet), scan for the terminator.
+        if self.skipping {
+            if let Some(pos) = src.windows(2).position(|w| w == b"\r\n") {
+                let discarded = pos + 2;
+                warn!(
+                    bytes = discarded,
+                    "codec: finished skipping oversized line tail"
+                );
+                src.advance(discarded);
+                self.skipping = false;
+                // Continue — try to decode the next message.
+            } else {
+                // Still no terminator. Discard everything and wait.
+                src.clear();
+                return Ok(None);
+            }
+        }
+
         // Look for \r\n in the buffer.
         let crlf_pos = src.windows(2).position(|w| w == b"\r\n");
 
         match crlf_pos {
+            Some(pos) if pos > MAX_LINE_LENGTH => {
+                // Complete oversized line — skip it entirely.
+                warn!(
+                    bytes = pos,
+                    "codec: skipped oversized IRC line ({pos} bytes)"
+                );
+                src.advance(pos + 2); // skip line + \r\n
+                // Try to decode the next message in the buffer.
+                self.decode(src)
+            }
             Some(pos) => {
-                // Extract the line (without \r\n), advance the buffer.
+                // Normal line — extract and parse.
                 let line_bytes = src.split_to(pos);
                 src.advance(2); // skip \r\n
 
@@ -48,7 +89,13 @@ impl Decoder for IrcCodec {
             None => {
                 // No complete line yet. Check if buffer is getting too large.
                 if src.len() > MAX_LINE_LENGTH {
-                    return Err(CodecError::LineTooLong);
+                    let discarded = src.len();
+                    warn!(
+                        bytes = discarded,
+                        "codec: discarding oversized partial line, waiting for terminator"
+                    );
+                    src.clear();
+                    self.skipping = true;
                 }
                 Ok(None)
             }
@@ -77,7 +124,7 @@ mod tests {
 
     #[test]
     fn decode_complete_line() {
-        let mut codec = IrcCodec;
+        let mut codec = IrcCodec::default();
         let mut buf = BytesMut::from("NICK wings\r\n");
         let msg = codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(msg.command, "NICK");
@@ -87,7 +134,7 @@ mod tests {
 
     #[test]
     fn decode_partial_line_then_complete() {
-        let mut codec = IrcCodec;
+        let mut codec = IrcCodec::default();
         let mut buf = BytesMut::from("NICK wi");
 
         // Not enough data yet.
@@ -102,7 +149,7 @@ mod tests {
 
     #[test]
     fn decode_two_messages_in_one_read() {
-        let mut codec = IrcCodec;
+        let mut codec = IrcCodec::default();
         let mut buf = BytesMut::from("NICK wings\r\nUSER wings 0 * :Wings\r\n");
 
         let msg1 = codec.decode(&mut buf).unwrap().unwrap();
@@ -117,7 +164,7 @@ mod tests {
 
     #[test]
     fn decode_message_with_prefix() {
-        let mut codec = IrcCodec;
+        let mut codec = IrcCodec::default();
         let mut buf =
             BytesMut::from(":wings!user@host PRIVMSG #lagoon :Hello everyone!\r\n");
         let msg = codec.decode(&mut buf).unwrap().unwrap();
@@ -127,16 +174,41 @@ mod tests {
     }
 
     #[test]
-    fn decode_rejects_oversized_line() {
-        let mut codec = IrcCodec;
-        let mut buf = BytesMut::from(vec![b'A'; MAX_LINE_LENGTH + 1].as_slice());
-        let err = codec.decode(&mut buf).unwrap_err();
-        assert!(matches!(err, CodecError::LineTooLong));
+    fn decode_skips_oversized_line_and_continues() {
+        let mut codec = IrcCodec::default();
+        // Oversized line followed by a valid line.
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&vec![b'A'; MAX_LINE_LENGTH + 100]);
+        buf.extend_from_slice(b"\r\nNICK wings\r\n");
+
+        // First decode should skip the oversized line and return the valid one.
+        let msg = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(msg.command, "NICK");
+        assert_eq!(msg.params, vec!["wings"]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn decode_skips_oversized_partial_then_completes() {
+        let mut codec = IrcCodec::default();
+        // Oversized partial line (no \r\n yet).
+        let mut buf = BytesMut::from(vec![b'A'; MAX_LINE_LENGTH + 100].as_slice());
+
+        // Should return None and enter skip mode.
+        assert!(codec.decode(&mut buf).unwrap().is_none());
+        assert!(codec.skipping);
+        assert!(buf.is_empty());
+
+        // More data arrives with the terminator and a valid message.
+        buf.extend_from_slice(b"more garbage\r\nNICK wings\r\n");
+        let msg = codec.decode(&mut buf).unwrap().unwrap();
+        assert_eq!(msg.command, "NICK");
+        assert!(!codec.skipping);
     }
 
     #[test]
     fn decode_empty_buffer() {
-        let mut codec = IrcCodec;
+        let mut codec = IrcCodec::default();
         let mut buf = BytesMut::new();
         assert!(codec.decode(&mut buf).unwrap().is_none());
     }
@@ -145,7 +217,7 @@ mod tests {
 
     #[test]
     fn encode_appends_crlf() {
-        let mut codec = IrcCodec;
+        let mut codec = IrcCodec::default();
         let mut buf = BytesMut::new();
         let msg = Message {
             prefix: None,
@@ -158,7 +230,7 @@ mod tests {
 
     #[test]
     fn encode_with_prefix() {
-        let mut codec = IrcCodec;
+        let mut codec = IrcCodec::default();
         let mut buf = BytesMut::new();
         let msg = Message {
             prefix: Some("server.lagun.co".into()),
@@ -176,7 +248,7 @@ mod tests {
 
     #[test]
     fn roundtrip_through_codec() {
-        let mut codec = IrcCodec;
+        let mut codec = IrcCodec::default();
 
         // Encode a message.
         let original = Message {

@@ -1,8 +1,18 @@
 pub mod bot;
 pub mod codec;
+pub mod community;
 pub mod federation;
+pub mod gossip;
 pub mod invite;
 pub mod lens;
 pub mod message;
+pub mod modes;
 pub mod server;
+pub mod spiral;
 pub mod transport;
+pub mod vdf;
+pub mod yggdrasil;
+
+pub mod latency_gossip;
+pub mod polp;
+pub mod proof_store;
