@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use axum::{
     Json,
     extract::State,
@@ -8,6 +10,8 @@ use axum_extra::headers::{Authorization, authorization::Bearer};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use webauthn_rs::prelude::*;
+
+use lagoon_server::irc::profile::UserProfile;
 
 use crate::state::{AppState, User};
 
@@ -32,6 +36,37 @@ fn extract_origin(headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
         StatusCode::BAD_REQUEST,
         "No Origin or Host header — cannot determine WebAuthn RP ID".into(),
     ))
+}
+
+/// Deserialize passkey credentials from a UserProfile's serialized JSON strings.
+fn deserialize_credentials(profile: &UserProfile) -> Vec<Passkey> {
+    profile
+        .credentials
+        .iter()
+        .filter_map(|json| serde_json::from_str(json).ok())
+        .collect()
+}
+
+/// Populate the local hot cache from a mesh-fetched UserProfile.
+async fn cache_profile_locally(state: &AppState, profile: &UserProfile) {
+    let credentials = deserialize_credentials(profile);
+    if credentials.is_empty() {
+        return;
+    }
+    let user = User {
+        id: profile.uuid.parse().unwrap_or_else(|_| Uuid::new_v4()),
+        username: profile.username.clone(),
+        credentials,
+        ed25519_pubkey: profile
+            .ed25519_pubkey
+            .as_ref()
+            .and_then(|h| hex::decode(h).ok()),
+    };
+    state
+        .users
+        .write()
+        .await
+        .insert(profile.username.clone(), user);
 }
 
 #[derive(Deserialize)]
@@ -61,13 +96,25 @@ pub async fn register_begin(
         return Err((StatusCode::BAD_REQUEST, "Username must be 1-32 characters".into()));
     }
 
-    // Check if user already exists.
-    let users = state.users.read().await;
-    let existing_creds: Vec<Passkey> = users
-        .get(&username)
-        .map(|u| u.credentials.clone())
-        .unwrap_or_default();
-    drop(users);
+    // Collect existing credentials for the exclude list.
+    // Check local hot cache first, then ProfileStore for mesh-replicated creds.
+    let mut existing_creds: Vec<Passkey> = {
+        let users = state.users.read().await;
+        users
+            .get(&username)
+            .map(|u| u.credentials.clone())
+            .unwrap_or_default()
+    };
+
+    // Also check ProfileStore — may have credentials from other nodes.
+    if existing_creds.is_empty() {
+        if let Some(irc) = state.irc_state.as_ref() {
+            let st = irc.read().await;
+            if let Some(profile) = st.profile_store.get(&username) {
+                existing_creds = deserialize_credentials(profile);
+            }
+        }
+    }
 
     let user_id = Uuid::new_v4();
 
@@ -127,20 +174,46 @@ pub async fn register_complete(
         .finish_passkey_registration(&req.credential, &reg_state)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Registration failed: {e}")))?;
 
-    // Create or update user.
-    let mut users = state.users.write().await;
-    let user = users.entry(username.clone()).or_insert_with(|| User {
-        id: Uuid::new_v4(),
-        username: username.clone(),
-        credentials: Vec::new(),
-        ed25519_pubkey: None,
-    });
-    user.credentials.push(passkey);
-    drop(users);
+    // Create or update user in local hot cache.
+    let user_id = {
+        let mut users = state.users.write().await;
+        let user = users.entry(username.clone()).or_insert_with(|| User {
+            id: Uuid::new_v4(),
+            username: username.clone(),
+            credentials: Vec::new(),
+            ed25519_pubkey: None,
+        });
+        user.credentials.push(passkey.clone());
+        user.id
+    };
+
+    // Replicate to ProfileStore for mesh propagation + persistence.
+    if let Some(irc) = state.irc_state.as_ref() {
+        let cred_json = serde_json::to_string(&passkey)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialize cred: {e}")))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let profile = UserProfile {
+            username: username.clone(),
+            uuid: user_id.to_string(),
+            credentials: BTreeSet::from([cred_json]),
+            ed25519_pubkey: None,
+            created_at: now.clone(),
+            modified_at: now,
+        };
+        let mut st = irc.write().await;
+        if st.profile_store.put(profile) {
+            lagoon_server::irc::federation::broadcast_profile_have_to_cluster(&st, None);
+        }
+        drop(st);
+    }
 
     // Create session token.
     let token = generate_session_token();
-    state.sessions.write().await.insert(token.clone(), username.clone());
+    state
+        .sessions
+        .write()
+        .await
+        .insert(token.clone(), username.clone());
 
     // Auto-join the default community.
     if let Some(irc) = state.irc_state.as_ref() {
@@ -161,6 +234,11 @@ pub struct LoginBeginResponse {
 }
 
 /// Begin passkey authentication — returns a challenge.
+///
+/// Credential lookup cascades through three sources:
+///   1. Local hot cache (`AppState.users`)
+///   2. ProfileStore (persistent local cache, CRDT-merged)
+///   3. Mesh query (broadcast ProfileQuery to all connected peers)
 pub async fn login_begin(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -174,24 +252,97 @@ pub async fn login_begin(
 
     let username = req.username.trim().to_string();
 
-    let users = state.users.read().await;
-    let user = users
-        .get(&username)
-        .ok_or((StatusCode::NOT_FOUND, "User not found".into()))?;
+    // 1. Check local hot cache — fastest path.
+    {
+        let users = state.users.read().await;
+        if let Some(user) = users.get(&username) {
+            let (challenge, auth_state) = webauthn
+                .start_passkey_authentication(&user.credentials)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("WebAuthn error: {e}"),
+                    )
+                })?;
+            drop(users);
+            state
+                .auth_challenges
+                .write()
+                .await
+                .insert(username, auth_state);
+            return Ok(Json(LoginBeginResponse { options: challenge }));
+        }
+    }
 
-    let (challenge, auth_state) = webauthn
-        .start_passkey_authentication(&user.credentials)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("WebAuthn error: {e}")))?;
+    // 2. Check ProfileStore (persistent local cache).
+    if let Some(irc) = state.irc_state.as_ref() {
+        let profile = {
+            let st = irc.read().await;
+            st.profile_store.get(&username).cloned()
+        };
+        if let Some(profile) = profile {
+            let credentials = deserialize_credentials(&profile);
+            if !credentials.is_empty() {
+                cache_profile_locally(&state, &profile).await;
+                let (challenge, auth_state) = webauthn
+                    .start_passkey_authentication(&credentials)
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("WebAuthn error: {e}"),
+                        )
+                    })?;
+                state
+                    .auth_challenges
+                    .write()
+                    .await
+                    .insert(username, auth_state);
+                return Ok(Json(LoginBeginResponse { options: challenge }));
+            }
+        }
 
-    drop(users);
+        // 3. Query mesh — broadcast ProfileQuery to all connected peers.
+        let rx = {
+            let mut st = irc.write().await;
+            st.query_profile_from_mesh(&username)
+        };
 
-    state
-        .auth_challenges
-        .write()
-        .await
-        .insert(username, auth_state);
+        // Await event-driven response (oneshot fires when ProfileResponse
+        // arrives from any peer). Bounded deadline prevents hanging forever
+        // if no peer has the profile.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+            Ok(Ok(Some(profile))) => {
+                let credentials = deserialize_credentials(&profile);
+                if credentials.is_empty() {
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        "User profile found but contains no valid credentials".into(),
+                    ));
+                }
+                cache_profile_locally(&state, &profile).await;
+                let (challenge, auth_state) = webauthn
+                    .start_passkey_authentication(&credentials)
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("WebAuthn error: {e}"),
+                        )
+                    })?;
+                state
+                    .auth_challenges
+                    .write()
+                    .await
+                    .insert(username, auth_state);
+                return Ok(Json(LoginBeginResponse { options: challenge }));
+            }
+            _ => {
+                return Err((StatusCode::NOT_FOUND, "User not found".into()));
+            }
+        }
+    }
 
-    Ok(Json(LoginBeginResponse { options: challenge }))
+    // No embedded IRC server — standalone mode, local-only auth.
+    Err((StatusCode::NOT_FOUND, "User not found".into()))
 }
 
 #[derive(Deserialize)]
@@ -225,7 +376,7 @@ pub async fn login_complete(
         .finish_passkey_authentication(&req.credential, &auth_state)
         .map_err(|e| (StatusCode::UNAUTHORIZED, format!("Auth failed: {e}")))?;
 
-    // Update credential counter to prevent replay.
+    // Update credential counter to prevent replay (local only, not replicated).
     let mut users = state.users.write().await;
     if let Some(user) = users.get_mut(&username) {
         user.credentials.iter_mut().for_each(|cred| {
@@ -235,7 +386,11 @@ pub async fn login_complete(
     drop(users);
 
     let token = generate_session_token();
-    state.sessions.write().await.insert(token.clone(), username.clone());
+    state
+        .sessions
+        .write()
+        .await
+        .insert(token.clone(), username.clone());
 
     // Auto-join the default community on login too (in case they registered before communities existed).
     if let Some(irc) = state.irc_state.as_ref() {

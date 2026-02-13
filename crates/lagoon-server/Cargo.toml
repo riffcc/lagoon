@@ -33,6 +33,7 @@ tokio-tungstenite = { workspace = true }
 citadel-topology = { workspace = true }
 citadel-gossip = { workspace = true }
 citadel-spore = { workspace = true }
+citadel-crdt = { workspace = true }
 bincode = { workspace = true }
 serde_bytes = { workspace = true }
 lagoon-vdf = { workspace = true }

@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::profile::UserProfile;
 use super::server::MeshPeerInfo;
 
 /// JSON payload for the Hello message — identity exchange.
@@ -85,6 +86,25 @@ pub enum MeshMessage {
     /// Latency proof delta entries (base64-bincode).
     #[serde(rename = "latency_delta")]
     LatencyDelta { data: String },
+
+    /// Query: "do you have this user's profile?"
+    #[serde(rename = "profile_query")]
+    ProfileQuery { username: String },
+
+    /// Response: profile data (or null if not found).
+    #[serde(rename = "profile_response")]
+    ProfileResponse {
+        username: String,
+        profile: Option<UserProfile>,
+    },
+
+    /// Profile SPORE HaveList for intra-cluster sync (base64-bincode).
+    #[serde(rename = "profile_have")]
+    ProfileHave { data: String },
+
+    /// Profile delta — missing profiles for intra-cluster sync (base64-bincode).
+    #[serde(rename = "profile_delta")]
+    ProfileDelta { data: String },
 }
 
 impl MeshMessage {
@@ -303,6 +323,65 @@ mod tests {
     }
 
     #[test]
+    fn profile_query_round_trip() {
+        let msg = MeshMessage::ProfileQuery { username: "wings".into() };
+        let json = msg.to_json().unwrap();
+        assert!(json.contains(r#""type":"profile_query""#));
+        assert!(json.contains(r#""username":"wings""#));
+        let decoded = MeshMessage::from_json(&json).unwrap();
+        match decoded {
+            MeshMessage::ProfileQuery { username } => assert_eq!(username, "wings"),
+            other => panic!("expected ProfileQuery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_response_with_profile_round_trip() {
+        use std::collections::BTreeSet;
+
+        let profile = UserProfile {
+            username: "wings".into(),
+            uuid: "550e8400-e29b-41d4-a716-446655440000".into(),
+            credentials: BTreeSet::from(["cred_json_1".into(), "cred_json_2".into()]),
+            ed25519_pubkey: Some("aabbccdd".into()),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            modified_at: "2026-02-13T18:00:00Z".into(),
+        };
+        let msg = MeshMessage::ProfileResponse {
+            username: "wings".into(),
+            profile: Some(profile),
+        };
+        let json = msg.to_json().unwrap();
+        assert!(json.contains(r#""type":"profile_response""#));
+        let decoded = MeshMessage::from_json(&json).unwrap();
+        match decoded {
+            MeshMessage::ProfileResponse { username, profile } => {
+                assert_eq!(username, "wings");
+                let p = profile.unwrap();
+                assert_eq!(p.credentials.len(), 2);
+            }
+            other => panic!("expected ProfileResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_response_not_found_round_trip() {
+        let msg = MeshMessage::ProfileResponse {
+            username: "ghost".into(),
+            profile: None,
+        };
+        let json = msg.to_json().unwrap();
+        let decoded = MeshMessage::from_json(&json).unwrap();
+        match decoded {
+            MeshMessage::ProfileResponse { username, profile } => {
+                assert_eq!(username, "ghost");
+                assert!(profile.is_none());
+            }
+            other => panic!("expected ProfileResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unknown_type_fails() {
         let json = r#"{"type":"bogus","data":"hello"}"#;
         assert!(MeshMessage::from_json(json).is_err());
@@ -320,5 +399,29 @@ mod tests {
         let msg = MeshMessage::Sync;
         let json = msg.to_json().unwrap();
         assert!(json.starts_with(r#"{"type":"#));
+    }
+
+    #[test]
+    fn profile_have_round_trip() {
+        let msg = MeshMessage::ProfileHave { data: "cHJvZmlsZV9zcG9yZQ==".into() };
+        let json = msg.to_json().unwrap();
+        assert!(json.contains(r#""type":"profile_have""#));
+        let decoded = MeshMessage::from_json(&json).unwrap();
+        match decoded {
+            MeshMessage::ProfileHave { data } => assert_eq!(data, "cHJvZmlsZV9zcG9yZQ=="),
+            other => panic!("expected ProfileHave, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn profile_delta_round_trip() {
+        let msg = MeshMessage::ProfileDelta { data: "ZGVsdGFfcHJvZmlsZXM=".into() };
+        let json = msg.to_json().unwrap();
+        assert!(json.contains(r#""type":"profile_delta""#));
+        let decoded = MeshMessage::from_json(&json).unwrap();
+        match decoded {
+            MeshMessage::ProfileDelta { data } => assert_eq!(data, "ZGVsdGFfcHJvZmlsZXM="),
+            other => panic!("expected ProfileDelta, got {other:?}"),
+        }
     }
 }

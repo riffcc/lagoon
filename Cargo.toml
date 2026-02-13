@@ -70,6 +70,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1"] }
 citadel-topology = { path = "/mnt/riffcastle/lagun-project/citadel/crates/citadel-topology", features = ["serde"] }
 citadel-gossip = { path = "/mnt/riffcastle/lagun-project/citadel/crates/citadel-gossip" }
 citadel-spore = { path = "/mnt/riffcastle/lagun-project/citadel/crates/citadel-spore" }
+citadel-crdt = { path = "/mnt/riffcastle/lagun-project/citadel/crates/citadel-crdt" }
 bincode = "1.3"
 serde_bytes = "0.11"
 

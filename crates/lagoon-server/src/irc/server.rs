@@ -20,6 +20,7 @@ use super::community::CommunityStore;
 use super::federation::{self, FederatedChannel, FederationManager, RelayEvent};
 use super::invite::InviteStore;
 use super::lens::LensIdentity;
+use super::profile::ProfileStore;
 use super::message::Message;
 use super::modes::{self, BanEntry, ChannelModes, WhowasBuffer};
 use super::transport::{self, TransportConfig};
@@ -216,6 +217,13 @@ pub struct MeshPeerInfo {
     /// Yggdrasil peer URI for overlay peering (e.g. `tcp://[200:xxxx::]:9443`).
     #[serde(default)]
     pub ygg_peer_uri: Option<String>,
+    /// Previous VDF step — used to detect non-advancement.
+    #[serde(skip)]
+    pub prev_vdf_step: Option<u64>,
+    /// Unix timestamp of last VDF step advancement.  VDF IS the heartbeat:
+    /// if this hasn't updated in 10 seconds, the peer is dead.
+    #[serde(skip)]
+    pub last_vdf_advance: u64,
 }
 
 fn default_peer_port() -> u16 {
@@ -241,6 +249,8 @@ impl Default for MeshPeerInfo {
             vdf_resonance_credit: None,
             vdf_actual_rate_hz: None,
             ygg_peer_uri: None,
+            prev_vdf_step: None,
+            last_vdf_advance: 0,
         }
     }
 }
@@ -468,6 +478,8 @@ pub struct ServerState {
     /// instead of local-only view.  Controlled by LAGOON_FULL_TELEMETRY env var.
     /// Default: ON.  Set LAGOON_FULL_TELEMETRY=0 to disable.
     pub full_telemetry: bool,
+    /// User profile CRDT store — local cache + mesh query support.
+    pub profile_store: ProfileStore,
 }
 
 /// Handle to send messages to a connected client.
@@ -491,6 +503,7 @@ impl ServerState {
     ) -> Self {
         let invites = InviteStore::load_or_create(&data_dir);
         let communities = CommunityStore::load_or_create(&data_dir);
+        let profile_store = ProfileStore::load_or_create(&data_dir);
         let pubkey = super::lens::pubkey_bytes(&lens).expect("valid lens identity");
         let mut mesh = MeshState::new(&pubkey, &lens.peer_id);
 
@@ -523,6 +536,7 @@ impl ServerState {
             full_telemetry: std::env::var("LAGOON_FULL_TELEMETRY")
                 .map(|v| v != "0")
                 .unwrap_or(true), // ON by default
+            profile_store,
         }
     }
 
@@ -763,6 +777,24 @@ impl ServerState {
             self.build_mesh_snapshot()
         };
         let _ = self.mesh_topology_tx.send(snapshot);
+    }
+
+    /// Query the mesh for a user profile. Sends ProfileQuery to all connected
+    /// relays and returns a oneshot receiver that fires when the first
+    /// ProfileResponse arrives (or the caller's timeout expires).
+    pub fn query_profile_from_mesh(
+        &mut self,
+        username: &str,
+    ) -> tokio::sync::oneshot::Receiver<Option<super::profile::UserProfile>> {
+        let rx = self.profile_store.register_query(username);
+        // Broadcast the query to all connected mesh relays.
+        let query_msg = super::wire::MeshMessage::ProfileQuery {
+            username: username.to_string(),
+        };
+        for relay in self.federation.relays.values() {
+            let _ = relay.outgoing_tx.send(federation::RelayCommand::SendMesh(query_msg.clone()));
+        }
+        rx
     }
 }
 
@@ -3338,6 +3370,59 @@ async fn handle_command(
                             federation::RelayEvent::LatencyProofDelta {
                                 remote_host: node_name,
                                 payload_b64: json.clone(),
+                            },
+                        );
+                    }
+                    "PROFILE_QUERY" => {
+                        let node_name = nick.strip_suffix("~relay")
+                            .unwrap_or(nick).to_owned();
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                            if let Some(username) = v.get("username").and_then(|u| u.as_str()) {
+                                let _ = st.federation_event_tx.send(
+                                    federation::RelayEvent::ProfileQuery {
+                                        remote_host: node_name,
+                                        username: username.to_string(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    "PROFILE_RESPONSE" => {
+                        let node_name = nick.strip_suffix("~relay")
+                            .unwrap_or(nick).to_owned();
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                            let username = v.get("username")
+                                .and_then(|u| u.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let profile = v.get("profile")
+                                .and_then(|p| serde_json::from_value(p.clone()).ok());
+                            let _ = st.federation_event_tx.send(
+                                federation::RelayEvent::ProfileResponse {
+                                    remote_host: node_name,
+                                    username,
+                                    profile,
+                                },
+                            );
+                        }
+                    }
+                    "PROFILE_HAVE" => {
+                        let node_name = nick.strip_suffix("~relay")
+                            .unwrap_or(nick).to_owned();
+                        let _ = st.federation_event_tx.send(
+                            federation::RelayEvent::ProfileHave {
+                                remote_host: node_name,
+                                payload_b64: json.to_string(),
+                            },
+                        );
+                    }
+                    "PROFILE_DELTA" => {
+                        let node_name = nick.strip_suffix("~relay")
+                            .unwrap_or(nick).to_owned();
+                        let _ = st.federation_event_tx.send(
+                            federation::RelayEvent::ProfileDelta {
+                                remote_host: node_name,
+                                payload_b64: json.to_string(),
                             },
                         );
                     }

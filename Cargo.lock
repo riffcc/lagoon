@@ -1051,6 +1051,7 @@ dependencies = [
  "blake3",
  "bytes",
  "chrono",
+ "citadel-crdt",
  "citadel-gossip",
  "citadel-spore",
  "citadel-topology",
