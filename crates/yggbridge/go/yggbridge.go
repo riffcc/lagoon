@@ -163,10 +163,14 @@ func createNetstack(yggCore *core.Core) (*stack.Stack, *yggNIC, error) {
 			if err != nil {
 				break
 			}
+			d := nic.dispatcher
+			if d == nil {
+				break // NIC closed during shutdown
+			}
 			pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{
 				Payload: buffer.MakeWithData(nic.readBuf[:rx]),
 			})
-			nic.dispatcher.DeliverNetworkPacket(ipv6.ProtocolNumber, pkb)
+			d.DeliverNetworkPacket(ipv6.ProtocolNumber, pkb)
 		}
 	}()
 
