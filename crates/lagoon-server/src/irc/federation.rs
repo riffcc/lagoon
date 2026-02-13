@@ -711,17 +711,23 @@ pub fn spawn_event_processor(
                         }
                     }
 
-                    // Clean up relay handle.
+                    // Clean up relay handle — grab remote_node_name before removing.
+                    let actual_node_name = st.federation.relays.get(&remote_host)
+                        .and_then(|r| r.remote_node_name.clone());
                     if let Some(relay) = st.federation.relays.remove(&remote_host) {
                         relay.task_handle.abort();
                     }
 
                     // Find and remove connection state by mesh_key.
+                    // Use the actual node_name from the relay's HELLO exchange,
+                    // NOT the relay_key — with anycast, relay_key is "anycast-mesh"
+                    // which doesn't match any node's node_name.
+                    let match_name = actual_node_name.as_deref().unwrap_or(&remote_host);
                     let disconnected_ids: Vec<String> = st
                         .mesh
                         .known_peers
                         .iter()
-                        .filter(|(_, p)| p.node_name == remote_host)
+                        .filter(|(_, p)| p.node_name == match_name)
                         .map(|(id, _)| id.clone())
                         .collect();
                     for id in &disconnected_ids {
@@ -1000,8 +1006,38 @@ pub fn spawn_event_processor(
                     // Track which node each relay is connected to.
                     // This lets us detect when two relay keys reach the same node
                     // (e.g. LAGOON_PEERS key "iad" and inbound node "node-XXXX").
+                    //
+                    // CRITICAL: When a relay reconnects via anycast and lands on
+                    // a DIFFERENT node, we must clear the old node's Connected
+                    // state — otherwise ghost entries accumulate forever.
                     if let Some(relay) = st.federation.relays.get_mut(&remote_host) {
-                        relay.remote_node_name = Some(node_name.clone());
+                        if let Some(old_node) = relay.remote_node_name.replace(node_name.clone()) {
+                            if old_node != node_name {
+                                // Relay was connected to a different node before.
+                                // Clear the old node's Connected state.
+                                let ghost_ids: Vec<String> = st.mesh.known_peers.iter()
+                                    .filter(|(_, p)| p.node_name == old_node)
+                                    .map(|(id, _)| id.clone())
+                                    .collect();
+                                for id in &ghost_ids {
+                                    info!(
+                                        relay_key = %remote_host,
+                                        old_node = %old_node,
+                                        new_node = %node_name,
+                                        mesh_key = %id,
+                                        "mesh: clearing ghost Connected state — relay reconnected to different node"
+                                    );
+                                    st.mesh.connections.remove(id);
+                                    st.mesh.spiral.remove_peer(id);
+                                    st.mesh.latency_gossip.remove_peer(id);
+                                }
+                                if !ghost_ids.is_empty() {
+                                    let neighbors = st.mesh.spiral.neighbors().clone();
+                                    st.mesh.latency_gossip.set_spiral_neighbors(neighbors);
+                                    st.notify_topology_change();
+                                }
+                            }
+                        }
                     }
 
                     // Connection reciprocity: if this peer connected to us and

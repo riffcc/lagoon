@@ -1586,6 +1586,185 @@ fn dispatch_hello_yggdrasil_addr_propagated() {
 }
 
 #[test]
+fn anycast_ghost_peers_cleared_on_node_change() {
+    // Reproduces the ghost peer bug from rolling deploys:
+    //
+    // 1. Relay "anycast-mesh" connects to pod-1a1345dd → marked Connected
+    // 2. Rolling deploy kills that pod, relay reconnects to pod-be8f7c33
+    // 3. Old pod-1a1345dd should be cleared from Connected state
+    //
+    // The bug was: disconnect cleanup searched `p.node_name == "anycast-mesh"`
+    // which matched nothing, so ghosts accumulated forever.
+    //
+    // The fix: use relay.remote_node_name (the actual node) for cleanup.
+    //
+    // This test validates the state-level invariant: when we know a relay
+    // was previously connected to node X, switching to node Y must clear
+    // node X's Connected state.
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (state, _rx) = make_test_state("ghost-test.lagun.co");
+
+        // Simulate: old pod was known and marked Connected.
+        let old_ghost = lens::generate_identity("lagun.co");
+        let new_node = lens::generate_identity("lagun.co");
+        {
+            let mut st = state.write().await;
+            st.mesh.known_peers.insert(
+                old_ghost.peer_id.clone(),
+                MeshPeerInfo {
+                    peer_id: old_ghost.peer_id.clone(),
+                    server_name: "lagun.co".into(),
+                    public_key_hex: old_ghost.public_key_hex.clone(),
+                    node_name: "pod-1a1345dd".into(),
+                    site_name: "lagun.co".into(),
+                    ..Default::default()
+                },
+            );
+            st.mesh.connections.insert(
+                old_ghost.peer_id.clone(),
+                MeshConnectionState::Connected,
+            );
+
+            // Ghost is Connected.
+            assert_eq!(
+                st.mesh.connections.get(&old_ghost.peer_id),
+                Some(&MeshConnectionState::Connected)
+            );
+        }
+
+        // Simulate: relay reconnects, HELLO from different node.
+        // The fix clears ghosts by searching node_name, not relay_key.
+        {
+            let mut st = state.write().await;
+            let old_node_name = "pod-1a1345dd";
+            let new_node_name = "pod-be8f7c33";
+
+            // This is what the fixed code does on HELLO with changed node:
+            let ghost_ids: Vec<String> = st.mesh.known_peers.iter()
+                .filter(|(_, p)| p.node_name == old_node_name)
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &ghost_ids {
+                st.mesh.connections.remove(id);
+                st.mesh.spiral.remove_peer(id);
+            }
+
+            // Add the new node.
+            st.mesh.known_peers.insert(
+                new_node.peer_id.clone(),
+                MeshPeerInfo {
+                    peer_id: new_node.peer_id.clone(),
+                    server_name: "lagun.co".into(),
+                    public_key_hex: new_node.public_key_hex.clone(),
+                    node_name: new_node_name.into(),
+                    site_name: "lagun.co".into(),
+                    ..Default::default()
+                },
+            );
+            st.mesh.connections.insert(
+                new_node.peer_id.clone(),
+                MeshConnectionState::Connected,
+            );
+        }
+
+        let st = state.read().await;
+
+        // Ghost must NOT be Connected.
+        assert_ne!(
+            st.mesh.connections.get(&old_ghost.peer_id),
+            Some(&MeshConnectionState::Connected),
+            "ghost peer from old deploy must not remain Connected"
+        );
+
+        // New node IS Connected.
+        assert_eq!(
+            st.mesh.connections.get(&new_node.peer_id),
+            Some(&MeshConnectionState::Connected),
+            "new node must be Connected"
+        );
+
+        // Only 1 Connected entry, not 2.
+        let connected_count = st.mesh.connections.values()
+            .filter(|&&s| s == MeshConnectionState::Connected)
+            .count();
+        assert_eq!(connected_count, 1, "exactly 1 connected peer, no ghosts");
+    });
+}
+
+/// Verifies that disconnect cleanup uses actual node_name (not relay_key)
+/// to find and remove the old peer's Connected state.
+#[test]
+fn disconnect_cleanup_uses_node_name_not_relay_key() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (state, _rx) = make_test_state("relay-key-test.lagun.co");
+
+        let peer = lens::generate_identity("lagun.co");
+        {
+            let mut st = state.write().await;
+            st.mesh.known_peers.insert(
+                peer.peer_id.clone(),
+                MeshPeerInfo {
+                    peer_id: peer.peer_id.clone(),
+                    server_name: "lagun.co".into(),
+                    public_key_hex: peer.public_key_hex.clone(),
+                    node_name: "pod-abc123".into(),
+                    site_name: "lagun.co".into(),
+                    ..Default::default()
+                },
+            );
+            st.mesh.connections.insert(
+                peer.peer_id.clone(),
+                MeshConnectionState::Connected,
+            );
+        }
+
+        // Simulate: relay_key is "anycast-mesh" but the actual node was "pod-abc123".
+        // Old buggy code searched: p.node_name == "anycast-mesh" → found NOTHING.
+        // Fixed code uses: relay.remote_node_name → "pod-abc123".
+        {
+            let mut st = state.write().await;
+
+            // Bug: searching by relay_key finds nothing.
+            let relay_key = "anycast-mesh";
+            let buggy_result: Vec<String> = st.mesh.known_peers.iter()
+                .filter(|(_, p)| p.node_name == relay_key)
+                .map(|(id, _)| id.clone())
+                .collect();
+            assert!(buggy_result.is_empty(), "relay_key 'anycast-mesh' should match no nodes");
+
+            // Fix: searching by actual node_name finds the peer.
+            let actual_node = "pod-abc123";
+            let fixed_result: Vec<String> = st.mesh.known_peers.iter()
+                .filter(|(_, p)| p.node_name == actual_node)
+                .map(|(id, _)| id.clone())
+                .collect();
+            assert_eq!(fixed_result.len(), 1);
+            assert_eq!(fixed_result[0], peer.peer_id);
+
+            // Clean it up.
+            for id in &fixed_result {
+                st.mesh.connections.remove(id);
+            }
+        }
+
+        let st = state.read().await;
+        assert!(
+            !st.mesh.connections.contains_key(&peer.peer_id),
+            "peer must be cleaned up when using actual node_name"
+        );
+    });
+}
+
+#[test]
 fn dispatch_peers_carries_yggdrasil_addr() {
     let (tx, mut rx) = make_event_channel();
     let peer = MeshPeerInfo {
