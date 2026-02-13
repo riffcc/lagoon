@@ -1,0 +1,31 @@
+[package]
+name = "anymesh"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "TCP socket migration and anycast mesh coordination."
+
+[lib]
+name = "anymesh"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anymesh"
+path = "bin/anymesh.rs"
+
+[dependencies]
+tokio = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+hostname = { workspace = true }
+base64 = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+serde_json = { workspace = true }

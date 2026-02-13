@@ -1,0 +1,22 @@
+app = 'anycast-mesh'
+primary_region = 'lhr'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  PORT = '42105'
+  PEERS = 'lhr.anycast-mesh.internal,nrt.anycast-mesh.internal,iad.anycast-mesh.internal'
+  ANYCAST_IP = '::'
+
+[[services]]
+  protocol = 'tcp'
+  internal_port = 42105
+
+  [[services.ports]]
+    port = 42105
+
+[[vm]]
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 256

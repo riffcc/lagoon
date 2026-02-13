@@ -4,6 +4,8 @@ members = [
     "crates/lagoon-server",
     "crates/lagoon-web",
     "crates/lagoon-vdf",
+    "crates/anymesh",
+    "crates/yggbridge",
 ]
 
 [workspace.package]
@@ -76,6 +78,13 @@ lagoon-vdf = { path = "crates/lagoon-vdf" }
 
 # Networking
 socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"
+
+# Anymesh
+anymesh = { path = "crates/anymesh" }
+
+# Yggdrasil
+yggbridge = { path = "crates/yggbridge" }
 
 # Dev
 pretty_assertions = "1"

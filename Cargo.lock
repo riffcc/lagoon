@@ -21,6 +21,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "anymesh"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "bincode",
+ "hostname",
+ "libc",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1028,6 +1045,7 @@ dependencies = [
 name = "lagoon-server"
 version = "0.1.0"
 dependencies = [
+ "anymesh",
  "base64 0.22.1",
  "bincode",
  "blake3",
@@ -1055,6 +1073,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "yggbridge",
 ]
 
 [[package]]
@@ -1098,6 +1117,7 @@ dependencies = [
  "uuid",
  "webauthn-rs",
  "webauthn-rs-proto",
+ "yggbridge",
 ]
 
 [[package]]
@@ -2670,6 +2690,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e17bb3549cc1321ae1296b9cdc2698e2b6cb1992adfa19a8c72e5b7a738f44cd"
 dependencies = [
  "time",
+]
+
+[[package]]
+name = "yggbridge"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
