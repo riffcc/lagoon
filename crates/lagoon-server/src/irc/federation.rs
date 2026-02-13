@@ -158,6 +158,35 @@ pub fn dispatch_mesh_message(
             });
             None
         }
+        MeshMessage::ProfileQuery { username } => {
+            let _ = event_tx.send(RelayEvent::ProfileQuery {
+                remote_host: remote_host.to_string(),
+                username,
+            });
+            None
+        }
+        MeshMessage::ProfileResponse { username, profile } => {
+            let _ = event_tx.send(RelayEvent::ProfileResponse {
+                remote_host: remote_host.to_string(),
+                username,
+                profile,
+            });
+            None
+        }
+        MeshMessage::ProfileHave { data } => {
+            let _ = event_tx.send(RelayEvent::ProfileHave {
+                remote_host: remote_host.to_string(),
+                payload_b64: data,
+            });
+            None
+        }
+        MeshMessage::ProfileDelta { data } => {
+            let _ = event_tx.send(RelayEvent::ProfileDelta {
+                remote_host: remote_host.to_string(),
+                payload_b64: data,
+            });
+            None
+        }
     }
 }
 
@@ -452,6 +481,27 @@ pub enum RelayEvent {
         remote_host: String,
         payload_b64: String,
     },
+    /// Received a profile query from the mesh — "do you have this user?"
+    ProfileQuery {
+        remote_host: String,
+        username: String,
+    },
+    /// Received a profile response from the mesh — profile data (or None).
+    ProfileResponse {
+        remote_host: String,
+        username: String,
+        profile: Option<super::profile::UserProfile>,
+    },
+    /// Received PROFILE_HAVE — remote cluster peer's profile SPORE.
+    ProfileHave {
+        remote_host: String,
+        payload_b64: String,
+    },
+    /// Received PROFILE_DELTA — profiles we're missing from a cluster peer.
+    ProfileDelta {
+        remote_host: String,
+        payload_b64: String,
+    },
 }
 
 /// Manages all federated channel relay connections.
@@ -527,7 +577,21 @@ pub fn spawn_event_processor(
             st.transport_config.ygg_node.clone()
         };
 
-        while let Some(event) = event_rx.recv().await {
+        // VDF liveness: challenge SPIRAL neighbors every 5 seconds.
+        // Responses update last_vdf_advance; peers that stop responding
+        // get evicted by the VDF_DEAD_SECS sweep below.
+        let mut vdf_challenge_interval = tokio::time::interval(
+            std::time::Duration::from_secs(5),
+        );
+        vdf_challenge_interval.set_missed_tick_behavior(
+            tokio::time::MissedTickBehavior::Skip,
+        );
+        // Skip the first immediate tick.
+        vdf_challenge_interval.tick().await;
+
+        loop {
+        tokio::select! {
+            Some(event) = event_rx.recv() => {
             match event {
                 RelayEvent::RemotePrivmsg {
                     local_channel,
@@ -908,6 +972,9 @@ pub fn spawn_event_processor(
                             vdf_resonance_credit,
                             vdf_actual_rate_hz,
                             ygg_peer_uri: ygg_peer_uri.clone(),
+                            prev_vdf_step: None,
+                            // HELLO with a VDF step = first proof of life.
+                            last_vdf_advance: if vdf_step.is_some() { now } else { 0 },
                         },
                     );
                     st.mesh
@@ -954,11 +1021,12 @@ pub fn spawn_event_processor(
 
                     st.notify_topology_change();
 
-                    // Staleness eviction: remove disconnected peers we haven't
-                    // heard from in 5 minutes. Event-driven — runs on every HELLO.
-                    // Future: VDF-advancement tracking (proof-challenge-response)
-                    // will replace this with cryptographic liveness detection.
-                    const STALE_PEER_SECS: u64 = 10;
+                    // VDF-based liveness eviction.  VDF IS the heartbeat.
+                    // If a peer's VDF step hasn't advanced in 10 seconds, it's dead.
+                    // Connection state is irrelevant — a dead node may still be
+                    // "Connected" at the Ygg overlay level.  VDF non-participation
+                    // is the ONLY authority on liveness.
+                    const VDF_DEAD_SECS: u64 = 10;
                     {
                         let mut evicted = Vec::new();
 
@@ -966,10 +1034,13 @@ pub fn spawn_event_processor(
                             if *peer_mkey == our_pid {
                                 continue;
                             }
-                            if st.mesh.connections.contains_key(peer_mkey) {
-                                continue;
-                            }
-                            if now.saturating_sub(peer.last_seen) < STALE_PEER_SECS {
+                            // Peer hasn't sent any VDF yet — use last_seen as fallback
+                            // (new peer that hasn't had time to prove work).
+                            if peer.last_vdf_advance == 0 {
+                                if now.saturating_sub(peer.last_seen) < VDF_DEAD_SECS {
+                                    continue;
+                                }
+                            } else if now.saturating_sub(peer.last_vdf_advance) < VDF_DEAD_SECS {
                                 continue;
                             }
                             evicted.push(peer_mkey.clone());
@@ -980,13 +1051,40 @@ pub fn spawn_event_processor(
                                 info!(
                                     mesh_key = %evicted_key,
                                     server_name = %peer.server_name,
+                                    node_name = %peer.node_name,
                                     vdf_step = ?peer.vdf_step,
-                                    last_seen = peer.last_seen,
-                                    stale_secs = STALE_PEER_SECS,
-                                    "mesh: evicting stale peer — not seen recently"
+                                    last_vdf_advance = peer.last_vdf_advance,
+                                    dead_secs = VDF_DEAD_SECS,
+                                    "mesh: evicting dead peer — VDF not advancing"
                                 );
+                                st.mesh.connections.remove(evicted_key);
                                 st.mesh.spiral.remove_peer(evicted_key);
                                 st.mesh.latency_gossip.remove_peer(evicted_key);
+
+                                // Cut the Ygg overlay connection — dead nodes don't
+                                // get to stay peered.
+                                if let Some(ref ygg) = st.transport_config.ygg_node {
+                                    if let Some(ref uri) = peer.ygg_peer_uri {
+                                        match ygg.remove_peer(uri) {
+                                            Ok(()) => info!(
+                                                uri,
+                                                node_name = %peer.node_name,
+                                                "APE: removed dead peer from Ygg overlay"
+                                            ),
+                                            Err(e) => tracing::debug!(
+                                                uri,
+                                                error = %e,
+                                                "APE: remove_peer failed (may already be gone)"
+                                            ),
+                                        }
+                                    }
+                                }
+
+                                // Shut down the relay task if one exists for this peer.
+                                if let Some(relay) = st.federation.relays.remove(&peer.node_name) {
+                                    let _ = relay.outgoing_tx.send(RelayCommand::Shutdown);
+                                    relay.task_handle.abort();
+                                }
                             }
                         }
 
@@ -1067,9 +1165,6 @@ pub fn spawn_event_processor(
                                 "mesh: reciprocal connect to inbound peer"
                             );
 
-                            let hello_json =
-                                serde_json::to_string(&build_hello_payload(&st))
-                                    .unwrap_or_default();
                             let event_tx = st.federation_event_tx.clone();
 
                             let peer_ygg_addr = st
@@ -1097,15 +1192,13 @@ pub fn spawn_event_processor(
                                 });
                             let tc_arc = Arc::new(tc_with_peer);
 
-                            let (cmd_tx, task_handle) = spawn_relay(
+                            let (cmd_tx, task_handle) = spawn_native_relay(
                                 node_name.clone(),
                                 connect_key,
                                 event_tx,
                                 tc_arc,
+                                state.clone(),
                             );
-                            let _ = cmd_tx.send(RelayCommand::MeshHello {
-                                json: hello_json,
-                            });
 
                             st.federation.relays.insert(
                                 node_name.clone(),
@@ -1124,9 +1217,18 @@ pub fn spawn_event_processor(
                     }
 
                     // Send PEERS to the newly connected peer.
-                    // No chunking needed — WebSocket has no size limit.
-                    let peers_list: Vec<MeshPeerInfo> =
-                        st.mesh.known_peers.values().cloned().collect();
+                    // Only include peers we're actively connected to (+ self).
+                    // Gossiping disconnected peers causes ghost amplification:
+                    // dead peers get their last_seen refreshed by gossip, preventing
+                    // staleness eviction across the mesh.
+                    let peers_list: Vec<MeshPeerInfo> = st.mesh.known_peers.iter()
+                        .filter(|(mkey, _)| {
+                            *mkey == &our_pid
+                                || st.mesh.connections.get(*mkey)
+                                    .copied() == Some(MeshConnectionState::Connected)
+                        })
+                        .map(|(_, p)| p.clone())
+                        .collect();
                     if !peers_list.is_empty() {
                         if let Some(relay) = st.federation.relays.get(&remote_host) {
                             let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
@@ -1167,6 +1269,32 @@ pub fn spawn_event_processor(
                                 );
                             }
                         }
+
+                        // Profile SPORE catch-up: send our profile HaveList so
+                        // the peer can diff and push any profiles we're missing.
+                        let spore_bytes = bincode::serialize(st.profile_store.spore())
+                            .unwrap_or_default();
+                        let b64 = base64::engine::general_purpose::STANDARD
+                            .encode(&spore_bytes);
+                        if let Some(relay) = st.federation.relays.get(&remote_host) {
+                            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                MeshMessage::ProfileHave { data: b64 },
+                            ));
+                            info!(
+                                remote_host,
+                                "profile_gossip: sent SPORE HaveList to cluster peer for catch-up"
+                            );
+                        }
+                    }
+
+                    // Immediate VDF challenge: demand proof of work from the
+                    // new peer.  This starts the liveness clock — if they don't
+                    // respond with a VDF proof, last_vdf_advance won't advance
+                    // and the periodic sweep will evict them.
+                    if let Some(relay) = st.federation.relays.get(&remote_host) {
+                        let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                            MeshMessage::VdfProofReq,
+                        ));
                     }
 
                     // Dedup: if two relays now point to the same node (same
@@ -1394,9 +1522,6 @@ pub fn spawn_event_processor(
                     // and claim a position.
                     if !new_peer_servers.is_empty() {
                         let spiral_active = st.mesh.spiral.is_claimed();
-                        let hello_json =
-                            serde_json::to_string(&build_hello_payload(&st))
-                                .unwrap_or_default();
                         let event_tx = st.federation_event_tx.clone();
                         let tc = st.transport_config.clone();
 
@@ -1465,7 +1590,7 @@ pub fn spawn_event_processor(
                             // how to reach it.
                             //
                             // When peer_ygg_addr is set, connect() takes the overlay
-                            // WebSocket path (ws://[ygg_addr]:8080/api/federation/ws)
+                            // WebSocket path (ws://[ygg_addr]:8080/api/mesh/ws)
                             // automatically — no DNS, no TLS, Ygg encrypts transport.
                             // The port/tls fields are irrelevant for overlay peers
                             // because the transport layer overrides them.
@@ -1479,15 +1604,13 @@ pub fn spawn_event_processor(
                             );
                             let tc_arc = Arc::new(tc_with_peer);
 
-                            let (cmd_tx, task_handle) = spawn_relay(
+                            let (cmd_tx, task_handle) = spawn_native_relay(
                                 node_name.clone(),
                                 connect_key,
                                 event_tx.clone(),
                                 tc_arc,
+                                state.clone(),
                             );
-                            let _ = cmd_tx.send(RelayCommand::MeshHello {
-                                json: hello_json.clone(),
-                            });
 
                             st.federation.relays.insert(
                                 node_name.clone(),
@@ -1598,10 +1721,20 @@ pub fn spawn_event_processor(
                             if proof.verify() {
                                 // VDF proof verified = this peer is alive and doing work.
                                 // Update vdf_step — VDF IS the heartbeat.
+                                // Track advancement: if step changed, update last_vdf_advance.
                                 if let Some(ref mkey) = mesh_key {
                                     let mut st = state.write().await;
                                     if let Some(peer) = st.mesh.known_peers.get_mut(mkey) {
+                                        let old_step = peer.vdf_step;
                                         peer.vdf_step = Some(proof.steps);
+                                        if old_step != Some(proof.steps) {
+                                            let now = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_secs();
+                                            peer.prev_vdf_step = old_step;
+                                            peer.last_vdf_advance = now;
+                                        }
                                     }
                                 }
                                 info!(
@@ -1908,9 +2041,246 @@ pub fn spawn_event_processor(
                         }
                     }
                 }
+
+                RelayEvent::ProfileQuery { remote_host, username } => {
+                    info!(remote_host, username, "profile: received query");
+                    let st = state.read().await;
+                    let profile = st.profile_store.get(&username).cloned();
+                    // Send response back to the querying peer.
+                    if let Some(relay) = st.federation.relays.get(&remote_host) {
+                        let response = MeshMessage::ProfileResponse {
+                            username: username.clone(),
+                            profile,
+                        };
+                        let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(response));
+                    }
+                }
+
+                RelayEvent::ProfileResponse { remote_host, username, profile } => {
+                    info!(remote_host, username, found = profile.is_some(), "profile: received response");
+                    if let Some(profile) = profile {
+                        let mut st = state.write().await;
+                        let changed = st.profile_store.put(profile.clone());
+                        if changed {
+                            info!(username, "profile: merged into local store");
+                            broadcast_profile_have_to_cluster(&st, Some(&remote_host));
+                        }
+                        // Resolve all pending queries — profile found!
+                        st.profile_store.resolve_query(&username, Some(profile));
+                    }
+                    // None responses: don't resolve — let the caller's timeout
+                    // handle the "no peer has this profile" case. Another peer
+                    // might still respond with Some.
+                }
+
+                RelayEvent::ProfileHave { remote_host, payload_b64 } => {
+                    let spore_bytes = match base64::engine::general_purpose::STANDARD
+                        .decode(&payload_b64)
+                    {
+                        Ok(b) => b,
+                        Err(_) => {
+                            warn!(remote_host, "profile_gossip: invalid base64 in PROFILE_HAVE");
+                            continue;
+                        }
+                    };
+                    let peer_spore: citadel_spore::Spore = match bincode::deserialize(&spore_bytes) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            warn!(remote_host, "profile_gossip: invalid bincode in PROFILE_HAVE");
+                            continue;
+                        }
+                    };
+
+                    let st = state.read().await;
+                    let missing = st.profile_store.profiles_missing_from(&peer_spore);
+
+                    if !missing.is_empty() {
+                        let count = missing.len();
+                        let delta_bytes = bincode::serialize(&missing).unwrap_or_default();
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&delta_bytes);
+
+                        if let Some(relay) = st.federation.relays.get(&remote_host) {
+                            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                MeshMessage::ProfileDelta { data: b64 },
+                            ));
+                            info!(remote_host, count, "profile_gossip: sent PROFILE_DELTA in response");
+                        }
+                    } else {
+                        tracing::debug!(remote_host, "profile_gossip: peer is up-to-date");
+                    }
+                }
+
+                RelayEvent::ProfileDelta { remote_host, payload_b64 } => {
+                    let delta_bytes = match base64::engine::general_purpose::STANDARD
+                        .decode(&payload_b64)
+                    {
+                        Ok(b) => b,
+                        Err(_) => {
+                            warn!(remote_host, "profile_gossip: invalid base64 in PROFILE_DELTA");
+                            continue;
+                        }
+                    };
+                    let profiles: Vec<super::profile::UserProfile> =
+                        match bincode::deserialize(&delta_bytes) {
+                            Ok(p) => p,
+                            Err(_) => {
+                                warn!(remote_host, "profile_gossip: invalid bincode in PROFILE_DELTA");
+                                continue;
+                            }
+                        };
+
+                    let mut st = state.write().await;
+                    let mut merged = 0usize;
+                    for profile in profiles {
+                        if st.profile_store.put(profile) {
+                            merged += 1;
+                        }
+                    }
+
+                    if merged > 0 {
+                        info!(remote_host, merged, "profile_gossip: merged profile delta");
+                        // Re-gossip to other cluster peers (transitive propagation).
+                        broadcast_profile_have_to_cluster(&st, Some(&remote_host));
+                    }
+                }
+            } // match event
+            } // Some(event) => {
+
+            // VDF liveness: challenge SPIRAL neighbors (up to 2 hops)
+            // and sweep for dead peers whose VDF stopped advancing.
+            _ = vdf_challenge_interval.tick() => {
+                let st = state.read().await;
+                // Challenge SPIRAL neighbors: send VdfProofReq to all
+                // connected neighbors.  SPIRAL neighbors police each other —
+                // each node challenges nodes up to 2 hops away.
+                let neighbor_keys: Vec<String> = st.mesh.spiral.neighbors()
+                    .iter().cloned().collect();
+                for nkey in &neighbor_keys {
+                    // Find which relay serves this neighbor.
+                    if let Some(peer) = st.mesh.known_peers.get(nkey) {
+                        if let Some(relay) = st.federation.relays.get(&peer.node_name) {
+                            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                MeshMessage::VdfProofReq,
+                            ));
+                        }
+                    }
+                }
+
+                // Also challenge 2-hop neighbors: peers that are neighbors
+                // of our neighbors but not directly connected to us.
+                // We can reach them via gossip relay — ask our connected
+                // neighbors about THEIR neighbors' liveness.
+                // (For now, direct neighbors suffice — transitive policing
+                // emerges because every node challenges its own neighbors.)
+
+                drop(st);
+
+                // VDF dead-peer sweep (same logic as the HELLO handler).
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                const VDF_DEAD_SECS: u64 = 10;
+
+                let mut st = state.write().await;
+                let our_pid_w = st.lens.peer_id.clone();
+                let mut evicted = Vec::new();
+
+                for (peer_mkey, peer) in &st.mesh.known_peers {
+                    if *peer_mkey == our_pid_w {
+                        continue;
+                    }
+                    if peer.last_vdf_advance == 0 {
+                        if now.saturating_sub(peer.last_seen) < VDF_DEAD_SECS {
+                            continue;
+                        }
+                    } else if now.saturating_sub(peer.last_vdf_advance) < VDF_DEAD_SECS {
+                        continue;
+                    }
+                    evicted.push(peer_mkey.clone());
+                }
+
+                for evicted_key in &evicted {
+                    if let Some(peer) = st.mesh.known_peers.remove(evicted_key) {
+                        info!(
+                            mesh_key = %evicted_key,
+                            server_name = %peer.server_name,
+                            node_name = %peer.node_name,
+                            vdf_step = ?peer.vdf_step,
+                            last_vdf_advance = peer.last_vdf_advance,
+                            dead_secs = VDF_DEAD_SECS,
+                            "mesh: evicting dead peer — VDF not advancing"
+                        );
+                        st.mesh.connections.remove(evicted_key);
+                        st.mesh.spiral.remove_peer(evicted_key);
+                        st.mesh.latency_gossip.remove_peer(evicted_key);
+
+                        if let Some(ref ygg) = st.transport_config.ygg_node {
+                            if let Some(ref uri) = peer.ygg_peer_uri {
+                                match ygg.remove_peer(uri) {
+                                    Ok(()) => info!(
+                                        uri,
+                                        node_name = %peer.node_name,
+                                        "APE: removed dead peer from Ygg overlay"
+                                    ),
+                                    Err(e) => tracing::debug!(
+                                        uri,
+                                        error = %e,
+                                        "APE: remove_peer failed (may already be gone)"
+                                    ),
+                                }
+                            }
+                        }
+
+                        if let Some(relay) = st.federation.relays.remove(&peer.node_name) {
+                            let _ = relay.outgoing_tx.send(RelayCommand::Shutdown);
+                            relay.task_handle.abort();
+                        }
+                    }
+                }
+
+                if !evicted.is_empty() {
+                    let neighbors = st.mesh.spiral.neighbors().clone();
+                    st.mesh.latency_gossip.set_spiral_neighbors(neighbors);
+                    st.notify_topology_change();
+                }
             }
-        }
+
+            else => break,
+        } // select!
+        } // loop
     });
+}
+
+/// Broadcast our profile SPORE HaveList to all connected cluster peers.
+///
+/// Called after a profile change (registration, merge from delta) so that
+/// other same-site nodes can diff and pull any profiles they're missing.
+/// `exclude` skips a specific relay (the one that just sent us the delta).
+pub fn broadcast_profile_have_to_cluster(
+    st: &super::server::ServerState,
+    exclude: Option<&str>,
+) {
+    let spore_bytes = bincode::serialize(st.profile_store.spore()).unwrap_or_default();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&spore_bytes);
+    let msg = MeshMessage::ProfileHave { data: b64 };
+    let our_site = &*SITE_NAME;
+
+    for (key, relay) in &st.federation.relays {
+        if exclude == Some(key.as_str()) {
+            continue;
+        }
+        // Only send to cluster peers (same site_name).
+        let is_cluster = relay.remote_node_name.as_ref().and_then(|nn| {
+            st.mesh.known_peers.values()
+                .find(|p| &p.node_name == nn)
+                .map(|p| super::gossip::is_cluster_peer(our_site, &p.site_name))
+        }).unwrap_or(false);
+
+        if is_cluster {
+            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(msg.clone()));
+        }
+    }
 }
 
 /// Execute latency gossip sync actions by sending MESH subcommands to relay peers.
@@ -2048,6 +2418,316 @@ pub fn spawn_relay(
     ));
 
     (cmd_tx, handle)
+}
+
+// ---------------------------------------------------------------------------
+// Native mesh relay — JSON over WebSocket, no IRC framing
+// ---------------------------------------------------------------------------
+
+/// Outcome of a native WebSocket relay loop iteration.
+enum NativeLoopOutcome {
+    /// Connection lost or closed by remote — reconnect with backoff.
+    Reconnect,
+    /// Explicit shutdown requested — exit permanently.
+    Shutdown,
+}
+
+/// Spawn a native mesh relay task (JSON over WebSocket).
+///
+/// Same role as `spawn_relay()` but speaks native JSON `MeshMessage` frames
+/// to `/api/mesh/ws` instead of IRC-over-WebSocket.
+pub fn spawn_native_relay(
+    relay_key: String,
+    connect_target: String,
+    event_tx: mpsc::UnboundedSender<RelayEvent>,
+    transport_config: Arc<TransportConfig>,
+    state: Arc<tokio::sync::RwLock<super::server::ServerState>>,
+) -> (mpsc::UnboundedSender<RelayCommand>, tokio::task::JoinHandle<()>) {
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+
+    let handle = tokio::spawn(relay_task_native(
+        relay_key,
+        connect_target,
+        cmd_rx,
+        event_tx,
+        transport_config,
+        state,
+    ));
+
+    (cmd_tx, handle)
+}
+
+/// Native mesh relay task — connects to `/api/mesh/ws`, exchanges JSON
+/// `MeshMessage` frames. Reconnects on failure with exponential backoff.
+async fn relay_task_native(
+    relay_key: String,
+    connect_target: String,
+    mut cmd_rx: mpsc::UnboundedReceiver<RelayCommand>,
+    event_tx: mpsc::UnboundedSender<RelayEvent>,
+    transport_config: Arc<TransportConfig>,
+    state: Arc<tokio::sync::RwLock<super::server::ServerState>>,
+) {
+    let remote_host = relay_key;
+    let mut consecutive_failures: u32 = 0;
+
+    'reconnect: loop {
+        let outcome = match transport::connect_native(&connect_target, &transport_config).await {
+            Ok(transport::NativeWs::Ygg(ws)) => {
+                consecutive_failures = 0;
+                info!(%remote_host, "native relay: connected via Ygg overlay");
+                native_ws_loop(ws, &remote_host, &mut cmd_rx, &event_tx, &state).await
+            }
+            Ok(transport::NativeWs::Tls(ws)) => {
+                consecutive_failures = 0;
+                info!(%remote_host, "native relay: connected via TLS WebSocket");
+                native_ws_loop(ws, &remote_host, &mut cmd_rx, &event_tx, &state).await
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                if consecutive_failures <= 3 {
+                    warn!(%remote_host, %connect_target, attempt = consecutive_failures,
+                        "native relay: connect failed, will retry: {e}");
+                } else if consecutive_failures % 30 == 0 {
+                    warn!(%remote_host, %connect_target, attempt = consecutive_failures,
+                        "native relay: still failing to connect: {e}");
+                }
+                if !backoff_drain_native(&mut cmd_rx, consecutive_failures).await {
+                    return;
+                }
+                continue 'reconnect;
+            }
+        };
+
+        match outcome {
+            NativeLoopOutcome::Shutdown => return,
+            NativeLoopOutcome::Reconnect => {
+                consecutive_failures += 1;
+                info!(%remote_host, attempt = consecutive_failures,
+                    "native relay: connection lost, will reconnect");
+                if !backoff_drain_native(&mut cmd_rx, consecutive_failures).await {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Inner WebSocket loop — generic over the underlying stream type.
+///
+/// Handles Hello exchange, bidirectional JSON message dispatch, and keepalive.
+async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    ws: tokio_tungstenite::WebSocketStream<S>,
+    relay_key: &str,
+    cmd_rx: &mut mpsc::UnboundedReceiver<RelayCommand>,
+    event_tx: &mpsc::UnboundedSender<RelayEvent>,
+    state: &Arc<tokio::sync::RwLock<super::server::ServerState>>,
+) -> NativeLoopOutcome {
+    use futures::SinkExt as _;
+    use tokio_tungstenite::tungstenite::Message as TungsMsg;
+
+    let (mut ws_tx, mut ws_rx) = futures::StreamExt::split(ws);
+
+    // ── Hello exchange ──────────────────────────────────────────────────
+
+    // Send our Hello.
+    let our_hello = {
+        let st = state.read().await;
+        build_wire_hello(&st)
+    };
+    let hello_msg = MeshMessage::Hello(our_hello);
+    let hello_json = match hello_msg.to_json() {
+        Ok(j) => j,
+        Err(e) => {
+            warn!(relay_key, "native relay: failed to serialize Hello: {e}");
+            return NativeLoopOutcome::Reconnect;
+        }
+    };
+    if ws_tx.send(TungsMsg::Text(hello_json.into())).await.is_err() {
+        warn!(relay_key, "native relay: failed to send Hello");
+        return NativeLoopOutcome::Reconnect;
+    }
+
+    // Receive their Hello (30s timeout).
+    let remote_hello = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        futures::StreamExt::next(&mut ws_rx),
+    )
+    .await
+    {
+        Ok(Some(Ok(TungsMsg::Text(text)))) => match MeshMessage::from_json(&text) {
+            Ok(MeshMessage::Hello(hello)) => hello,
+            Ok(other) => {
+                warn!(relay_key, ?other, "native relay: first message must be Hello");
+                return NativeLoopOutcome::Reconnect;
+            }
+            Err(e) => {
+                warn!(relay_key, "native relay: invalid first message: {e}");
+                return NativeLoopOutcome::Reconnect;
+            }
+        },
+        _ => {
+            warn!(relay_key, "native relay: no Hello received within timeout");
+            return NativeLoopOutcome::Reconnect;
+        }
+    };
+
+    let remote_peer_id = remote_hello.peer_id.clone();
+    let remote_node_name = if remote_hello.node_name.is_empty() {
+        super::server::derive_node_name(&remote_hello.server_name)
+    } else {
+        remote_hello.node_name.clone()
+    };
+    let site_name = if remote_hello.site_name.is_empty() {
+        super::server::derive_site_name(&remote_hello.server_name)
+    } else {
+        remote_hello.site_name.clone()
+    };
+    let remote_mesh_key: Option<String> = Some(format!("{site_name}/{remote_node_name}"));
+
+    info!(
+        relay_key,
+        peer_id = %remote_peer_id,
+        node_name = %remote_node_name,
+        server_name = %remote_hello.server_name,
+        "native relay: received Hello"
+    );
+
+    // Dispatch their Hello to the event processor.
+    dispatch_mesh_message(
+        MeshMessage::Hello(remote_hello),
+        relay_key,
+        None, // no peer_addr for WebSocket
+        &remote_mesh_key,
+        event_tx,
+    );
+
+    // ── Bidirectional message loop ──────────────────────────────────────
+
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    keepalive.tick().await; // skip first immediate tick
+
+    loop {
+        tokio::select! {
+            // Incoming WebSocket messages from remote peer.
+            ws_msg = futures::StreamExt::next(&mut ws_rx) => {
+                match ws_msg {
+                    Some(Ok(TungsMsg::Text(text))) => {
+                        match MeshMessage::from_json(&text) {
+                            Ok(msg) => {
+                                // dispatch_mesh_message returns Some(hello) for Hello
+                                // messages — we already handled the first one above,
+                                // but a re-Hello (VDF state change) is valid.
+                                let _ = dispatch_mesh_message(
+                                    msg,
+                                    relay_key,
+                                    None,
+                                    &remote_mesh_key,
+                                    event_tx,
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    relay_key,
+                                    error = %e,
+                                    "native relay: failed to parse message"
+                                );
+                            }
+                        }
+                    }
+                    Some(Ok(TungsMsg::Pong(_))) => {
+                        // Keepalive response — peer is alive.
+                    }
+                    Some(Ok(TungsMsg::Close(_))) | None => {
+                        info!(relay_key, "native relay: connection closed by remote");
+                        return NativeLoopOutcome::Reconnect;
+                    }
+                    Some(Err(e)) => {
+                        warn!(relay_key, error = %e, "native relay: read error");
+                        return NativeLoopOutcome::Reconnect;
+                    }
+                    _ => {} // Binary, Ping (tungstenite auto-responds)
+                }
+            }
+
+            // Outgoing commands from the server event processor.
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(RelayCommand::SendMesh(mesh_msg)) => {
+                        if let Ok(json) = mesh_msg.to_json() {
+                            if ws_tx.send(TungsMsg::Text(json.into())).await.is_err() {
+                                return NativeLoopOutcome::Reconnect;
+                            }
+                        }
+                    }
+                    Some(RelayCommand::MeshHello { json: _ }) => {
+                        // Re-send our Hello (e.g., VDF state change).
+                        let hello = {
+                            let st = state.read().await;
+                            build_wire_hello(&st)
+                        };
+                        let msg = MeshMessage::Hello(hello);
+                        if let Ok(j) = msg.to_json() {
+                            if ws_tx.send(TungsMsg::Text(j.into())).await.is_err() {
+                                return NativeLoopOutcome::Reconnect;
+                            }
+                        }
+                    }
+                    Some(RelayCommand::Shutdown) => {
+                        info!(relay_key, "native relay: shutdown requested");
+                        let _ = ws_tx.send(TungsMsg::Close(None)).await;
+                        return NativeLoopOutcome::Shutdown;
+                    }
+                    Some(RelayCommand::Reconnect) => {
+                        info!(relay_key, "native relay: reconnect requested");
+                        let _ = ws_tx.send(TungsMsg::Close(None)).await;
+                        return NativeLoopOutcome::Reconnect;
+                    }
+                    Some(_) => {
+                        // Channel ops (JoinChannel, Privmsg, etc.) — not
+                        // supported in native mesh mode.
+                    }
+                    None => {
+                        // Command channel closed — relay handle removed.
+                        return NativeLoopOutcome::Shutdown;
+                    }
+                }
+            }
+
+            // Periodic keepalive ping.
+            _ = keepalive.tick() => {
+                if ws_tx.send(TungsMsg::Ping(vec![].into())).await.is_err() {
+                    return NativeLoopOutcome::Reconnect;
+                }
+            }
+        }
+    }
+}
+
+/// Backoff drain for the native relay task.
+///
+/// Waits with exponential backoff while consuming commands. Returns `true` to
+/// continue reconnecting, `false` to exit (Shutdown or channel closed).
+async fn backoff_drain_native(
+    cmd_rx: &mut mpsc::UnboundedReceiver<RelayCommand>,
+    failures: u32,
+) -> bool {
+    let secs = (2u64.pow(failures)).min(60);
+    let backoff = tokio::time::sleep(std::time::Duration::from_secs(secs));
+    tokio::pin!(backoff);
+    loop {
+        tokio::select! {
+            _ = &mut backoff => return true,
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(RelayCommand::Shutdown) => return false,
+                    Some(RelayCommand::Reconnect) => {} // Already reconnecting.
+                    Some(_) => {} // Drop other commands during backoff.
+                    None => return false, // Channel closed — relay handle removed.
+                }
+            }
+        }
+    }
 }
 
 /// Per-channel state within the relay task.
@@ -2535,6 +3215,43 @@ async fn relay_task(
                                         payload_b64: json,
                                     });
                                 }
+                                "PROFILE_QUERY" => {
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                                        if let Some(username) = v.get("username").and_then(|u| u.as_str()) {
+                                            let _ = event_tx.send(RelayEvent::ProfileQuery {
+                                                remote_host: remote_host.clone(),
+                                                username: username.to_string(),
+                                            });
+                                        }
+                                    }
+                                }
+                                "PROFILE_RESPONSE" => {
+                                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                                        let username = v.get("username")
+                                            .and_then(|u| u.as_str())
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let profile = v.get("profile")
+                                            .and_then(|p| serde_json::from_value(p.clone()).ok());
+                                        let _ = event_tx.send(RelayEvent::ProfileResponse {
+                                            remote_host: remote_host.clone(),
+                                            username,
+                                            profile,
+                                        });
+                                    }
+                                }
+                                "PROFILE_HAVE" => {
+                                    let _ = event_tx.send(RelayEvent::ProfileHave {
+                                        remote_host: remote_host.clone(),
+                                        payload_b64: json,
+                                    });
+                                }
+                                "PROFILE_DELTA" => {
+                                    let _ = event_tx.send(RelayEvent::ProfileDelta {
+                                        remote_host: remote_host.clone(),
+                                        payload_b64: json,
+                                    });
+                                }
                                 _ => {}
                             }
                         }
@@ -2863,17 +3580,13 @@ pub fn spawn_mesh_connector(state: SharedState, transport_config: Arc<TransportC
 
             info!(peer = %peer_host, node = %node, "mesh: connecting");
 
-            let (cmd_tx, task_handle) = spawn_relay(
+            let (cmd_tx, task_handle) = spawn_native_relay(
                 node.clone(),
                 peer_host.clone(),
                 event_tx.clone(),
                 Arc::clone(&tc),
+                state.clone(),
             );
-
-            // Send MESH HELLO (will be queued until registered).
-            let _ = cmd_tx.send(RelayCommand::MeshHello {
-                json: hello_json.clone(),
-            });
 
             st.federation.relays.insert(
                 node.clone(),
@@ -2916,6 +3629,14 @@ fn mesh_message_to_irc(msg: &MeshMessage) -> Message {
         MeshMessage::GossipDiff { data } => ("GOSSIP_DIFF".into(), data.clone()),
         MeshMessage::LatencyHave { data } => ("LATENCY_HAVE".into(), data.clone()),
         MeshMessage::LatencyDelta { data } => ("LATENCY_DELTA".into(), data.clone()),
+        MeshMessage::ProfileQuery { username } => {
+            ("PROFILE_QUERY".into(), serde_json::json!({ "username": username }).to_string())
+        }
+        MeshMessage::ProfileResponse { username, profile } => {
+            ("PROFILE_RESPONSE".into(), serde_json::json!({ "username": username, "profile": profile }).to_string())
+        }
+        MeshMessage::ProfileHave { data } => ("PROFILE_HAVE".into(), data.clone()),
+        MeshMessage::ProfileDelta { data } => ("PROFILE_DELTA".into(), data.clone()),
     };
     let mut params = vec![sub];
     if !payload.is_empty() {

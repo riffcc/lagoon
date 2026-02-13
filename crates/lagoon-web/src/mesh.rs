@@ -6,8 +6,7 @@
 //! triggers the event processor to send Peers/LatencyHave/GossipSpore back
 //! through the relay handle), and enter the bidirectional message loop.
 //!
-//! This replaces the old `federation_ws_bridge` (WS → TCP → IRC → MESH dispatch)
-//! with a single-layer handler: WS → `dispatch_mesh_message()` → `event_tx`.
+//! Single-layer handler: WS → `dispatch_mesh_message()` → `event_tx`.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

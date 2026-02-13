@@ -33,8 +33,6 @@ fn build_router(state: AppState) -> Router {
         .route("/api/auth/me", get(auth::me))
         // WebSocket IRC bridge
         .route("/api/ws", get(bridge::ws_handler))
-        // Federation WebSocket tunnel (IRC-over-WS for CDN/proxy traversal — legacy)
-        .route("/api/federation/ws", get(bridge::federation_ws_handler))
         // Native mesh WebSocket — JSON over WS, no IRC
         .route("/api/mesh/ws", get(mesh::mesh_ws_handler))
         // Topology endpoints
@@ -120,7 +118,7 @@ pub async fn run_with_irc() -> Result<(), Box<dyn std::error::Error + Send + Syn
     let app = build_router(state);
 
     // Spawn Ygg overlay web gateway — ws:// federation over the mesh.
-    // Other nodes dial ws://[our_ygg_addr]:8080/api/federation/ws through
+    // Other nodes dial ws://[our_ygg_addr]:8080/api/mesh/ws through
     // the overlay. Ygg encrypts the transport, so no TLS needed.
     if let Some(ref node) = ygg_node {
         match node.listen(8080) {
@@ -200,7 +198,7 @@ async fn serve_tls(app: Router) -> Result<(), Box<dyn std::error::Error + Send +
 /// Serve the web gateway over Yggdrasil overlay connections.
 ///
 /// Accepts connections from the embedded Ygg node's listener (port 8080) and
-/// serves the full Axum router — including `/api/federation/ws` for mesh
+/// serves the full Axum router — including `/api/mesh/ws` for native mesh
 /// federation. This lets other nodes connect via `ws://[ygg_addr]:8080/...`
 /// through the encrypted overlay, with no TLS needed (Ygg encrypts).
 async fn ygg_serve(listener: yggbridge::YggListener, app: Router) {

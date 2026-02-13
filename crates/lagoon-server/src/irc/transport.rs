@@ -4,10 +4,14 @@
 //! Resolves remote hostnames to socket addresses (DNS, Yggdrasil peer table,
 //! or direct IPv6) and creates TCP or WebSocket connections.
 //!
-//! When a peer is configured with `tls: true` (port 443 in `LAGOON_PEERS`),
-//! federation traffic is tunneled over WebSocket (`wss://host/api/federation/ws`).
-//! This survives CDN/proxy layers (e.g. Cloudflare) that only pass HTTP/WebSocket.
-//! Each WebSocket text message = one IRC line.
+//! Two WebSocket modes:
+//!
+//! - **Native mesh** (`/api/mesh/ws`): JSON `MeshMessage` frames. Used by
+//!   `relay_task_native()` for all WebSocket connections. This is the primary
+//!   path — simple, correct, one dispatch function.
+//!
+//! - **Legacy IRC** (`connect()` with `WsRelayStream`): IRC-over-WebSocket for
+//!   plain TCP relay_task backwards compatibility. Being phased out.
 //!
 //! For plain TCP peers (Yggdrasil, local network), connections go direct.
 
@@ -235,13 +239,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsRelayStream<S> {
 ///
 /// Three transport modes, tried in priority order:
 ///
-/// 1. **Ygg overlay WebSocket** (`ws://[ygg_addr]:8080/api/federation/ws`):
+/// 1. **Ygg overlay WebSocket** (`ws://[ygg_addr]:8080/api/mesh/ws`):
 ///    When the peer has a known Yggdrasil address and we have an embedded Ygg
 ///    node. Dials the overlay → WebSocket upgrade to the web gateway. No TLS
 ///    needed — Yggdrasil encrypts the transport. No DNS needed — we have the
 ///    overlay address from MESH HELLO / MESH PEERS.
 ///
-/// 2. **TLS WebSocket** (`wss://host:443/api/federation/ws`):
+/// 2. **TLS WebSocket** (`wss://host:443/api/mesh/ws`):
 ///    For peers configured with `tls: true` (port 443). tokio-tungstenite
 ///    handles DNS and TLS. Survives CDN/proxy layers (Cloudflare, HAProxy).
 ///    Used for the anycast entry point (`LAGOON_PEERS=lagun.co:443`).
@@ -268,10 +272,10 @@ const WEB_GATEWAY_PORT: u16 = 8080;
 /// Priority: Ygg overlay (encrypted, no DNS) > TLS WebSocket (CDN) > plain TCP.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportMode {
-    /// Ygg overlay → `ws://[200:xxxx]:8080/api/federation/ws` (or `/api/mesh/ws`).
+    /// Ygg overlay → `ws://[200:xxxx]:8080/api/mesh/ws`.
     /// Ygg encrypts the transport, no TLS needed.
     YggOverlay { addr: Ipv6Addr },
-    /// TLS WebSocket → `wss://host:port/api/federation/ws`.
+    /// TLS WebSocket → `wss://host:port/api/mesh/ws`.
     /// Survives CDN/proxy layers.
     TlsWebSocket { host: String, port: u16 },
     /// Plain TCP → direct IRC protocol.
@@ -341,7 +345,7 @@ pub async fn connect(
     // The web gateway on port 8080 handles the WebSocket federation
     // endpoint with all the authentication and proxying already built in.
     if let (Some(ygg_node), Some(ygg_v6)) = (&config.ygg_node, ygg_addr) {
-        let url = format!("ws://[{ygg_v6}]:{WEB_GATEWAY_PORT}/api/federation/ws");
+        let url = format!("ws://[{ygg_v6}]:{WEB_GATEWAY_PORT}/api/mesh/ws");
         info!(remote_host, %url, "transport: connecting via WebSocket over Ygg overlay");
         let stream = ygg_node
             .dial(ygg_v6, WEB_GATEWAY_PORT)
@@ -362,9 +366,9 @@ pub async fn connect(
     // Public internet path — wss:// through CDN/proxy/anycast.
     if tls {
         let url = if remote_host.contains(':') {
-            format!("wss://[{remote_host}]:{port}/api/federation/ws")
+            format!("wss://[{remote_host}]:{port}/api/mesh/ws")
         } else {
-            format!("wss://{remote_host}:{port}/api/federation/ws")
+            format!("wss://{remote_host}:{port}/api/mesh/ws")
         };
         info!(remote_host, %url, "transport: connecting via WebSocket (TLS)");
         let (ws_stream, _response) = tokio_tungstenite::connect_async(&url)
@@ -388,6 +392,77 @@ pub async fn connect(
         stream: Box::new(stream),
         peer_addr: Some(addr),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Native WebSocket connection (JSON MeshMessages, no IRC framing)
+// ---------------------------------------------------------------------------
+
+/// Raw WebSocket stream for the native mesh relay — NOT wrapped in IRC framing.
+///
+/// The relay_task_native() uses these directly for JSON MeshMessage exchange.
+/// Generic over the underlying transport (Ygg overlay or TLS).
+pub enum NativeWs {
+    /// Ygg overlay: `ws://[200:xxxx]:8080/api/mesh/ws`, encrypted by Ygg.
+    Ygg(tokio_tungstenite::WebSocketStream<yggbridge::YggStream>),
+    /// TLS WebSocket: `wss://host:port/api/mesh/ws`, internet path.
+    Tls(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>),
+}
+
+/// Connect to a remote peer's native mesh WebSocket endpoint (`/api/mesh/ws`).
+///
+/// Returns a raw `WebSocketStream` (not IRC-wrapped). The caller sends/receives
+/// JSON `MeshMessage` text frames directly.
+///
+/// Priority:
+/// 1. **Ygg overlay** if we have an embedded Ygg node AND the peer has a known
+///    overlay address.
+/// 2. **TLS WebSocket** if the peer is configured with `tls: true` (port 443).
+/// 3. **PlainTcp** → error (native mode requires WebSocket).
+pub async fn connect_native(
+    remote_host: &str,
+    config: &TransportConfig,
+) -> io::Result<NativeWs> {
+    let peer = config.peers.get(remote_host);
+    let port = peer.map(|p| p.port).unwrap_or(DEFAULT_PORT);
+    let tls = peer.map(|p| p.tls).unwrap_or(false);
+    let ygg_addr = peer.and_then(|p| p.yggdrasil_addr);
+
+    // Priority 1: Ygg overlay WebSocket.
+    if let (Some(ygg_node), Some(ygg_v6)) = (&config.ygg_node, ygg_addr) {
+        let url = format!("ws://[{ygg_v6}]:{WEB_GATEWAY_PORT}/api/mesh/ws");
+        info!(remote_host, %url, "transport: native mesh via Ygg overlay");
+        let stream = ygg_node
+            .dial(ygg_v6, WEB_GATEWAY_PORT)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+        let (ws_stream, _response) = tokio_tungstenite::client_async(&url, stream)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+        info!(remote_host, "transport: native mesh via Ygg overlay connected");
+        return Ok(NativeWs::Ygg(ws_stream));
+    }
+
+    // Priority 2: TLS WebSocket.
+    if tls {
+        let url = if remote_host.contains(':') {
+            format!("wss://[{remote_host}]:{port}/api/mesh/ws")
+        } else {
+            format!("wss://{remote_host}:{port}/api/mesh/ws")
+        };
+        info!(remote_host, %url, "transport: native mesh via TLS WebSocket");
+        let (ws_stream, _response) = tokio_tungstenite::connect_async(&url)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+        info!(remote_host, "transport: native mesh via TLS WebSocket connected");
+        return Ok(NativeWs::Tls(ws_stream));
+    }
+
+    // PlainTcp — not supported for native mesh mode.
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("native mesh requires WebSocket transport (peer {remote_host} is PlainTcp)"),
+    ))
 }
 
 /// Apply aggressive TCP keepalive for fast dead peer detection.
@@ -847,11 +922,11 @@ mod tests {
         let host = "lon.lagun.co";
         let port = 443u16;
         let url = if host.contains(':') {
-            format!("wss://[{host}]:{port}/api/federation/ws")
+            format!("wss://[{host}]:{port}/api/mesh/ws")
         } else {
-            format!("wss://{host}:{port}/api/federation/ws")
+            format!("wss://{host}:{port}/api/mesh/ws")
         };
-        assert_eq!(url, "wss://lon.lagun.co:443/api/federation/ws");
+        assert_eq!(url, "wss://lon.lagun.co:443/api/mesh/ws");
     }
 
     #[test]
@@ -859,13 +934,13 @@ mod tests {
         let host = "2a09:8280:5d::d2:e42f:0";
         let port = 443u16;
         let url = if host.contains(':') {
-            format!("wss://[{host}]:{port}/api/federation/ws")
+            format!("wss://[{host}]:{port}/api/mesh/ws")
         } else {
-            format!("wss://{host}:{port}/api/federation/ws")
+            format!("wss://{host}:{port}/api/mesh/ws")
         };
         assert_eq!(
             url,
-            "wss://[2a09:8280:5d::d2:e42f:0]:443/api/federation/ws"
+            "wss://[2a09:8280:5d::d2:e42f:0]:443/api/mesh/ws"
         );
     }
 
