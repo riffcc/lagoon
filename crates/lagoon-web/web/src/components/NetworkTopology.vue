@@ -40,6 +40,20 @@ function nodeLabel(node) {
   return node.server_name
 }
 
+/** VDF liveness state for a node.
+ *  VDF step progression IS the heartbeat — no timestamps, no timeouts.
+ *  Returns: 'ticking' (step advancing), 'stalled' (step frozen), or null (no VDF data). */
+const prevVdfSteps = new Map()
+function vdfLiveness(node) {
+  if (node.is_self) return 'ticking' // we're always alive
+  if (node.vdf_step == null) return null
+  const key = node.id || node.mesh_key
+  const prev = prevVdfSteps.get(key)
+  prevVdfSteps.set(key, node.vdf_step)
+  if (prev == null) return 'ticking' // first observation, assume alive
+  return node.vdf_step > prev ? 'ticking' : 'stalled'
+}
+
 /** Count links touching a given node ID in the current graph data. */
 function countNodeLinks(nodeId) {
   if (!graph) return { total: 0, connected: 0, disconnected: 0 }
@@ -246,22 +260,22 @@ async function try3D() {
         // Text sprite for label.
         const canvas = document.createElement('canvas')
         const ctx = canvas.getContext('2d')
-        canvas.width = 256
+        canvas.width = 512
         canvas.height = 64
-        ctx.font = isBrowser ? '20px monospace' : '24px monospace'
+        ctx.font = isBrowser ? '20px monospace' : '22px monospace'
         ctx.fillStyle = COLORS.text
         ctx.textAlign = 'center'
-        ctx.fillText(nodeLabel(node), 128, 28)
+        ctx.fillText(nodeLabel(node), 256, 28)
         if (!isBrowser) {
           ctx.font = '14px monospace'
           ctx.fillStyle = '#565f89'
-          ctx.fillText(node.mesh_key.substring(5, 21) + '...', 128, 52)
+          ctx.fillText(node.mesh_key.substring(5, 21) + '...', 256, 52)
         }
 
         const texture = new THREE.CanvasTexture(canvas)
         const spriteMat = new THREE.SpriteMaterial({ map: texture, transparent: true })
         const sprite = new THREE.Sprite(spriteMat)
-        sprite.scale.set(isBrowser ? 30 : 40, 10, 1)
+        sprite.scale.set(isBrowser ? 40 : 60, 10, 1)
         sprite.position.y = size + 8
         group.add(sprite)
         return group
@@ -445,6 +459,11 @@ function updateGraph(snapshot) {
       existing.vdf_resonance_credit = n.vdf_resonance_credit ?? null
       existing.spiral_index = n.spiral_index ?? null
       existing.is_spiral_neighbor = n.is_spiral_neighbor || false
+
+      existing.peer_count = n.peer_count ?? null
+      existing.connected_count = n.connected_count ?? null
+      existing.ygg_up_count = n.ygg_up_count ?? null
+      existing.disconnected_count = n.disconnected_count ?? null
     } else {
       // New node — must rebuild.
       structureChanged = true
@@ -507,6 +526,11 @@ function updateGraph(snapshot) {
         vdf_resonance_credit: n.vdf_resonance_credit ?? null,
         spiral_index: n.spiral_index ?? null,
         is_spiral_neighbor: n.is_spiral_neighbor || false,
+
+        peer_count: n.peer_count ?? null,
+        connected_count: n.connected_count ?? null,
+        ygg_up_count: n.ygg_up_count ?? null,
+        disconnected_count: n.disconnected_count ?? null,
       }
       // Preserve previous position so d3 doesn't reset the simulation.
       if (prev) {
@@ -632,8 +656,42 @@ onUnmounted(() => {
       <span class="panel-label">Relation</span>
       <span class="panel-value spiral-tag">SPIRAL neighbor</span>
     </div>
+    <!-- VDF liveness (the actual heartbeat) -->
+    <div v-if="hoveredNode.vdf_step != null" class="panel-row">
+      <span class="panel-label">VDF Step</span>
+      <span class="panel-value">{{ hoveredNode.vdf_step.toLocaleString() }}</span>
+    </div>
+    <div v-if="!hoveredNode.is_self && vdfLiveness(hoveredNode) != null" class="panel-row">
+      <span class="panel-label">VDF Heartbeat</span>
+      <span class="panel-value" :class="vdfLiveness(hoveredNode) === 'ticking' ? 'status-up' : 'status-down'">
+        {{ vdfLiveness(hoveredNode) === 'ticking' ? 'ticking' : 'STALLED — eject' }}
+      </span>
+    </div>
+    <!-- Self node peer stats -->
+    <div v-if="hoveredNode.peer_count != null" class="panel-section">
+      <div class="panel-divider"></div>
+      <div class="panel-row">
+        <span class="panel-label">Peers Known</span>
+        <span class="panel-value">{{ hoveredNode.peer_count }}</span>
+      </div>
+      <div class="panel-row">
+        <span class="panel-label">Relays Up</span>
+        <span class="panel-value status-up">{{ hoveredNode.connected_count }}</span>
+      </div>
+      <div v-if="hoveredNode.ygg_up_count != null" class="panel-row">
+        <span class="panel-label">Ygg Overlay</span>
+        <span class="panel-value" :class="hoveredNode.ygg_up_count > 0 ? 'status-up' : 'status-down'">
+          {{ hoveredNode.ygg_up_count }} up
+        </span>
+      </div>
+      <div v-if="hoveredNode.disconnected_count > 0" class="panel-row">
+        <span class="panel-label">Disconnected</span>
+        <span class="panel-value status-down">{{ hoveredNode.disconnected_count }}</span>
+      </div>
+    </div>
+    <!-- Link count from graph (all nodes) -->
     <div class="panel-row">
-      <span class="panel-label">Links</span>
+      <span class="panel-label">Graph Links</span>
       <span class="panel-value">{{ countNodeLinks(hoveredNode.id || hoveredNode.mesh_key).total }}</span>
     </div>
   </div>
@@ -725,4 +783,10 @@ onUnmounted(() => {
 .credit-ok { color: #e0af68; }
 .credit-bad { color: #f7768e; }
 .spiral-tag { color: #7aa2f7; }
+
+.panel-divider {
+  height: 1px;
+  background: #3b4261;
+  margin: 6px 0;
+}
 </style>
