@@ -2,7 +2,7 @@
 FROM rust:1-bookworm AS rust-build
 
 # Install Go (needed by yggbridge crate's build.rs)
-RUN curl -fsSL https://go.dev/dl/go1.23.6.linux-amd64.tar.gz | tar -C /usr/local -xzf -
+RUN curl -fsSL https://go.dev/dl/go1.24.4.linux-amd64.tar.gz | tar -C /usr/local -xzf -
 ENV PATH="/usr/local/go/bin:${PATH}"
 
 # Clone citadel (path dependency) at the same absolute path Cargo.toml expects

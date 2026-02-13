@@ -1,6 +1,6 @@
 module github.com/riffcc/yggbridge
 
-go 1.25.5
+go 1.24.4
 
 require (
 	github.com/gologme/log v1.3.0
