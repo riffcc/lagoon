@@ -21,65 +21,142 @@ use super::lens;
 use super::message::Message;
 use super::server::{broadcast, derive_node_name, MeshConnectionState, MeshPeerInfo, SharedState, NODE_NAME, SERVER_NAME, SITE_NAME};
 use super::transport::{self, TransportConfig};
+use super::wire::{MeshMessage, HelloPayload};
 use base64::Engine as _;
 
 /// Maximum disconnected peers retained per SITE_NAME before dedup eviction.
 const MAX_DISCONNECTED_PER_SITE: usize = 5;
-/// Maximum safe JSON payload bytes for a single IRC MESH message.
-/// IRC max line is 8191; reserve room for "MESH PEERS " prefix + \r\n.
-const MAX_MESH_PAYLOAD: usize = 7000;
 
-/// Send a list of serializable items as MESH messages, splitting into chunks
-/// if the JSON payload would exceed `MAX_MESH_PAYLOAD`.
-fn send_chunked_mesh<T: serde::Serialize>(
-    relay: &RelayHandle,
-    subcommand: &str,
-    items: &[T],
-) {
-    if items.is_empty() {
-        return;
-    }
-    // Fast path: try everything at once.
-    if let Ok(json) = serde_json::to_string(items) {
-        if json.len() <= MAX_MESH_PAYLOAD {
-            let _ = relay.outgoing_tx.send(RelayCommand::Raw(Message {
-                prefix: None,
-                command: "MESH".into(),
-                params: vec![subcommand.into(), json],
-            }));
-            return;
+/// Build the Yggdrasil underlay peer URI for APE (Anycast Peer Entry).
+///
+/// Strategy: prefer the **underlay address** derived from the relay's TCP peer
+/// address (confirmed-different node via MESH HELLO peer_id verification)
+/// over the overlay address from `ygg_peer_uri`.
+///
+/// Why: The overlay address (`tcp://[200:xxxx::]:9443`) only works if we're
+/// already ON the Ygg overlay.  For a fresh node bootstrapping via anycast,
+/// we're NOT on the overlay yet.  But the relay already has a TCP connection
+/// to a confirmed-different node — use that IP as the underlay Ygg peer.
+///
+/// Returns `None` if neither source is available.
+pub fn ape_peer_uri(
+    relay_peer_addr: Option<SocketAddr>,
+    ygg_peer_uri: Option<&str>,
+) -> Option<String> {
+    // First try: underlay address from relay TCP peer (confirmed-different node).
+    let underlay_uri = relay_peer_addr.map(|addr| {
+        format!("tcp://[{}]:9443", addr.ip())
+    });
+
+    underlay_uri.or_else(|| ygg_peer_uri.map(|s| s.to_string()))
+}
+
+/// Dispatch a received `MeshMessage` into the appropriate `RelayEvent`.
+///
+/// Single code path for all mesh message processing — called from both
+/// the inbound WebSocket handler and the outbound relay_task.
+///
+/// Returns the `HelloPayload` if the message was a Hello (needed by callers
+/// to extract identity and set `remote_mesh_key`).
+pub fn dispatch_mesh_message(
+    msg: MeshMessage,
+    remote_host: &str,
+    relay_peer_addr: Option<SocketAddr>,
+    remote_mesh_key: &Option<String>,
+    event_tx: &mpsc::UnboundedSender<RelayEvent>,
+) -> Option<HelloPayload> {
+    match msg {
+        MeshMessage::Hello(hello) => {
+            let site_name = if hello.site_name.is_empty() {
+                super::server::derive_site_name(&hello.server_name)
+            } else {
+                hello.site_name.clone()
+            };
+            let node_name = if hello.node_name.is_empty() {
+                derive_node_name(&hello.server_name)
+            } else {
+                hello.node_name.clone()
+            };
+            let _ = event_tx.send(RelayEvent::MeshHello {
+                remote_host: remote_host.to_string(),
+                peer_id: hello.peer_id.clone(),
+                server_name: hello.server_name.clone(),
+                public_key_hex: hello.public_key_hex.clone(),
+                spiral_index: hello.spiral_index,
+                vdf_genesis: hello.vdf_genesis.clone(),
+                vdf_hash: hello.vdf_hash.clone(),
+                vdf_step: hello.vdf_step,
+                yggdrasil_addr: hello.yggdrasil_addr.clone(),
+                site_name,
+                node_name,
+                vdf_resonance_credit: hello.vdf_resonance_credit,
+                vdf_actual_rate_hz: hello.vdf_actual_rate_hz,
+                ygg_peer_uri: hello.ygg_peer_uri.clone(),
+                relay_peer_addr,
+            });
+            Some(hello)
         }
-    }
-    // Slow path: accumulate items into size-capped chunks.
-    let mut chunk: Vec<&T> = Vec::new();
-    let mut chunk_bytes: usize = 2; // "[]"
-    for item in items {
-        let item_json = match serde_json::to_string(item) {
-            Ok(j) => j,
-            Err(_) => continue,
-        };
-        let added = if chunk.is_empty() { item_json.len() } else { item_json.len() + 1 };
-        if chunk_bytes + added > MAX_MESH_PAYLOAD && !chunk.is_empty() {
-            if let Ok(json) = serde_json::to_string(&chunk) {
-                let _ = relay.outgoing_tx.send(RelayCommand::Raw(Message {
-                    prefix: None,
-                    command: "MESH".into(),
-                    params: vec![subcommand.into(), json],
-                }));
-            }
-            chunk.clear();
-            chunk_bytes = 2;
+        MeshMessage::Peers { peers } => {
+            let _ = event_tx.send(RelayEvent::MeshPeers {
+                remote_host: remote_host.to_string(),
+                peers,
+            });
+            None
         }
-        chunk.push(item);
-        chunk_bytes += added;
-    }
-    if !chunk.is_empty() {
-        if let Ok(json) = serde_json::to_string(&chunk) {
-            let _ = relay.outgoing_tx.send(RelayCommand::Raw(Message {
-                prefix: None,
-                command: "MESH".into(),
-                params: vec![subcommand.into(), json],
-            }));
+        MeshMessage::VdfProofReq => {
+            let _ = event_tx.send(RelayEvent::MeshVdfProofReq {
+                remote_host: remote_host.to_string(),
+            });
+            None
+        }
+        MeshMessage::VdfProof { proof } => {
+            let _ = event_tx.send(RelayEvent::MeshVdfProof {
+                remote_host: remote_host.to_string(),
+                proof_json: proof.to_string(),
+                mesh_key: remote_mesh_key.clone(),
+            });
+            None
+        }
+        MeshMessage::Sync => {
+            let _ = event_tx.send(RelayEvent::MeshSync {
+                remote_host: remote_host.to_string(),
+            });
+            None
+        }
+        MeshMessage::Gossip { message } => {
+            let _ = event_tx.send(RelayEvent::GossipReceive {
+                remote_host: remote_host.to_string(),
+                message_json: message.to_string(),
+            });
+            None
+        }
+        MeshMessage::GossipSpore { data } => {
+            let _ = event_tx.send(RelayEvent::GossipSpore {
+                remote_host: remote_host.to_string(),
+                spore_json: data,
+            });
+            None
+        }
+        MeshMessage::GossipDiff { data } => {
+            let _ = event_tx.send(RelayEvent::GossipDiff {
+                remote_host: remote_host.to_string(),
+                messages_json: data,
+            });
+            None
+        }
+        MeshMessage::LatencyHave { data } => {
+            let _ = event_tx.send(RelayEvent::LatencyHaveList {
+                remote_host: remote_host.to_string(),
+                payload_b64: data,
+            });
+            None
+        }
+        MeshMessage::LatencyDelta { data } => {
+            let _ = event_tx.send(RelayEvent::LatencyProofDelta {
+                remote_host: remote_host.to_string(),
+                payload_b64: data,
+            });
+            None
         }
     }
 }
@@ -244,6 +321,12 @@ pub enum RelayCommand {
     PartChannel { remote_channel: String },
     /// Send a raw pre-formatted message on the relay connection (e.g. FRELAY DM).
     Raw(Message),
+    /// Send a native mesh protocol message (JSON over WebSocket).
+    ///
+    /// Used by the event processor for all mesh-related sends. Native inbound
+    /// handlers serialize directly to JSON; legacy outbound relay_tasks translate
+    /// to IRC `MESH {subcommand} {json}` lines.
+    SendMesh(MeshMessage),
     /// Send MESH HELLO after registration.
     MeshHello { json: String },
     /// Shut down the relay connection entirely.
@@ -826,29 +909,9 @@ pub fn spawn_event_processor(
                         .insert(mkey.clone(), MeshConnectionState::Connected);
 
                     // APE: dynamically peer with this node's Yggdrasil overlay.
-                    //
-                    // Strategy: prefer the UNDERLAY address (relay TCP peer IP on
-                    // port 9443) over the OVERLAY address from ygg_peer_uri.
-                    //
-                    // Why: The overlay address (`tcp://[200:xxxx::]:9443`) only
-                    // works if we're already on the Ygg overlay. For a fresh node
-                    // bootstrapping via anycast, we're NOT on the overlay yet.
-                    // But the IRC relay already has a TCP connection to a confirmed-
-                    // different node — use that IP as the underlay Ygg peer.
-                    //
-                    // DNS self-connection is impossible here because MESH HELLO
-                    // peer_id already verified this is a different node.
                     if let Some(ref ygg) = st.transport_config.ygg_node {
-                        // First try: underlay address from relay TCP peer.
-                        let underlay_uri = relay_peer_addr.map(|addr| {
-                            format!("tcp://[{}]:9443", addr.ip())
-                        });
-
-                        let uri_to_use = underlay_uri.as_deref()
-                            .or(ygg_peer_uri.as_deref());
-
-                        if let Some(uri) = uri_to_use {
-                            match ygg.add_peer(uri) {
+                        if let Some(uri) = ape_peer_uri(relay_peer_addr, ygg_peer_uri.as_deref()) {
+                            match ygg.add_peer(&uri) {
                                 Ok(()) => info!(
                                     uri,
                                     peer_id,
@@ -1024,18 +1087,19 @@ pub fn spawn_event_processor(
                         }
                     }
 
-                    // Send MESH PEERS to the newly connected peer (chunked).
-                    // Uses the relay handle (which now exists after reciprocal connect above).
+                    // Send PEERS to the newly connected peer.
+                    // No chunking needed — WebSocket has no size limit.
                     let peers_list: Vec<MeshPeerInfo> =
                         st.mesh.known_peers.values().cloned().collect();
                     if !peers_list.is_empty() {
                         if let Some(relay) = st.federation.relays.get(&remote_host) {
-                            send_chunked_mesh(relay, "PEERS", &peers_list);
+                            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                MeshMessage::Peers { peers: peers_list },
+                            ));
                         }
                     }
 
-                    // Send MESH LATENCY_HAVE — our proof SPORE for efficient delta sync.
-                    // Replaces monolithic MESH TOPOLOGY which overflows at 10+ nodes.
+                    // Send LATENCY_HAVE — our proof SPORE for efficient delta sync.
                     {
                         let spore_bytes = bincode::serialize(
                             st.mesh.proof_store.spore(),
@@ -1046,11 +1110,9 @@ pub fn spawn_event_processor(
                         let b64 = base64::engine::general_purpose::STANDARD
                             .encode(bincode::serialize(&sync_msg).unwrap_or_default());
                         if let Some(relay) = st.federation.relays.get(&remote_host) {
-                            let _ = relay.outgoing_tx.send(RelayCommand::Raw(Message {
-                                prefix: None,
-                                command: "MESH".into(),
-                                params: vec!["LATENCY_HAVE".into(), b64],
-                            }));
+                            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                MeshMessage::LatencyHave { data: b64 },
+                            ));
                         }
                     }
 
@@ -1060,11 +1122,9 @@ pub fn spawn_event_processor(
                         let our_spore = st.mesh.gossip.seen_messages();
                         if let Ok(spore_json) = serde_json::to_string(our_spore) {
                             if let Some(relay) = st.federation.relays.get(&remote_host) {
-                                let _ = relay.outgoing_tx.send(RelayCommand::Raw(Message {
-                                    prefix: None,
-                                    command: "MESH".into(),
-                                    params: vec!["GOSSIP_SPORE".into(), spore_json],
-                                }));
+                                let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                    MeshMessage::GossipSpore { data: spore_json },
+                                ));
                                 info!(
                                     remote_host,
                                     "gossip: sent SPORE HaveList to cluster peer for catch-up"
@@ -1236,7 +1296,9 @@ pub fn spawn_event_processor(
                     if !newly_discovered.is_empty() {
                         for (host, relay) in &st.federation.relays {
                             if *host != remote_host && relay.mesh_connected {
-                                send_chunked_mesh(relay, "PEERS", &newly_discovered);
+                                let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                    MeshMessage::Peers { peers: newly_discovered.clone() },
+                                ));
                             }
                         }
                         info!(
@@ -1473,13 +1535,11 @@ pub fn spawn_event_processor(
                             let proof =
                                 lagoon_vdf::VdfProof::generate_with_slot(&c, 3, spiral_slot);
                             drop(c);
-                            if let Ok(proof_json) = serde_json::to_string(&proof) {
+                            if let Ok(proof_val) = serde_json::to_value(&proof) {
                                 if let Some(relay) = st.federation.relays.get(&remote_host) {
-                                    let _ = relay.outgoing_tx.send(RelayCommand::Raw(Message {
-                                        prefix: None,
-                                        command: "MESH".into(),
-                                        params: vec!["VDFPROOF".into(), proof_json],
-                                    }));
+                                    let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                        MeshMessage::VdfProof { proof: proof_val },
+                                    ));
                                     info!(
                                         remote_host,
                                         steps = proof.steps,
@@ -1539,7 +1599,9 @@ pub fn spawn_event_processor(
                         st.mesh.known_peers.values().cloned().collect();
                     if !peers.is_empty() {
                         if let Some(relay) = st.federation.relays.get(&remote_host) {
-                            send_chunked_mesh(relay, "PEERS", &peers);
+                            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                MeshMessage::Peers { peers: peers.clone() },
+                            ));
                             info!(
                                 remote_host,
                                 peer_count = peers.len(),
@@ -1561,12 +1623,10 @@ pub fn spawn_event_processor(
                     for relay in st.federation.relays.values() {
                         if relay.mesh_connected {
                             for msg in &outbox {
-                                if let Ok(json) = serde_json::to_string(msg) {
-                                    let _ = relay.outgoing_tx.send(RelayCommand::Raw(Message {
-                                        prefix: None,
-                                        command: "MESH".into(),
-                                        params: vec!["GOSSIP".into(), json],
-                                    }));
+                                if let Ok(val) = serde_json::to_value(msg) {
+                                    let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                        MeshMessage::Gossip { message: val },
+                                    ));
                                 }
                             }
                         }
@@ -1587,13 +1647,13 @@ pub fn spawn_event_processor(
                             deliver_gossip_event(&st, &event);
 
                             // Re-gossip: forward to all OTHER connected relays.
-                            for (host, relay) in &st.federation.relays {
-                                if relay.mesh_connected && *host != remote_host {
-                                    let _ = relay.outgoing_tx.send(RelayCommand::Raw(Message {
-                                        prefix: None,
-                                        command: "MESH".into(),
-                                        params: vec!["GOSSIP".into(), message_json.clone()],
-                                    }));
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&message_json) {
+                                for (host, relay) in &st.federation.relays {
+                                    if relay.mesh_connected && *host != remote_host {
+                                        let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                            MeshMessage::Gossip { message: val.clone() },
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -1609,11 +1669,9 @@ pub fn spawn_event_processor(
                         if !diff_msgs.is_empty() {
                             if let Ok(batch_json) = serde_json::to_string(&diff_msgs) {
                                 if let Some(relay) = st.federation.relays.get(&remote_host) {
-                                    let _ = relay.outgoing_tx.send(RelayCommand::Raw(Message {
-                                        prefix: None,
-                                        command: "MESH".into(),
-                                        params: vec!["GOSSIP_DIFF".into(), batch_json],
-                                    }));
+                                    let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                        MeshMessage::GossipDiff { data: batch_json },
+                                    ));
                                     info!(
                                         remote_host,
                                         diff_count = diff_msgs.len(),
@@ -1833,18 +1891,18 @@ fn execute_latency_gossip_actions(
                 neighbor_node_name, message,
             } => (neighbor_node_name, message),
         };
-        let sub = match &message {
-            super::latency_gossip::SyncMessage::HaveList { .. } => "LATENCY_HAVE",
-            super::latency_gossip::SyncMessage::ProofDelta { .. } => "LATENCY_DELTA",
-        };
         let b64 = base64::engine::general_purpose::STANDARD
             .encode(bincode::serialize(&message).unwrap_or_default());
+        let mesh_msg = match &message {
+            super::latency_gossip::SyncMessage::HaveList { .. } => {
+                MeshMessage::LatencyHave { data: b64 }
+            }
+            super::latency_gossip::SyncMessage::ProofDelta { .. } => {
+                MeshMessage::LatencyDelta { data: b64 }
+            }
+        };
         if let Some(relay) = st.federation.relays.get(&node_name) {
-            let _ = relay.outgoing_tx.send(RelayCommand::Raw(Message {
-                prefix: None,
-                command: "MESH".into(),
-                params: vec![sub.into(), b64],
-            }));
+            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(mesh_msg));
         }
     }
 }
@@ -2533,6 +2591,14 @@ async fn relay_task(
                             pre_reg_cmds.push(RelayCommand::MeshHello { json });
                         }
                     }
+                    RelayCommand::SendMesh(mesh_msg) => {
+                        if registered {
+                            let irc_msg = mesh_message_to_irc(&mesh_msg);
+                            if framed.send(irc_msg).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
                     RelayCommand::Raw(raw_msg) => {
                         if registered {
                             if framed.send(raw_msg).await.is_err() {
@@ -2611,6 +2677,28 @@ struct MeshHelloPayload {
     /// Yggdrasil peer URI for overlay peering (e.g. `tcp://[200:xxxx::]:9443`).
     #[serde(default)]
     pub ygg_peer_uri: Option<String>,
+}
+
+/// Build a native `wire::HelloPayload` from server state (use inside read lock).
+///
+/// Public so that the inbound mesh handler (lagoon-web) can send our Hello.
+pub fn build_wire_hello(st: &super::server::ServerState) -> HelloPayload {
+    let hp = build_hello_payload(st);
+    HelloPayload {
+        peer_id: hp.peer_id,
+        server_name: hp.server_name,
+        public_key_hex: hp.public_key_hex,
+        spiral_index: hp.spiral_index,
+        vdf_genesis: hp.vdf_genesis,
+        vdf_hash: hp.vdf_hash,
+        vdf_step: hp.vdf_step,
+        yggdrasil_addr: hp.yggdrasil_addr,
+        site_name: hp.site_name,
+        node_name: hp.node_name,
+        vdf_resonance_credit: hp.vdf_resonance_credit,
+        vdf_actual_rate_hz: hp.vdf_actual_rate_hz,
+        ygg_peer_uri: hp.ygg_peer_uri,
+    }
 }
 
 /// Build a MeshHelloPayload from server state (use inside read lock).
@@ -2766,6 +2854,42 @@ pub fn spawn_mesh_connector(state: SharedState, transport_config: Arc<TransportC
             );
         }
     });
+}
+
+/// Translate a native `MeshMessage` into an IRC `MESH {subcommand} {json}` line.
+///
+/// Temporary backward compatibility for the old IRC-framed relay_task.
+/// This is deleted when the relay_task is rewritten for native WebSocket.
+fn mesh_message_to_irc(msg: &MeshMessage) -> Message {
+    let (sub, payload) = match msg {
+        MeshMessage::Hello(hello) => {
+            ("HELLO".into(), serde_json::to_string(hello).unwrap_or_default())
+        }
+        MeshMessage::Peers { peers } => {
+            ("PEERS".into(), serde_json::to_string(peers).unwrap_or_default())
+        }
+        MeshMessage::VdfProofReq => ("VDFPROOF_REQ".into(), String::new()),
+        MeshMessage::VdfProof { proof } => {
+            ("VDFPROOF".into(), proof.to_string())
+        }
+        MeshMessage::Sync => ("SYNC".into(), String::new()),
+        MeshMessage::Gossip { message } => {
+            ("GOSSIP".into(), message.to_string())
+        }
+        MeshMessage::GossipSpore { data } => ("GOSSIP_SPORE".into(), data.clone()),
+        MeshMessage::GossipDiff { data } => ("GOSSIP_DIFF".into(), data.clone()),
+        MeshMessage::LatencyHave { data } => ("LATENCY_HAVE".into(), data.clone()),
+        MeshMessage::LatencyDelta { data } => ("LATENCY_DELTA".into(), data.clone()),
+    };
+    let mut params = vec![sub];
+    if !payload.is_empty() {
+        params.push(payload);
+    }
+    Message {
+        prefix: None,
+        command: "MESH".into(),
+        params,
+    }
 }
 
 /// Send a FRELAY command to the remote server. Returns true on success.

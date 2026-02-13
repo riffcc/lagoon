@@ -3,6 +3,7 @@ mod bridge;
 mod communities;
 mod debug;
 mod invites;
+mod mesh;
 pub mod state;
 mod tls;
 mod topology;
@@ -32,8 +33,10 @@ fn build_router(state: AppState) -> Router {
         .route("/api/auth/me", get(auth::me))
         // WebSocket IRC bridge
         .route("/api/ws", get(bridge::ws_handler))
-        // Federation WebSocket tunnel (IRC-over-WS for CDN/proxy traversal)
+        // Federation WebSocket tunnel (IRC-over-WS for CDN/proxy traversal — legacy)
         .route("/api/federation/ws", get(bridge::federation_ws_handler))
+        // Native mesh WebSocket — JSON over WS, no IRC
+        .route("/api/mesh/ws", get(mesh::mesh_ws_handler))
         // Topology endpoints
         .route("/api/topology", get(topology::get_topology))
         .route("/api/topology/debug", get(topology::get_topology_debug))
@@ -65,7 +68,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let state = AppState::new()?;
     let app = build_router(state);
 
-    let use_tls = std::env::var("LAGOON_WEB_NO_TLS").is_err();
+    let use_tls = std::env::var("LAGOON_WEB_TLS").is_ok();
 
     if use_tls {
         serve_tls(app).await
@@ -130,7 +133,7 @@ pub async fn run_with_irc() -> Result<(), Box<dyn std::error::Error + Send + Syn
         }
     }
 
-    let use_tls = std::env::var("LAGOON_WEB_NO_TLS").is_err();
+    let use_tls = std::env::var("LAGOON_WEB_TLS").is_ok();
 
     if use_tls {
         serve_tls(app).await

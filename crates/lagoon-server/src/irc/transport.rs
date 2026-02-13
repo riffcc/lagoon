@@ -26,7 +26,7 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 use tracing::{info, warn};
 
 /// Default IRC port for federation relay connections.
-const DEFAULT_PORT: u16 = 6667;
+const DEFAULT_PORT: u16 = 443;
 
 /// Combined async read+write trait for type-erased transport streams.
 pub trait RelayTransport: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -261,6 +261,69 @@ pub struct ConnectResult {
 /// Web gateway port — the HTTP/WS server that lagoon-web runs on.
 /// Overlay connections use this for `ws://` federation.
 const WEB_GATEWAY_PORT: u16 = 8080;
+
+/// Which transport to use for a federation connection.
+///
+/// Determined by `select_transport()` from the peer's configuration.
+/// Priority: Ygg overlay (encrypted, no DNS) > TLS WebSocket (CDN) > plain TCP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportMode {
+    /// Ygg overlay → `ws://[200:xxxx]:8080/api/federation/ws` (or `/api/mesh/ws`).
+    /// Ygg encrypts the transport, no TLS needed.
+    YggOverlay { addr: Ipv6Addr },
+    /// TLS WebSocket → `wss://host:port/api/federation/ws`.
+    /// Survives CDN/proxy layers.
+    TlsWebSocket { host: String, port: u16 },
+    /// Plain TCP → direct IRC protocol.
+    PlainTcp { host: String, port: u16 },
+}
+
+/// Select the transport mode for connecting to a remote host.
+///
+/// Pure decision function — no I/O.  `connect()` calls this and then
+/// establishes the connection according to the result.
+///
+/// Priority:
+/// 1. **Ygg overlay** if we have an embedded Ygg node AND the peer has a known
+///    overlay address.
+/// 2. **TLS WebSocket** if the peer is configured with `tls: true` (port 443).
+/// 3. **Plain TCP** for everything else.
+pub fn select_transport(
+    remote_host: &str,
+    config: &TransportConfig,
+) -> TransportMode {
+    select_transport_inner(remote_host, &config.peers, config.ygg_node.is_some())
+}
+
+/// Inner logic for transport selection — testable without a real YggNode.
+pub fn select_transport_inner(
+    remote_host: &str,
+    peers: &HashMap<String, PeerEntry>,
+    has_ygg_node: bool,
+) -> TransportMode {
+    let peer = peers.get(remote_host);
+    let port = peer.map(|p| p.port).unwrap_or(DEFAULT_PORT);
+    let tls = peer.map(|p| p.tls).unwrap_or(false);
+    let ygg_addr = peer.and_then(|p| p.yggdrasil_addr);
+
+    if has_ygg_node {
+        if let Some(ygg_v6) = ygg_addr {
+            return TransportMode::YggOverlay { addr: ygg_v6 };
+        }
+    }
+
+    if tls {
+        return TransportMode::TlsWebSocket {
+            host: remote_host.to_string(),
+            port,
+        };
+    }
+
+    TransportMode::PlainTcp {
+        host: remote_host.to_string(),
+        port,
+    }
+}
 
 pub async fn connect(
     remote_host: &str,
@@ -582,12 +645,13 @@ fn parse_host_port(s: &str) -> (String, u16, bool) {
 
 /// Build transport configuration from environment and local system state.
 ///
-/// Reads `LAGOON_PEERS` env var for peer table entries.
+/// Reads `LAGOON_URL` for the WebSocket federation endpoint (CDN/reverse proxy).
+/// `LAGOON_PEERS` is for Yggdrasil underlay peering — handled by init_yggdrasil().
 ///
-/// Supported formats (comma-separated):
-/// - `host:443` — connect with TLS on port 443
-/// - `host` — connect plain TCP on port 6667
-/// - `host=200:addr` — Yggdrasil with explicit IPv6 address
+/// Supported LAGOON_URL formats (comma-separated):
+/// - `host.example.com` — WebSocket TLS on port 443
+/// - `host:443` — explicit port, TLS auto-detected from port 443
+/// - `host:6667` — plain TCP (legacy)
 pub fn build_config() -> TransportConfig {
     let mut config = TransportConfig::new();
 
@@ -597,19 +661,18 @@ pub fn build_config() -> TransportConfig {
         info!("transport: Yggdrasil connectivity detected (TUN/system)");
     }
 
-    if let Ok(peers_str) = std::env::var("LAGOON_PEERS") {
-        for entry in peers_str.split(',') {
+    // LAGOON_URL = WebSocket federation endpoint(s).
+    if let Ok(url_str) = std::env::var("LAGOON_URL") {
+        for entry in url_str.split(',') {
             let entry = entry.trim();
             if entry.is_empty() {
                 continue;
             }
             if let Some((host, peer_entry)) = parse_peer_entry(entry) {
                 if peer_entry.tls {
-                    info!(host, port = peer_entry.port, "transport: peer (TLS)");
-                } else if peer_entry.yggdrasil_addr.is_some() {
-                    info!(host, port = peer_entry.port, "transport: peer (Yggdrasil)");
+                    info!(host, port = peer_entry.port, "transport: federation endpoint (TLS)");
                 } else {
-                    info!(host, port = peer_entry.port, "transport: peer (plain TCP)");
+                    info!(host, port = peer_entry.port, "transport: federation endpoint (plain)");
                 }
                 config.peers.insert(host, peer_entry);
             }
@@ -682,7 +745,7 @@ mod tests {
     async fn resolve_direct_ipv4() {
         let config = TransportConfig::new();
         let addr = resolve("127.0.0.1", &config, DEFAULT_PORT).await.unwrap();
-        assert_eq!(addr, SocketAddr::new("127.0.0.1".parse().unwrap(), 6667));
+        assert_eq!(addr, SocketAddr::new("127.0.0.1".parse().unwrap(), 443));
     }
 
     #[tokio::test]
@@ -699,15 +762,15 @@ mod tests {
         );
 
         let addr = resolve("test.lagun.co", &config, DEFAULT_PORT).await.unwrap();
-        assert_eq!(addr, SocketAddr::new(IpAddr::V6(ygg), 6667));
+        assert_eq!(addr, SocketAddr::new(IpAddr::V6(ygg), 443));
     }
 
     #[test]
     fn parse_host_port_plain() {
         let (host, port, tls) = parse_host_port("lon.lagun.co");
         assert_eq!(host, "lon.lagun.co");
-        assert_eq!(port, 6667);
-        assert!(!tls);
+        assert_eq!(port, 443); // Default port is 443 (WebSocket behind CDN)
+        assert!(!tls); // No client-side TLS — CDN terminates
     }
 
     #[test]
@@ -739,7 +802,7 @@ mod tests {
     fn parse_peer_entry_plain() {
         let (host, entry) = parse_peer_entry("node2.mesh.lagun.co").unwrap();
         assert_eq!(host, "node2.mesh.lagun.co");
-        assert_eq!(entry.port, 6667);
+        assert_eq!(entry.port, 443); // Default port is 443 (WebSocket)
         assert!(!entry.tls);
         assert!(entry.yggdrasil_addr.is_none());
     }
@@ -749,7 +812,7 @@ mod tests {
         let (host, entry) =
             parse_peer_entry("per.lagun.co=201:6647:b411:52ad:a45a:fba5:efd1:cfe5").unwrap();
         assert_eq!(host, "per.lagun.co");
-        assert_eq!(entry.port, 6667);
+        assert_eq!(entry.port, 443); // Default port is 443 (WebSocket)
         assert!(!entry.tls);
         assert!(entry.yggdrasil_addr.is_some());
         assert!(is_yggdrasil_ipv6(&entry.yggdrasil_addr.unwrap()));
@@ -781,5 +844,118 @@ mod tests {
             url,
             "wss://[2a09:8280:5d::d2:e42f:0]:443/api/federation/ws"
         );
+    }
+
+    // ── Transport priority tests ─────────────────────────────────────
+
+    #[test]
+    fn select_transport_ygg_overlay_when_node_and_addr() {
+        let ygg: Ipv6Addr = "200:1234::1".parse().unwrap();
+        let mut peers = HashMap::new();
+        peers.insert(
+            "per.lagun.co".into(),
+            PeerEntry {
+                yggdrasil_addr: Some(ygg),
+                port: DEFAULT_PORT,
+                tls: false,
+            },
+        );
+        let mode = select_transport_inner("per.lagun.co", &peers, true);
+        assert_eq!(mode, TransportMode::YggOverlay { addr: ygg });
+    }
+
+    #[test]
+    fn select_transport_tls_ws_when_no_ygg_node() {
+        let ygg: Ipv6Addr = "200:1234::1".parse().unwrap();
+        let mut peers = HashMap::new();
+        peers.insert(
+            "per.lagun.co".into(),
+            PeerEntry {
+                yggdrasil_addr: Some(ygg),
+                port: 443,
+                tls: true,
+            },
+        );
+        // No ygg_node → falls through to TLS WS.
+        let mode = select_transport_inner("per.lagun.co", &peers, false);
+        assert_eq!(
+            mode,
+            TransportMode::TlsWebSocket {
+                host: "per.lagun.co".into(),
+                port: 443,
+            }
+        );
+    }
+
+    #[test]
+    fn select_transport_tls_ws_when_no_ygg_addr() {
+        let mut peers = HashMap::new();
+        peers.insert(
+            "lagun.co".into(),
+            PeerEntry {
+                yggdrasil_addr: None,
+                port: 443,
+                tls: true,
+            },
+        );
+        // ygg_node exists but peer has no ygg_addr → TLS WS.
+        let mode = select_transport_inner("lagun.co", &peers, true);
+        assert_eq!(
+            mode,
+            TransportMode::TlsWebSocket {
+                host: "lagun.co".into(),
+                port: 443,
+            }
+        );
+    }
+
+    #[test]
+    fn select_transport_plain_tcp_fallback() {
+        let mut peers = HashMap::new();
+        peers.insert(
+            "sanctuary.lon.riff.cc".into(),
+            PeerEntry {
+                yggdrasil_addr: None,
+                port: 6667,
+                tls: false,
+            },
+        );
+        let mode = select_transport_inner("sanctuary.lon.riff.cc", &peers, false);
+        assert_eq!(
+            mode,
+            TransportMode::PlainTcp {
+                host: "sanctuary.lon.riff.cc".into(),
+                port: 6667,
+            }
+        );
+    }
+
+    #[test]
+    fn select_transport_unknown_peer_defaults_to_plain() {
+        let peers = HashMap::new();
+        let mode = select_transport_inner("unknown.host", &peers, true);
+        assert_eq!(
+            mode,
+            TransportMode::PlainTcp {
+                host: "unknown.host".into(),
+                port: DEFAULT_PORT,
+            }
+        );
+    }
+
+    #[test]
+    fn select_transport_ygg_overlay_takes_priority_over_tls() {
+        let ygg: Ipv6Addr = "201:abcd::1".parse().unwrap();
+        let mut peers = HashMap::new();
+        peers.insert(
+            "lon.lagun.co".into(),
+            PeerEntry {
+                yggdrasil_addr: Some(ygg),
+                port: 443,
+                tls: true, // would be TLS WS, but Ygg overlay wins
+            },
+        );
+        let mode = select_transport_inner("lon.lagun.co", &peers, true);
+        assert_eq!(mode, TransportMode::YggOverlay { addr: ygg });
     }
 }

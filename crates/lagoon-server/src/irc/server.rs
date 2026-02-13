@@ -971,39 +971,19 @@ async fn accept_loop(
 
 /// Initialize the embedded Yggdrasil node from the Lens identity key.
 ///
-/// Initialize the embedded Yggdrasil node.
+/// Ygg always starts with an **empty peer list**.  `LAGOON_PEERS` are WebSocket
+/// bootstrap targets (e.g. `lagun.co:443`), NOT Ygg underlay peers.  APE
+/// populates Ygg peers dynamically: after MESH HELLO, the event processor
+/// calls `ygg.add_peer(ygg_peer_uri)` to connect to the remote's underlay.
 ///
-/// Starts if `YGG_PEERS` is set (with optional peer URIs) OR if `LAGOON_YGG=1`.
-/// With `LAGOON_YGG=1` and no `YGG_PEERS`, the node starts with an empty peer
-/// list — peers are added dynamically via APE (Anycast Peer Entry) when MESH
-/// HELLO messages arrive carrying `ygg_peer_uri` fields.
+/// Triggered by: `LAGOON_PEERS` is set (federation bootstrap targets exist),
+/// or `LAGOON_YGG=1` (explicit enable).
 ///
-/// Returns `None` if neither env var is set or initialization fails.
+/// Returns `None` if neither is set or initialization fails.
 fn init_yggdrasil(lens: &super::lens::LensIdentity) -> Option<yggbridge::YggNode> {
-    let ygg_peers_str = std::env::var("YGG_PEERS").ok();
-    let lagoon_peers = std::env::var("LAGOON_PEERS").ok();
-
-    // Start Ygg if any of these are set:
-    //  1. YGG_PEERS → explicit Ygg bootstrap peers
-    //  2. LAGOON_PEERS → start with EMPTY peers (APE populates from relay TCP)
-    //  3. LAGOON_YGG=1 → explicit enable, empty peers
-    //
-    // NEVER derive Ygg peers from DNS hostnames — Fly `.internal` (and any
-    // shared DNS) returns the local machine first, causing self-connection
-    // loops.  APE uses the relay's TCP peer address (confirmed different node)
-    // to bootstrap onto the overlay.
-    let has_lagoon_peers = lagoon_peers.as_ref().is_some_and(|s| !s.trim().is_empty());
-    let ygg_explicit = std::env::var("LAGOON_YGG").ok().is_some_and(|v| v == "1");
-
-    if ygg_peers_str.is_none() && !has_lagoon_peers && !ygg_explicit {
+    if !should_start_yggdrasil() {
         return None;
     }
-
-    let peers: Vec<String> = ygg_peers_str
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(String::from)
-        .collect();
 
     // Build 64-byte Ed25519 private key from 32-byte seed.
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&lens.secret_seed);
@@ -1013,21 +993,15 @@ fn init_yggdrasil(lens: &super::lens::LensIdentity) -> Option<yggbridge::YggNode
 
     let listen = vec!["tcp://[::]:9443".to_string()];
 
-    match yggbridge::YggNode::new(&private_key, &peers, &listen) {
+    // Always start with empty peers — APE populates from MESH HELLO.
+    let empty_peers: Vec<String> = vec![];
+
+    match yggbridge::YggNode::new(&private_key, &empty_peers, &listen) {
         Ok(node) => {
-            if peers.is_empty() {
-                info!(
-                    address = %node.address(),
-                    "Yggdrasil started with empty peer list — APE will populate peers"
-                );
-            } else {
-                info!(
-                    address = %node.address(),
-                    peer_count = peers.len(),
-                    peers = ?peers,
-                    "Yggdrasil started (bootstrap from LAGOON_PEERS)"
-                );
-            }
+            info!(
+                address = %node.address(),
+                "Yggdrasil started with empty peer list — APE will populate peers"
+            );
             Some(node)
         }
         Err(e) => {
@@ -1035,6 +1009,20 @@ fn init_yggdrasil(lens: &super::lens::LensIdentity) -> Option<yggbridge::YggNode
             None
         }
     }
+}
+
+/// Determine whether Yggdrasil should be started.
+///
+/// Returns `true` if `LAGOON_PEERS` is set (federation bootstrap targets exist)
+/// or `LAGOON_YGG=1` (explicit enable).
+pub fn should_start_yggdrasil() -> bool {
+    let has_lagoon_peers = std::env::var("LAGOON_PEERS")
+        .ok()
+        .is_some_and(|s| !s.trim().is_empty());
+    let ygg_explicit = std::env::var("LAGOON_YGG")
+        .ok()
+        .is_some_and(|v| v == "1");
+    has_lagoon_peers || ygg_explicit
 }
 
 /// Per-connection state during registration.
@@ -3113,11 +3101,9 @@ async fn handle_command(
                     .count();
                 for relay in st.federation.relays.values() {
                     if relay.mesh_connected {
-                        let _ = relay.outgoing_tx.send(federation::RelayCommand::Raw(Message {
-                            prefix: None,
-                            command: "MESH".into(),
-                            params: vec!["SYNC".into()],
-                        }));
+                        let _ = relay.outgoing_tx.send(federation::RelayCommand::SendMesh(
+                            super::wire::MeshMessage::Sync,
+                        ));
                     }
                 }
                 drop(st);

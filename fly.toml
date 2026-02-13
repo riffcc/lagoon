@@ -5,8 +5,6 @@ primary_region = 'lhr'
   dockerfile = 'Dockerfile'
 
 [env]
-  LAGOON_EMBEDDED = '1'
-  LAGOON_WEB_NO_TLS = '1'
   LAGOON_WEB_ADDR = '0.0.0.0:8080'
   LAGOON_IRC_BIND = '[::]:6667'
   LAGOON_IRC_ADDR = '127.0.0.1:6667'
@@ -14,8 +12,8 @@ primary_region = 'lhr'
   SERVER_NAME = 'lagun.co'
   LAGOON_FULL_TELEMETRY = '1'
   RUST_LOG = 'info,lagoon_server::irc::federation=debug,lagoon_server::irc::transport=debug'
-  LAGOON_YGG = '1'
-  LAGOON_PEERS = 'lagun.co:443'
+  LAGOON_URL = 'anycast-mesh.fly.dev:443'
+  LAGOON_PEERS = '66.241.125.195:9443'
 
 [http_service]
   internal_port = 8080

@@ -37,7 +37,7 @@ pub struct AppState {
     pub irc_state: Option<SharedState>,
     /// Mesh topology watch channel receiver.
     pub mesh_watch: Option<watch::Receiver<MeshSnapshot>>,
-    /// True when running in embedded gateway mode (LAGOON_EMBEDDED=1).
+    /// True when running in embedded mode (default).
     /// All clients are web gateway users — their IPs are meaningless.
     pub gateway_mode: bool,
 }
