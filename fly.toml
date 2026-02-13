@@ -24,6 +24,13 @@ primary_region = 'lhr'
   auto_stop_machines = 'stop'
   min_machines_running = 3
 
+[[services]]
+  internal_port = 9443
+  protocol = 'tcp'
+
+  [[services.ports]]
+    port = 9443
+
 [[vm]]
   cpu_kind = 'shared'
   cpus = 1
