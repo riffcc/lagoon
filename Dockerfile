@@ -29,7 +29,7 @@ RUN npm run build
 
 # Stage 3: Runtime
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 COPY --from=rust-build /build/target/release/lagoon /usr/local/bin/lagoon
 COPY --from=rust-build /build/target/release/lagoon-web /usr/local/bin/lagoon-web
