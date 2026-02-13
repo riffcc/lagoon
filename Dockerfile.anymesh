@@ -1,0 +1,5 @@
+FROM debian:bookworm-slim
+COPY target/release/anymesh /usr/local/bin/anymesh
+ENV PORT="42105"
+EXPOSE 42105
+ENTRYPOINT ["anymesh"]

@@ -31,7 +31,7 @@ function nodeColor(node) {
 }
 
 function nodeLabel(node) {
-  if (node.node_type === 'browser') return node.lens_id.replace('web/', '')
+  if (node.node_type === 'browser') return node.mesh_key.replace('web/', '')
   return node.server_name
 }
 
@@ -96,9 +96,9 @@ function linkTooltip(link) {
 // Two-layer link rendering (SPIRAL structural + relay data links)
 // ---------------------------------------------------------------------------
 
-/** Link width by type: thin structural for spiral, metric-based for relay. */
+/** Link width by type: spiral neighbors are prominent, proof is thinner. */
 function linkWidthByType(link) {
-  if (link.link_type === 'spiral') return 0.8
+  if (link.link_type === 'spiral') return 2.0
   if (link.link_type === 'proof') return 1.0
   return linkWidthByUpload(link)
 }
@@ -113,32 +113,44 @@ function linkColorByLatency(link) {
   return lerpColor('#e0af68', '#f7768e', (t - 0.5) * 2)         // yellow → red
 }
 
-/** Link color by type: very muted for spiral, latency-based for relay. */
+/** Link color by type: spiral uses latency coloring, relay falls back to download. */
 function linkColorByType(link) {
-  if (link.link_type === 'spiral') return '#3b4261'
-  // Prefer latency color for relay links; fall back to download-based.
+  // SPIRAL links carry real metrics now — color by latency like relay.
+  if (link.link_type === 'spiral') {
+    if (link.latency_ms && link.latency_ms > 0) return linkColorByLatency(link)
+    return '#7aa2f7' // Blue for spiral without latency data
+  }
   if (link.latency_ms && link.latency_ms > 0) return linkColorByLatency(link)
   return linkColorByDownload(link)
 }
 
-/** Link opacity by type: faint for spiral, dimmer for proof, normal for relay. */
+/** Link opacity by type: spiral prominent, proof dimmer, relay normal. */
 function linkOpacityByType(link) {
-  if (link.link_type === 'spiral') return 0.3
+  if (link.link_type === 'spiral') return 0.7
   if (link.link_type === 'proof') return 0.4
-  return 0.6
+  return 0.5
 }
 
-/** Configure d3 link force distance based on latency (PoLP).
- *  Link length reflects measured RTT: short = low latency, long = high latency. */
-function configureLinkDistance(g) {
+/** Configure d3 forces for latency-proportional layout (PoLP).
+ *  Link length reflects measured RTT: short = low latency, long = high latency.
+ *  Strong charge repulsion prevents nodes from bunching up on LAN. */
+function configureForces(g) {
+  // Charge: strong repulsion so LAN nodes don't collapse into a dot.
+  const charge = g.d3Force('charge')
+  if (charge && charge.strength) {
+    charge.strength(-300)
+    charge.distanceMax(800)
+  }
+
+  // Link distance: log-scaled from RTT so sub-ms LAN links still spread out.
   const linkForce = g.d3Force('link')
   if (linkForce && linkForce.distance) {
     linkForce.distance(link => {
       if (link.latency_ms && link.latency_ms > 0) {
-        // Scale: 1ms → 30px, 500ms → 500px
-        return Math.max(30, Math.min(500, link.latency_ms))
+        // Log scale: 0.1ms → 80px, 1ms → 120px, 10ms → 160px, 100ms → 200px, 1000ms → 240px
+        return 80 + 40 * Math.log10(Math.max(0.1, link.latency_ms))
       }
-      return 100 // Default for links without latency data
+      return 150 // Default for links without latency data
     })
   }
 }
@@ -170,7 +182,7 @@ async function try3D() {
       .nodeLabel(node => {
         const label = nodeLabel(node)
         if (node.node_type === 'browser') return label
-        return `${label}\n${node.lens_id.substring(0, 16)}...`
+        return `${label}\n${node.mesh_key.substring(0, 16)}...`
       })
       .nodeColor(nodeColor)
       .nodeVal(node => node.is_self ? 4 : node.node_type === 'browser' ? 1 : 2)
@@ -202,7 +214,7 @@ async function try3D() {
         if (!isBrowser) {
           ctx.font = '14px monospace'
           ctx.fillStyle = '#565f89'
-          ctx.fillText(node.lens_id.substring(5, 21) + '...', 128, 52)
+          ctx.fillText(node.mesh_key.substring(5, 21) + '...', 128, 52)
         }
 
         const texture = new THREE.CanvasTexture(canvas)
@@ -213,7 +225,7 @@ async function try3D() {
         group.add(sprite)
         return group
       })
-      .linkDirectionalParticles(link => link.link_type === 'relay' ? 2 : 0)
+      .linkDirectionalParticles(link => (link.link_type === 'relay' || link.link_type === 'spiral') ? 2 : 0)
       .linkDirectionalParticleSpeed(link => {
         if (link.latency_ms && link.latency_ms > 0) {
           return Math.max(0.001, 0.02 / Math.max(1, link.latency_ms / 10))
@@ -223,8 +235,8 @@ async function try3D() {
       .linkDirectionalParticleWidth(1.5)
       .linkDirectionalParticleColor(link => linkColorByType(link))
 
-    // Latency-based link distance.
-    configureLinkDistance(g)
+    // Force layout: repulsion + latency-proportional link distance.
+    configureForces(g)
 
     graph = g
     mode.value = '3d'
@@ -252,7 +264,7 @@ async function try2D() {
     .nodeLabel(node => {
       const label = nodeLabel(node)
       if (node.node_type === 'browser') return label
-      return `${label}\n${node.lens_id.substring(0, 16)}...`
+      return `${label}\n${node.mesh_key.substring(0, 16)}...`
     })
     .nodeColor(nodeColor)
     .nodeVal(node => node.is_self ? 6 : node.node_type === 'browser' ? 1.5 : 3)
@@ -295,7 +307,7 @@ async function try2D() {
         const smallSize = Math.max(9 / globalScale, 2)
         ctx.font = `${smallSize}px monospace`
         ctx.fillStyle = '#565f89'
-        ctx.fillText(node.lens_id.substring(5, 21) + '...', node.x, node.y + size + 2 + fontSize + 1)
+        ctx.fillText(node.mesh_key.substring(5, 21) + '...', node.x, node.y + size + 2 + fontSize + 1)
       }
     })
     .nodePointerAreaPaint((node, color, ctx) => {
@@ -306,7 +318,7 @@ async function try2D() {
       ctx.fillStyle = color
       ctx.fill()
     })
-    .linkDirectionalParticles(link => link.link_type === 'relay' ? 2 : 0)
+    .linkDirectionalParticles(link => (link.link_type === 'relay' || link.link_type === 'spiral') ? 2 : 0)
     .linkDirectionalParticleSpeed(link => {
       if (link.latency_ms && link.latency_ms > 0) {
         return Math.max(0.001, 0.02 / Math.max(1, link.latency_ms / 10))
@@ -317,7 +329,7 @@ async function try2D() {
     .linkDirectionalParticleColor(link => linkColorByType(link))
 
   // Latency-based link distance.
-  configureLinkDistance(g)
+  configureForces(g)
 
   graph = g
   mode.value = '2d'
@@ -355,7 +367,7 @@ function updateGraph(snapshot) {
   const currentLinkMap = new Map(current.links.map(l => [linkKey(l), l]))
 
   // Incoming node/link sets.
-  const incomingNodeIds = new Set(snapshot.nodes.map(n => n.lens_id))
+  const incomingNodeIds = new Set(snapshot.nodes.map(n => n.mesh_key))
   const incomingLinks = snapshot.links.map(l => ({
     source: l.source,
     target: l.target,
@@ -370,11 +382,11 @@ function updateGraph(snapshot) {
 
   // --- Update or add nodes ---
   for (const n of snapshot.nodes) {
-    const existing = currentNodeMap.get(n.lens_id)
+    const existing = currentNodeMap.get(n.mesh_key)
     if (existing) {
       // Mutate in-place — no simulation reset.
       existing.server_name = n.server_name
-      existing.lens_id = n.lens_id
+      existing.mesh_key = n.mesh_key
       existing.is_self = n.is_self
       existing.connected = n.connected
       existing.node_type = n.node_type || 'server'
@@ -426,11 +438,11 @@ function updateGraph(snapshot) {
   if (structureChanged) {
     const nodes = snapshot.nodes.map(n => {
       // Preserve existing position for nodes that already exist.
-      const prev = currentNodeMap.get(n.lens_id)
+      const prev = currentNodeMap.get(n.mesh_key)
       const base = {
-        id: n.lens_id,
+        id: n.mesh_key,
         server_name: n.server_name,
-        lens_id: n.lens_id,
+        mesh_key: n.mesh_key,
         is_self: n.is_self,
         connected: n.connected,
         node_type: n.node_type || 'server',
@@ -448,7 +460,7 @@ function updateGraph(snapshot) {
     })
 
     graph.graphData({ nodes, links: incomingLinks })
-    configureLinkDistance(graph)
+    configureForces(graph)
   }
 }
 

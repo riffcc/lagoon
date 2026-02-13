@@ -1,11 +1,17 @@
 # Stage 1: Build Rust binaries
 FROM rust:1-bookworm AS rust-build
 
+# Install Go (needed by yggbridge crate's build.rs)
+RUN curl -fsSL https://go.dev/dl/go1.23.6.linux-amd64.tar.gz | tar -C /usr/local -xzf -
+ENV PATH="/usr/local/go/bin:${PATH}"
+
 # Clone citadel (path dependency) at the same absolute path Cargo.toml expects
 RUN git clone --depth 1 -b zorlin/v2-rewrite https://github.com/rifflabs/citadel.git \
     /mnt/riffcastle/lagun-project/citadel
 
 WORKDIR /build
+# Cache-bust arg: pass --build-arg CACHEBUST=$(date +%s) to force rebuild
+ARG CACHEBUST=0
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 # Remove web frontend source — we build that separately
@@ -30,18 +36,6 @@ COPY --from=rust-build /build/target/release/lagoon-web /usr/local/bin/lagoon-we
 COPY --from=web-build /build/dist/ /opt/lagoon-web/web/dist/
 
 WORKDIR /opt/lagoon-web
-
-# Embedded mode: lagoon-web runs with IRC server built-in.
-# No external IRC port — all access via web gateway only.
-ENV LAGOON_EMBEDDED=1
-ENV LAGOON_WEB_NO_TLS=1
-ENV LAGOON_WEB_ADDR=0.0.0.0:8080
-ENV LAGOON_IRC_ADDR=127.0.0.1:6667
-ENV LAGOON_DATA_DIR=/data
-ENV LAGOON_PEERS=lon.lagun.co:443
-ENV SERVER_NAME=lagun.co
-ENV LAGOON_FULL_TELEMETRY=1
-ENV RUST_LOG=info
 
 EXPOSE 8080
 

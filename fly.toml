@@ -1,0 +1,30 @@
+app = 'anycast-mesh'
+primary_region = 'lhr'
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  LAGOON_EMBEDDED = '1'
+  LAGOON_WEB_NO_TLS = '1'
+  LAGOON_WEB_ADDR = '0.0.0.0:8080'
+  LAGOON_IRC_BIND = '[::]:6667'
+  LAGOON_IRC_ADDR = '127.0.0.1:6667'
+  LAGOON_DATA_DIR = '/data'
+  SERVER_NAME = 'lagun.co'
+  LAGOON_FULL_TELEMETRY = '1'
+  RUST_LOG = 'info,lagoon_server::irc::federation=debug,lagoon_server::irc::transport=debug'
+  LAGOON_YGG = '1'
+  LAGOON_PEERS = 'lagun.co:443'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = 'stop'
+  min_machines_running = 3
+
+[[vm]]
+  cpu_kind = 'shared'
+  cpus = 1
+  memory_mb = 256
