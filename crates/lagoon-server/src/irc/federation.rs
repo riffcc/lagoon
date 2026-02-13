@@ -1321,30 +1321,39 @@ pub fn spawn_event_processor(
                     // remote_node_name), shut down the non-bootstrap one.
                     // Handles the race where an inbound HELLO created a reciprocal
                     // before the outbound relay's HELLO identified the same node.
-                    let dupe_key: Option<String> = st.federation.relays.iter()
-                        .find(|(k, r)| {
-                            *k != &remote_host
-                                && r.remote_node_name.as_deref() == Some(node_name.as_str())
-                        })
-                        .map(|(k, _)| k.clone());
-                    if let Some(dupe) = dupe_key {
-                        let dupe_is_bootstrap = st.federation.relays
-                            .get(&dupe).map_or(false, |r| r.is_bootstrap);
-                        let this_is_bootstrap = st.federation.relays
-                            .get(&remote_host).map_or(false, |r| r.is_bootstrap);
-                        // Keep the bootstrap relay; remove the reciprocal.
-                        let remove_key = if dupe_is_bootstrap && !this_is_bootstrap {
-                            remote_host.clone()
-                        } else {
-                            dupe
-                        };
-                        if let Some(removed) = st.federation.relays.remove(&remove_key) {
-                            info!(
-                                removed = %remove_key,
-                                node_name,
-                                "mesh: deduplicating — two connections to same node"
-                            );
-                            let _ = removed.outgoing_tx.send(RelayCommand::Shutdown);
+                    //
+                    // Skip dedup in small clusters: with anycast, killing
+                    // an inbound relay causes the remote's outbound to
+                    // reconnect → new inbound → dedup → kill cascade.
+                    // Two connections to the same node is harmless. Only
+                    // dedup when we have enough relays that waste matters.
+                    let total_relays = st.federation.relays.len();
+                    if total_relays > 6 {
+                        let dupe_key: Option<String> = st.federation.relays.iter()
+                            .find(|(k, r)| {
+                                *k != &remote_host
+                                    && r.remote_node_name.as_deref() == Some(node_name.as_str())
+                            })
+                            .map(|(k, _)| k.clone());
+                        if let Some(dupe) = dupe_key {
+                            let dupe_is_bootstrap = st.federation.relays
+                                .get(&dupe).map_or(false, |r| r.is_bootstrap);
+                            let this_is_bootstrap = st.federation.relays
+                                .get(&remote_host).map_or(false, |r| r.is_bootstrap);
+                            // Keep the bootstrap relay; remove the reciprocal.
+                            let remove_key = if dupe_is_bootstrap && !this_is_bootstrap {
+                                remote_host.clone()
+                            } else {
+                                dupe
+                            };
+                            if let Some(removed) = st.federation.relays.remove(&remove_key) {
+                                info!(
+                                    removed = %remove_key,
+                                    node_name,
+                                    "mesh: deduplicating — two connections to same node"
+                                );
+                                let _ = removed.outgoing_tx.send(RelayCommand::Shutdown);
+                            }
                         }
                     }
                 }
