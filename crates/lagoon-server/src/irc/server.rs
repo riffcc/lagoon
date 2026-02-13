@@ -170,8 +170,9 @@ impl MemberPrefix {
 /// Information about a known mesh peer.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct MeshPeerInfo {
-    /// Lens PeerID (`"b3b3/{hex}"`).
-    pub lens_id: String,
+    /// Cryptographic PeerID (`"b3b3/{hex}"`) — per-node identity derived from Ed25519 key.
+    #[serde(alias = "lens_id")]
+    pub peer_id: String,
     /// The peer's server name (e.g. `"per.lagun.co"`).
     pub server_name: String,
     /// Hex-encoded ed25519 public key.
@@ -206,6 +207,15 @@ pub struct MeshPeerInfo {
     /// Node identity within site (derived from server_name if absent).
     #[serde(default)]
     pub node_name: String,
+    /// Resonance credit — how precisely this peer tracks its target VDF rate [0, 1].
+    #[serde(default)]
+    pub vdf_resonance_credit: Option<f64>,
+    /// Actual measured VDF tick rate (Hz, exponential moving average).
+    #[serde(default)]
+    pub vdf_actual_rate_hz: Option<f64>,
+    /// Yggdrasil peer URI for overlay peering (e.g. `tcp://[200:xxxx::]:9443`).
+    #[serde(default)]
+    pub ygg_peer_uri: Option<String>,
 }
 
 fn default_peer_port() -> u16 {
@@ -215,7 +225,7 @@ fn default_peer_port() -> u16 {
 impl Default for MeshPeerInfo {
     fn default() -> Self {
         Self {
-            lens_id: String::new(),
+            peer_id: String::new(),
             server_name: String::new(),
             public_key_hex: String::new(),
             port: 6667,
@@ -228,6 +238,9 @@ impl Default for MeshPeerInfo {
             yggdrasil_addr: None,
             site_name: String::new(),
             node_name: String::new(),
+            vdf_resonance_credit: None,
+            vdf_actual_rate_hz: None,
+            ygg_peer_uri: None,
         }
     }
 }
@@ -244,9 +257,9 @@ pub enum MeshConnectionState {
 /// Mesh networking state — tracks known peers and their connections.
 #[derive(Debug)]
 pub struct MeshState {
-    /// Known peers: LensID → peer info.
+    /// Known peers: mesh_key (`"{site_name}/{node_name}"`) → peer info.
     pub known_peers: HashMap<String, MeshPeerInfo>,
-    /// Connection state per lens_id (NOT server_name — multiple peers may share a name).
+    /// Connection state per mesh_key (2D identity: site + node).
     pub connections: HashMap<String, MeshConnectionState>,
     /// Defederated LensIDs or server names — blocked from mesh.
     pub defederated: HashSet<String>,
@@ -260,7 +273,7 @@ pub struct MeshState {
     pub vdf_state_rx: Option<watch::Receiver<super::vdf::VdfState>>,
     /// VDF chain — shared with engine for ZK proof generation on demand.
     pub vdf_chain: Option<Arc<RwLock<lagoon_vdf::VdfChain>>>,
-    /// Yggdrasil admin socket metrics store.
+    /// Yggdrasil peer metrics store (populated from embedded Ygg node).
     pub ygg_metrics: super::yggdrasil::YggMetricsStore,
     /// SPORE gossip router for mesh-wide message replication.
     pub gossip: super::gossip::GossipRouter,
@@ -271,7 +284,7 @@ pub struct MeshState {
 }
 
 impl MeshState {
-    pub fn new(public_key_bytes: &[u8; 32], our_peer_id: &str) -> Self {
+    pub fn new(public_key_bytes: &[u8; 32], our_mesh_key: &str) -> Self {
         Self {
             known_peers: HashMap::new(),
             connections: HashMap::new(),
@@ -285,7 +298,7 @@ impl MeshState {
             gossip: super::gossip::GossipRouter::new(public_key_bytes),
             proof_store: super::proof_store::ProofStore::new(300_000), // 5 min TTL
             latency_gossip: super::latency_gossip::LatencyGossip::new(
-                our_peer_id.to_owned(),
+                our_mesh_key.to_owned(),
                 10_000, // 10s sync interval
             ),
         }
@@ -295,7 +308,9 @@ impl MeshState {
 /// A single node in a mesh topology snapshot.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct MeshNodeReport {
-    pub lens_id: String,
+    /// Globally unique mesh key: `"{site_name}/{node_name}"`.
+    #[serde(alias = "lens_id")]
+    pub mesh_key: String,
     pub server_name: String,
     pub is_self: bool,
     pub connected: bool,
@@ -353,7 +368,8 @@ fn default_link_type() -> String {
 /// Complete mesh topology snapshot — pushed via watch channel.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct MeshSnapshot {
-    pub self_lens_id: String,
+    #[serde(alias = "self_lens_id")]
+    pub self_mesh_key: String,
     pub self_server_name: String,
     #[serde(default)]
     pub self_site_name: String,
@@ -365,7 +381,7 @@ pub struct MeshSnapshot {
 impl MeshSnapshot {
     pub fn empty() -> Self {
         Self {
-            self_lens_id: String::new(),
+            self_mesh_key: String::new(),
             self_server_name: String::new(),
             self_site_name: String::new(),
             nodes: Vec::new(),
@@ -496,10 +512,13 @@ impl ServerState {
         let mut nodes = Vec::new();
         let mut links = Vec::new();
 
+        // Our identity = peer_id (public key).
+        let our_pid = self.lens.peer_id.clone();
+
         // Add self.
         let our_vdf_step = self.mesh.vdf_state_rx.as_ref().map(|rx| rx.borrow().total_steps);
         nodes.push(MeshNodeReport {
-            lens_id: self.lens.peer_id.clone(),
+            mesh_key: our_pid.clone(),
             server_name: self.lens.server_name.clone(),
             is_self: true,
             connected: true,
@@ -513,30 +532,30 @@ impl ServerState {
         });
 
         // Add known peers.
-        for (lens_id, peer_info) in &self.mesh.known_peers {
+        for (mkey, peer_info) in &self.mesh.known_peers {
             let connected = self
                 .mesh
                 .connections
-                .get(lens_id)
+                .get(mkey)
                 .copied()
                 == Some(MeshConnectionState::Connected);
             nodes.push(MeshNodeReport {
-                lens_id: lens_id.clone(),
+                mesh_key: mkey.clone(),
                 server_name: peer_info.server_name.clone(),
                 is_self: false,
                 connected,
                 node_type: "server".into(),
                 spiral_index: peer_info.spiral_index,
-                is_spiral_neighbor: self.mesh.spiral.is_neighbor(lens_id),
+                is_spiral_neighbor: self.mesh.spiral.is_neighbor(mkey),
                 vdf_step: peer_info.vdf_step,
-                spiral_coord: self.mesh.spiral.peer_world_coord(lens_id),
+                spiral_coord: self.mesh.spiral.peer_world_coord(mkey),
                 site_name: peer_info.site_name.clone(),
                 node_name: peer_info.node_name.clone(),
             });
             if connected {
                 // Latency priority: proof_store → relay PING/PONG → Yggdrasil.
                 let proof_rtt = self.mesh.proof_store
-                    .get(&self.lens.peer_id, lens_id)
+                    .get(&our_pid, mkey)
                     .map(|e| e.rtt_ms);
                 let relay_rtt = self.federation.relays.get(&peer_info.node_name)
                     .and_then(|r| r.last_rtt_ms);
@@ -551,13 +570,20 @@ impl ServerState {
                 let download_bps = ygg.map(|m| m.download_bps);
                 let latency_ms = proof_rtt.or(relay_rtt).or(ygg.map(|m| m.latency_ms));
 
+                // SPIRAL neighbors get "spiral" link_type so the visualization
+                // can render the overlay structure distinctly.
+                let lt = if self.mesh.spiral.is_neighbor(mkey) {
+                    "spiral"
+                } else {
+                    "relay"
+                };
                 links.push(MeshLinkReport {
-                    source: self.lens.peer_id.clone(),
-                    target: lens_id.clone(),
+                    source: our_pid.clone(),
+                    target: mkey.clone(),
                     upload_bps,
                     download_bps,
                     latency_ms,
-                    link_type: "relay".into(),
+                    link_type: lt.into(),
                 });
             }
         }
@@ -565,7 +591,7 @@ impl ServerState {
         // Add web gateway clients.
         for web_nick in &self.mesh.web_clients {
             nodes.push(MeshNodeReport {
-                lens_id: format!("web/{web_nick}"),
+                mesh_key: format!("web/{web_nick}"),
                 server_name: self.lens.server_name.clone(),
                 is_self: false,
                 connected: true,
@@ -578,7 +604,7 @@ impl ServerState {
                 node_name: self.lens.node_name.clone(),
             });
             links.push(MeshLinkReport {
-                source: self.lens.peer_id.clone(),
+                source: our_pid.clone(),
                 target: format!("web/{web_nick}"),
                 upload_bps: None,
                 download_bps: None,
@@ -592,7 +618,7 @@ impl ServerState {
         for neighbor_id in self.mesh.spiral.all_neighbor_ids() {
             if !relay_targets.contains(&neighbor_id) {
                 links.push(MeshLinkReport {
-                    source: self.lens.peer_id.clone(),
+                    source: our_pid.clone(),
                     target: neighbor_id,
                     upload_bps: None,
                     download_bps: None,
@@ -603,7 +629,14 @@ impl ServerState {
         }
 
         // Transitive latency: proof-derived links between remote peers (via gossip).
+        // Only include proofs where BOTH endpoints are known nodes (us or a known peer)
+        // to avoid dangling references from gossiped proofs about peers we haven't met.
         {
+            let known_ids: HashSet<&str> = {
+                let mut s: HashSet<&str> = self.mesh.known_peers.keys().map(|k| k.as_str()).collect();
+                s.insert(&our_pid);
+                s
+            };
             let existing_edges: HashSet<(String, String)> = links
                 .iter()
                 .map(|l| {
@@ -616,6 +649,9 @@ impl ServerState {
                 .collect();
             let latency_map = self.mesh.proof_store.latency_map((now * 1000) as i64);
             for ((peer_a, peer_b), rtt_ms) in &latency_map {
+                if !known_ids.contains(peer_a.as_str()) || !known_ids.contains(peer_b.as_str()) {
+                    continue;
+                }
                 let edge = if peer_a < peer_b {
                     (peer_a.clone(), peer_b.clone())
                 } else {
@@ -635,7 +671,7 @@ impl ServerState {
         }
 
         MeshSnapshot {
-            self_lens_id: self.lens.peer_id.clone(),
+            self_mesh_key: our_pid,
             self_server_name: self.lens.server_name.clone(),
             self_site_name: self.lens.site_name.clone(),
             nodes,
@@ -684,7 +720,7 @@ pub type SharedState = Arc<RwLock<ServerState>>;
 pub async fn start(
     addrs: &[&str],
 ) -> Result<(SharedState, watch::Receiver<MeshSnapshot>, Vec<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>>, broadcast::Sender<()>), Box<dyn std::error::Error + Send + Sync>> {
-    let transport_config = Arc::new(transport::build_config());
+    let mut transport_config = transport::build_config();
     let (event_tx, event_rx) = mpsc::unbounded_channel::<RelayEvent>();
 
     // Load or create Lens identity.
@@ -699,6 +735,15 @@ pub async fn start(
         node_name = %*NODE_NAME,
         "lens identity active"
     );
+
+    // Start embedded Yggdrasil node (if YGG_PEERS is set).
+    let ygg_node = init_yggdrasil(&lens).map(Arc::new);
+    if let Some(ref node) = ygg_node {
+        info!(address = %node.address(), "embedded Yggdrasil node started");
+        transport_config.yggdrasil_available = true;
+    }
+    transport_config.ygg_node = ygg_node.clone();
+    let transport_config = Arc::new(transport_config);
 
     let (topology_tx, topology_rx) = watch::channel(MeshSnapshot::empty());
 
@@ -723,6 +768,7 @@ pub async fn start(
             current_hash: genesis,
             session_steps: 0,
             total_steps: restored_total,
+            resonance: None,
         });
         st.mesh.vdf_state_rx = Some(vdf_state_rx);
         st.mesh.vdf_chain = Some(Arc::clone(&chain));
@@ -866,6 +912,74 @@ async fn accept_loop(
     }
 }
 
+/// Initialize the embedded Yggdrasil node from the Lens identity key.
+///
+/// Initialize the embedded Yggdrasil node.
+///
+/// Starts if `YGG_PEERS` is set (with optional peer URIs) OR if `LAGOON_YGG=1`.
+/// With `LAGOON_YGG=1` and no `YGG_PEERS`, the node starts with an empty peer
+/// list — peers are added dynamically via APE (Anycast Peer Entry) when MESH
+/// HELLO messages arrive carrying `ygg_peer_uri` fields.
+///
+/// Returns `None` if neither env var is set or initialization fails.
+fn init_yggdrasil(lens: &super::lens::LensIdentity) -> Option<yggbridge::YggNode> {
+    let ygg_peers_str = std::env::var("YGG_PEERS").ok();
+    let lagoon_peers = std::env::var("LAGOON_PEERS").ok();
+
+    // Start Ygg if any of these are set:
+    //  1. YGG_PEERS → explicit Ygg bootstrap peers
+    //  2. LAGOON_PEERS → start with EMPTY peers (APE populates from relay TCP)
+    //  3. LAGOON_YGG=1 → explicit enable, empty peers
+    //
+    // NEVER derive Ygg peers from DNS hostnames — Fly `.internal` (and any
+    // shared DNS) returns the local machine first, causing self-connection
+    // loops.  APE uses the relay's TCP peer address (confirmed different node)
+    // to bootstrap onto the overlay.
+    let has_lagoon_peers = lagoon_peers.as_ref().is_some_and(|s| !s.trim().is_empty());
+    let ygg_explicit = std::env::var("LAGOON_YGG").ok().is_some_and(|v| v == "1");
+
+    if ygg_peers_str.is_none() && !has_lagoon_peers && !ygg_explicit {
+        return None;
+    }
+
+    let peers: Vec<String> = ygg_peers_str
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+
+    // Build 64-byte Ed25519 private key from 32-byte seed.
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&lens.secret_seed);
+    let mut private_key = [0u8; 64];
+    private_key[..32].copy_from_slice(&lens.secret_seed);
+    private_key[32..].copy_from_slice(signing_key.verifying_key().as_bytes());
+
+    let listen = vec!["tcp://[::]:9443".to_string()];
+
+    match yggbridge::YggNode::new(&private_key, &peers, &listen) {
+        Ok(node) => {
+            if peers.is_empty() {
+                info!(
+                    address = %node.address(),
+                    "Yggdrasil started with empty peer list — APE will populate peers"
+                );
+            } else {
+                info!(
+                    address = %node.address(),
+                    peer_count = peers.len(),
+                    peers = ?peers,
+                    "Yggdrasil started (bootstrap from LAGOON_PEERS)"
+                );
+            }
+            Some(node)
+        }
+        Err(e) => {
+            warn!("Yggdrasil init failed: {e}");
+            None
+        }
+    }
+}
+
 /// Per-connection state during registration.
 struct PendingRegistration {
     nick: Option<String>,
@@ -873,8 +987,8 @@ struct PendingRegistration {
 }
 
 /// Handle a single client connection.
-async fn handle_client(
-    socket: tokio::net::TcpStream,
+async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send>(
+    socket: S,
     addr: SocketAddr,
     state: SharedState,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1038,7 +1152,7 @@ async fn handle_client(
 
 /// Handle NICK and USER commands during pre-registration.
 async fn handle_registration(
-    framed: &mut Framed<tokio::net::TcpStream, IrcCodec>,
+    framed: &mut Framed<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send, IrcCodec>,
     pending: &mut PendingRegistration,
     msg: &Message,
     _tx: &mpsc::UnboundedSender<Message>,
@@ -1089,7 +1203,7 @@ async fn handle_registration(
 
 /// Send the IRC welcome sequence (001-004).
 async fn send_welcome(
-    framed: &mut Framed<tokio::net::TcpStream, IrcCodec>,
+    framed: &mut Framed<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send, IrcCodec>,
     nick: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let welcome_msgs = [
@@ -1199,7 +1313,7 @@ enum CommandResult {
 
 /// Handle commands from a registered client.
 async fn handle_command(
-    framed: &mut Framed<tokio::net::TcpStream, IrcCodec>,
+    framed: &mut Framed<impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send, IrcCodec>,
     nick: &str,
     msg: &Message,
     state: &SharedState,
@@ -1452,6 +1566,7 @@ async fn handle_command(
                                     mesh_connected: false,
                                     is_bootstrap: false,
                                     last_rtt_ms: None,
+                                    remote_node_name: None,
                                 },
                             );
                         }
@@ -2984,6 +3099,12 @@ async fn handle_command(
                             site_name: String,
                             #[serde(default)]
                             node_name: String,
+                            #[serde(default)]
+                            vdf_resonance_credit: Option<f64>,
+                            #[serde(default)]
+                            vdf_actual_rate_hz: Option<f64>,
+                            #[serde(default)]
+                            ygg_peer_uri: Option<String>,
                         }
                         if let Ok(hello) = serde_json::from_str::<HelloPayload>(json) {
                             // Use node_name from HELLO if present, else derive from server_name.
@@ -3000,7 +3121,7 @@ async fn handle_command(
                             let _ = st.federation_event_tx.send(
                                 federation::RelayEvent::MeshHello {
                                     remote_host: node_name.clone(),
-                                    lens_id: hello.peer_id,
+                                    peer_id: hello.peer_id,
                                     server_name: hello.server_name.clone(),
                                     public_key_hex: hello.public_key_hex,
                                     spiral_index: hello.spiral_index,
@@ -3010,23 +3131,47 @@ async fn handle_command(
                                     yggdrasil_addr: hello.yggdrasil_addr,
                                     site_name,
                                     node_name,
+                                    vdf_resonance_credit: hello.vdf_resonance_credit,
+                                    vdf_actual_rate_hz: hello.vdf_actual_rate_hz,
+                                    ygg_peer_uri: hello.ygg_peer_uri,
+                                    // Inbound: they connected to us, so we don't
+                                    // have a meaningful TCP peer addr for APE
+                                    // underlay derivation (they initiated).
+                                    relay_peer_addr: None,
                                 },
                             );
 
-                            // Respond with our own HELLO (include SPIRAL + VDF).
-                            let (our_vdf_genesis, our_vdf_hash, our_vdf_step) = st
+                            // Respond with our own HELLO (include SPIRAL + VDF + resonance + APE).
+                            let (our_vdf_genesis, our_vdf_hash, our_vdf_step, our_vdf_credit, our_vdf_rate) = st
                                 .mesh
                                 .vdf_state_rx
                                 .as_ref()
                                 .map(|rx| {
                                     let vdf = rx.borrow();
+                                    let (credit, rate) = vdf
+                                        .resonance
+                                        .as_ref()
+                                        .map(|r| (Some(r.credit), Some(r.actual_rate_hz)))
+                                        .unwrap_or((None, None));
                                     (
                                         Some(hex::encode(vdf.genesis)),
                                         Some(hex::encode(vdf.current_hash)),
                                         Some(vdf.total_steps),
+                                        credit,
+                                        rate,
                                     )
                                 })
-                                .unwrap_or((None, None, None));
+                                .unwrap_or((None, None, None, None, None));
+
+                            // Ygg overlay address (identity/routing).
+                            let our_ygg_addr = st.transport_config.ygg_node
+                                .as_ref()
+                                .map(|n| n.address().to_string());
+                            // Ygg peer URI = UNDERLAY address. You don't tunnel Ygg through Ygg.
+                            let our_ygg_peer_uri = super::transport::detect_underlay_addr().map(|addr| match addr {
+                                std::net::IpAddr::V6(v6) => format!("tcp://[{v6}]:9443"),
+                                std::net::IpAddr::V4(v4) => format!("tcp://{v4}:9443"),
+                            });
 
                             let our_hello = serde_json::json!({
                                 "peer_id": st.lens.peer_id,
@@ -3036,6 +3181,10 @@ async fn handle_command(
                                 "vdf_genesis": our_vdf_genesis,
                                 "vdf_hash": our_vdf_hash,
                                 "vdf_step": our_vdf_step,
+                                "vdf_resonance_credit": our_vdf_credit,
+                                "vdf_actual_rate_hz": our_vdf_rate,
+                                "yggdrasil_addr": our_ygg_addr,
+                                "ygg_peer_uri": our_ygg_peer_uri,
                                 "site_name": st.lens.site_name,
                                 "node_name": st.lens.node_name,
                             });
@@ -3302,10 +3451,10 @@ async fn handle_command(
                                 .and_then(|s| s.parse().ok());
 
                             let mut st = state.write().await;
-                            let lens_id = st.lens.peer_id.clone();
+                            let creator_peer_id = st.lens.peer_id.clone();
                             let invite = st.invites.create(
                                 kind,
-                                lens_id,
+                                creator_peer_id,
                                 target.clone(),
                                 privileges,
                                 max_uses,
@@ -3556,17 +3705,18 @@ async fn handle_command(
                         to_remove.push(host.clone());
                     }
                 }
-                // Also check by lens_id in known_peers.
+                // Also check by mesh_key in known_peers.
                 let mut connection_ids_to_remove = Vec::new();
-                for (lens_id, peer_info) in &st.mesh.known_peers {
-                    if lens_id == target || peer_info.server_name == *target
+                for (mkey, peer_info) in &st.mesh.known_peers {
+                    if mkey == target || peer_info.server_name == *target
                         || peer_info.node_name == *target
+                        || peer_info.peer_id == *target
                     {
                         if let Some(relay) = st.federation.relays.get(&peer_info.node_name) {
                             let _ = relay.outgoing_tx.send(federation::RelayCommand::Shutdown);
                             to_remove.push(peer_info.node_name.clone());
                         }
-                        connection_ids_to_remove.push(lens_id.clone());
+                        connection_ids_to_remove.push(mkey.clone());
                     }
                 }
                 for host in &to_remove {

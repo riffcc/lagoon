@@ -15,9 +15,11 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::{Sink, Stream};
+use rand::seq::SliceRandom;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
@@ -51,19 +53,26 @@ pub struct PeerEntry {
 ///
 /// Holds per-peer connection settings (port, TLS, Yggdrasil address) and
 /// transport-level state. Shared across all relay tasks via Arc.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TransportConfig {
     /// Known peers: hostname → connection configuration.
     /// Populated from LAGOON_PEERS env var.
     pub peers: HashMap<String, PeerEntry>,
     /// Whether this node has Yggdrasil connectivity (detected at startup).
     pub yggdrasil_available: bool,
-    /// Optional SOCKS5 proxy for routing Yggdrasil connections (yggstack mode).
-    /// Set via `YGG_SOCKS_PROXY` env var (e.g. `127.0.0.1:1080`).
-    pub ygg_socks_proxy: Option<SocketAddr>,
-    /// Yggdrasil admin socket path for querying peer data.
-    /// Detected from `YGGDRASIL_ADMIN_SOCKET` env var or default locations.
-    pub ygg_admin_socket: Option<String>,
+    /// Embedded Yggdrasil node for overlay networking.
+    /// When present, Ygg-addressed peers are dialed directly through the overlay.
+    pub ygg_node: Option<Arc<yggbridge::YggNode>>,
+}
+
+impl std::fmt::Debug for TransportConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TransportConfig")
+            .field("peers", &self.peers)
+            .field("yggdrasil_available", &self.yggdrasil_available)
+            .field("ygg_node", &self.ygg_node.is_some())
+            .finish()
+    }
 }
 
 impl TransportConfig {
@@ -71,8 +80,7 @@ impl TransportConfig {
         Self {
             peers: HashMap::new(),
             yggdrasil_available: false,
-            ygg_socks_proxy: None,
-            ygg_admin_socket: None,
+            ygg_node: None,
         }
     }
 }
@@ -81,14 +89,13 @@ impl TransportConfig {
 // WebSocket transport adapter
 // ---------------------------------------------------------------------------
 
-/// Inner type for outbound WebSocket connections via `connect_async`.
-type WsInner = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<TcpStream>,
->;
-
 /// WebSocket transport adapter for IRC federation relay.
 ///
-/// Wraps a `WebSocketStream` to implement `AsyncRead + AsyncWrite`, allowing
+/// Generic over the underlying stream `S` so we can use the same adapter for:
+/// - `wss://` over TCP (`MaybeTlsStream<TcpStream>`) — public internet
+/// - `ws://` over Ygg overlay (`YggStream`) — encrypted mesh
+///
+/// Wraps a `WebSocketStream<S>` to implement `AsyncRead + AsyncWrite`, allowing
 /// the relay task's `Framed<RelayStream, IrcCodec>` to work transparently
 /// over WebSocket. Each WebSocket text message = one IRC line.
 ///
@@ -97,14 +104,14 @@ type WsInner = tokio_tungstenite::WebSocketStream<
 ///
 /// **Write path**: buffers bytes from the IrcCodec encoder, and on `flush`
 /// sends each complete `\r\n`-terminated line as a WebSocket text message.
-pub struct WsRelayStream {
-    inner: WsInner,
+pub struct WsRelayStream<S: AsyncRead + AsyncWrite + Unpin> {
+    inner: tokio_tungstenite::WebSocketStream<S>,
     read_buf: Vec<u8>,
     write_buf: Vec<u8>,
 }
 
-impl WsRelayStream {
-    fn new(inner: WsInner) -> Self {
+impl<S: AsyncRead + AsyncWrite + Unpin> WsRelayStream<S> {
+    fn new(inner: tokio_tungstenite::WebSocketStream<S>) -> Self {
         Self {
             inner,
             read_buf: Vec::new(),
@@ -113,7 +120,7 @@ impl WsRelayStream {
     }
 }
 
-impl AsyncRead for WsRelayStream {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WsRelayStream<S> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -160,7 +167,7 @@ impl AsyncRead for WsRelayStream {
     }
 }
 
-impl AsyncWrite for WsRelayStream {
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WsRelayStream<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -226,80 +233,98 @@ impl AsyncWrite for WsRelayStream {
 
 /// Connect to a remote federation peer.
 ///
-/// For TLS peers (port 443), tunnels over WebSocket (`wss://host/api/federation/ws`).
-/// tokio-tungstenite handles DNS resolution and TLS internally. This survives
-/// CDN/proxy layers (Cloudflare) that only pass HTTP/WebSocket.
+/// Three transport modes, tried in priority order:
 ///
-/// For plain TCP peers, resolves the hostname via:
-/// 1. Peer table lookup (LAGOON_PEERS entries with explicit addresses/ports).
-/// 2. Direct IP parse (raw `200:...` addresses).
-/// 3. Standard DNS resolution (prefer Yggdrasil 200::/7 results when available).
+/// 1. **Ygg overlay WebSocket** (`ws://[ygg_addr]:8080/api/federation/ws`):
+///    When the peer has a known Yggdrasil address and we have an embedded Ygg
+///    node. Dials the overlay → WebSocket upgrade to the web gateway. No TLS
+///    needed — Yggdrasil encrypts the transport. No DNS needed — we have the
+///    overlay address from MESH HELLO / MESH PEERS.
+///
+/// 2. **TLS WebSocket** (`wss://host:443/api/federation/ws`):
+///    For peers configured with `tls: true` (port 443). tokio-tungstenite
+///    handles DNS and TLS. Survives CDN/proxy layers (Cloudflare, HAProxy).
+///    Used for the anycast entry point (`LAGOON_PEERS=lagun.co:443`).
+///
+/// 3. **Plain TCP** (port 6667):
+///    Direct IRC protocol for LAN peers. DNS or peer-table resolution.
+///
+/// Result includes the resolved TCP peer address (for APE underlay derivation).
+/// WebSocket and overlay connections return `peer_addr: None`.
+pub struct ConnectResult {
+    pub stream: RelayStream,
+    /// The resolved TCP peer address.  `None` for WebSocket or Ygg overlay
+    /// connections (those don't need underlay APE bootstrapping).
+    pub peer_addr: Option<SocketAddr>,
+}
+
+/// Web gateway port — the HTTP/WS server that lagoon-web runs on.
+/// Overlay connections use this for `ws://` federation.
+const WEB_GATEWAY_PORT: u16 = 8080;
+
 pub async fn connect(
     remote_host: &str,
     config: &TransportConfig,
-) -> io::Result<RelayStream> {
+) -> io::Result<ConnectResult> {
     let peer = config.peers.get(remote_host);
     let port = peer.map(|p| p.port).unwrap_or(DEFAULT_PORT);
     let tls = peer.map(|p| p.tls).unwrap_or(false);
+    let ygg_addr = peer.and_then(|p| p.yggdrasil_addr);
 
+    // ── Priority 1: Ygg overlay WebSocket ──────────────────────────────
+    //
+    // If we have an embedded Ygg node and this peer has a known overlay
+    // address, dial ws:// through the mesh. Ygg encrypts, no TLS needed.
+    // The web gateway on port 8080 handles the WebSocket federation
+    // endpoint with all the authentication and proxying already built in.
+    if let (Some(ygg_node), Some(ygg_v6)) = (&config.ygg_node, ygg_addr) {
+        let url = format!("ws://[{ygg_v6}]:{WEB_GATEWAY_PORT}/api/federation/ws");
+        info!(remote_host, %url, "transport: connecting via WebSocket over Ygg overlay");
+        let stream = ygg_node
+            .dial(ygg_v6, WEB_GATEWAY_PORT)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+        let (ws_stream, _response) = tokio_tungstenite::client_async(&url, stream)
+            .await
+            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+        info!(remote_host, "transport: WebSocket over Ygg overlay connected");
+        return Ok(ConnectResult {
+            stream: Box::new(WsRelayStream::new(ws_stream)),
+            peer_addr: None, // overlay — no underlay APE needed
+        });
+    }
+
+    // ── Priority 2: TLS WebSocket ──────────────────────────────────────
+    //
+    // Public internet path — wss:// through CDN/proxy/anycast.
     if tls {
-        // WebSocket tunnel — survives Cloudflare/CDN proxies.
-        // tokio-tungstenite handles DNS resolution and TLS (rustls) internally.
-        let url = format!("wss://{remote_host}:{port}/api/federation/ws");
-        info!(remote_host, %url, "transport: connecting via WebSocket");
+        let url = if remote_host.contains(':') {
+            format!("wss://[{remote_host}]:{port}/api/federation/ws")
+        } else {
+            format!("wss://{remote_host}:{port}/api/federation/ws")
+        };
+        info!(remote_host, %url, "transport: connecting via WebSocket (TLS)");
         let (ws_stream, _response) = tokio_tungstenite::connect_async(&url)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
-        info!(remote_host, "transport: WebSocket connected");
-        Ok(Box::new(WsRelayStream::new(ws_stream)))
-    } else {
-        // Plain TCP (Yggdrasil, local network).
-        let addr = resolve(remote_host, config, port).await?;
-
-        // Try to route through Yggdrasil mesh via SOCKS5 proxy.
-        if let Some(proxy) = config.ygg_socks_proxy {
-            // If the resolved address is already a Ygg address, route directly.
-            if is_yggdrasil_addr(&addr) {
-                info!(remote_host, ?addr, ?proxy, "transport: connecting via SOCKS5");
-                let stream = socks5_connect(proxy, addr).await?;
-                return Ok(Box::new(stream));
-            }
-
-            // Otherwise, query yggstack peers to see if the target's public IP
-            // matches any Ygg peer — if so, route through the Ygg overlay.
-            if let Some(ref admin_socket) = config.ygg_admin_socket {
-                match super::yggdrasil::query_peers(admin_socket).await {
-                    Ok(peers) => {
-                        if let Some(ygg_addr) =
-                            super::yggdrasil::find_peer_by_remote_ip(&peers, &addr.ip())
-                        {
-                            let ygg_target = SocketAddr::new(IpAddr::V6(ygg_addr), port);
-                            info!(
-                                remote_host,
-                                ?addr,
-                                ?ygg_target,
-                                ?proxy,
-                                "transport: Ygg route discovered, connecting via SOCKS5"
-                            );
-                            let stream = socks5_connect(proxy, ygg_target).await?;
-                            return Ok(Box::new(stream));
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            error = %e,
-                            "transport: getPeers query failed, falling back to TCP"
-                        );
-                    }
-                }
-            }
-        }
-
-        info!(remote_host, ?addr, "transport: connecting via TCP");
-        let stream = TcpStream::connect(addr).await?;
-        set_tcp_keepalive(&stream)?;
-        Ok(Box::new(stream))
+        info!(remote_host, "transport: WebSocket (TLS) connected");
+        return Ok(ConnectResult {
+            stream: Box::new(WsRelayStream::new(ws_stream)),
+            peer_addr: None,
+        });
     }
+
+    // ── Priority 3: Plain TCP ──────────────────────────────────────────
+    //
+    // LAN peers — direct IRC protocol connection.
+    let addr = resolve(remote_host, config, port).await?;
+    info!(remote_host, ?addr, "transport: connecting via TCP");
+    let stream = TcpStream::connect(addr).await?;
+    set_tcp_keepalive(&stream)?;
+    Ok(ConnectResult {
+        stream: Box::new(stream),
+        peer_addr: Some(addr),
+    })
 }
 
 /// Apply aggressive TCP keepalive for fast dead peer detection.
@@ -314,75 +339,6 @@ pub(crate) fn set_tcp_keepalive(stream: &TcpStream) -> io::Result<()> {
         .with_retries(3);
     sock.set_tcp_keepalive(&keepalive)?;
     Ok(())
-}
-
-/// Minimal SOCKS5 CONNECT — routes a TCP connection through a SOCKS5 proxy.
-///
-/// Implements just enough of RFC 1928 to establish a proxied connection:
-/// no-auth negotiation → CONNECT request → bidirectional stream.
-/// Used for routing Yggdrasil overlay connections through yggstack.
-async fn socks5_connect(proxy: SocketAddr, target: SocketAddr) -> io::Result<TcpStream> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut stream = TcpStream::connect(proxy).await?;
-    set_tcp_keepalive(&stream)?;
-
-    // Auth negotiation: version 5, 1 method, no auth (0x00).
-    stream.write_all(&[0x05, 0x01, 0x00]).await?;
-    let mut auth_resp = [0u8; 2];
-    stream.read_exact(&mut auth_resp).await?;
-    if auth_resp != [0x05, 0x00] {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "SOCKS5 auth rejected",
-        ));
-    }
-
-    // CONNECT request: version=5, cmd=CONNECT(1), reserved=0, then address.
-    let mut req = vec![0x05, 0x01, 0x00];
-    match target.ip() {
-        IpAddr::V4(ip) => {
-            req.push(0x01); // IPv4
-            req.extend_from_slice(&ip.octets());
-        }
-        IpAddr::V6(ip) => {
-            req.push(0x04); // IPv6
-            req.extend_from_slice(&ip.octets());
-        }
-    }
-    req.extend_from_slice(&target.port().to_be_bytes());
-    stream.write_all(&req).await?;
-
-    // Response header: version, status, reserved, addr_type.
-    let mut resp = [0u8; 4];
-    stream.read_exact(&mut resp).await?;
-    if resp[1] != 0x00 {
-        return Err(io::Error::new(
-            io::ErrorKind::ConnectionRefused,
-            format!("SOCKS5 CONNECT failed: status {:#04x}", resp[1]),
-        ));
-    }
-    // Drain the bound address (we don't need it).
-    match resp[3] {
-        0x01 => {
-            let mut skip = [0u8; 6];
-            stream.read_exact(&mut skip).await?;
-        } // IPv4 + port
-        0x04 => {
-            let mut skip = [0u8; 18];
-            stream.read_exact(&mut skip).await?;
-        } // IPv6 + port
-        0x03 => {
-            // Domain name: 1-byte length + domain + 2-byte port.
-            let mut len = [0u8; 1];
-            stream.read_exact(&mut len).await?;
-            let mut skip = vec![0u8; len[0] as usize + 2];
-            stream.read_exact(&mut skip).await?;
-        }
-        _ => {}
-    }
-
-    Ok(stream)
 }
 
 /// Resolve a hostname to a SocketAddr using the peer table, direct parse,
@@ -409,7 +365,7 @@ async fn resolve(
 
     // 3. DNS lookup.
     let lookup_target = format!("{remote_host}:{port}");
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&lookup_target)
+    let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host(&lookup_target)
         .await?
         .collect();
 
@@ -426,6 +382,13 @@ async fn resolve(
             return Ok(*ygg);
         }
     }
+
+    // Shuffle DNS results to avoid always picking the local machine.
+    //
+    // Anycast DNS (e.g. Fly's `.internal`) returns all machines but sorts
+    // the local address first.  Without shuffling, every connection is a
+    // self-connection that gets detected and retried — an infinite loop.
+    addrs.shuffle(&mut rand::thread_rng());
 
     Ok(addrs[0])
 }
@@ -486,19 +449,53 @@ pub fn detect_yggdrasil_addr() -> Option<Ipv6Addr> {
         }
     }
 
-    // Admin socket fallback — yggstack mode (no TUN interface, address only
-    // reachable via the userspace Yggdrasil node's admin API).
-    if let Some(socket_path) = super::yggdrasil::detect_admin_socket() {
-        match super::yggdrasil::query_self_sync(&socket_path) {
-            Ok(Some(addr)) => {
-                info!("transport: Yggdrasil address from admin socket: {addr}");
-                return Some(addr);
+    None
+}
+
+/// Detect a non-Yggdrasil, non-loopback, non-link-local IPv6 address.
+///
+/// This is the node's **underlay** address — the real IP that other nodes
+/// can use to reach this machine's Ygg listener.  Ygg peer URIs MUST be
+/// underlay addresses because you don't tunnel Yggdrasil through Yggdrasil.
+///
+/// Reads `/proc/net/if_inet6` directly (no dependency on `ip` or `iproute2`).
+pub fn detect_underlay_addr() -> Option<IpAddr> {
+    if let Ok(content) = std::fs::read_to_string("/proc/net/if_inet6") {
+        for line in content.lines() {
+            let hex = line.split_whitespace().next().unwrap_or("");
+            if hex.len() != 32 {
+                continue;
             }
-            Ok(None) => {
-                tracing::debug!("transport: admin socket reachable but no Ygg address");
+            // Skip Yggdrasil (02xx, 03xx), loopback (::1), link-local (fe80::).
+            if hex.starts_with("02") || hex.starts_with("03") {
+                continue; // Yggdrasil overlay
             }
-            Err(e) => {
-                tracing::debug!("transport: admin socket query failed: {e}");
+            if hex == "00000000000000000000000000000001" {
+                continue; // ::1 loopback
+            }
+            if hex.starts_with("fe80") {
+                continue; // link-local
+            }
+            // Convert 32-char hex to colon-separated IPv6.
+            let groups: Vec<&str> = (0..8).map(|i| &hex[i * 4..(i + 1) * 4]).collect();
+            let addr_str = groups.join(":");
+            if let Ok(addr) = addr_str.parse::<Ipv6Addr>() {
+                return Some(IpAddr::V6(addr));
+            }
+        }
+    }
+
+    // Fallback: try first non-loopback IPv4 from /proc/net/fib_trie or interfaces.
+    if let Ok(output) = std::process::Command::new("hostname")
+        .args(["-I"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for token in stdout.split_whitespace() {
+            if let Ok(ip) = token.parse::<IpAddr>() {
+                if !ip.is_loopback() {
+                    return Some(ip);
+                }
             }
         }
     }
@@ -597,23 +594,7 @@ pub fn build_config() -> TransportConfig {
     config.yggdrasil_available = detect_yggdrasil_addr().is_some();
 
     if config.yggdrasil_available {
-        info!("transport: Yggdrasil connectivity detected");
-    }
-
-    // Admin socket for querying yggstack/Yggdrasil peer data.
-    config.ygg_admin_socket = super::yggdrasil::detect_admin_socket();
-
-    // SOCKS5 proxy for yggstack mode (Ygg connections via userspace netstack).
-    if let Ok(proxy_str) = std::env::var("YGG_SOCKS_PROXY") {
-        match proxy_str.parse::<SocketAddr>() {
-            Ok(addr) => {
-                info!(proxy = %addr, "transport: Yggdrasil SOCKS5 proxy configured");
-                config.ygg_socks_proxy = Some(addr);
-            }
-            Err(e) => {
-                warn!(proxy = %proxy_str, error = %e, "transport: invalid YGG_SOCKS_PROXY");
-            }
-        }
+        info!("transport: Yggdrasil connectivity detected (TUN/system)");
     }
 
     if let Ok(peers_str) = std::env::var("LAGOON_PEERS") {
@@ -779,7 +760,26 @@ mod tests {
         // Verify WebSocket URL construction for TLS peers.
         let host = "lon.lagun.co";
         let port = 443u16;
-        let url = format!("wss://{host}:{port}/api/federation/ws");
+        let url = if host.contains(':') {
+            format!("wss://[{host}]:{port}/api/federation/ws")
+        } else {
+            format!("wss://{host}:{port}/api/federation/ws")
+        };
         assert_eq!(url, "wss://lon.lagun.co:443/api/federation/ws");
+    }
+
+    #[test]
+    fn ws_url_format_ipv6() {
+        let host = "2a09:8280:5d::d2:e42f:0";
+        let port = 443u16;
+        let url = if host.contains(':') {
+            format!("wss://[{host}]:{port}/api/federation/ws")
+        } else {
+            format!("wss://{host}:{port}/api/federation/ws")
+        };
+        assert_eq!(
+            url,
+            "wss://[2a09:8280:5d::d2:e42f:0]:443/api/federation/ws"
+        );
     }
 }

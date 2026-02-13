@@ -103,10 +103,10 @@ pub async fn create_invite(
         .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
 
     let mut st = irc_state.write().await;
-    let lens_id = st.lens.peer_id.clone();
+    let creator_peer_id = st.lens.peer_id.clone();
     let invite = st
         .invites
-        .create(kind, lens_id, req.target, privileges, req.max_uses, expires_at);
+        .create(kind, creator_peer_id, req.target, privileges, req.max_uses, expires_at);
     let resp = InviteResponse::from(invite);
     Ok(Json(resp))
 }

@@ -24,17 +24,20 @@ pub fn hex_to_world(coord: HexCoord) -> [f64; 3] {
 }
 
 /// SPIRAL topology state for this node's mesh.
+///
+/// All string keys are mesh keys (`"{site_name}/{node_name}"`), the globally
+/// unique 2D identity for each node in the mesh.
 #[derive(Debug)]
 pub struct SpiralTopology {
     /// Our SPIRAL position (None = unclaimed, waiting for network info).
     our_index: Option<Spiral3DIndex>,
     our_coord: Option<HexCoord>,
-    our_lens_id: Option<String>,
-    /// All occupied positions: coord → lens_id.
+    our_mesh_key: Option<String>,
+    /// All occupied positions: coord → mesh_key.
     occupied: HashMap<HexCoord, String>,
-    /// Reverse: lens_id → (index, coord).
+    /// Reverse: mesh_key → (index, coord).
     peer_positions: HashMap<String, (Spiral3DIndex, HexCoord)>,
-    /// Current 20-neighbor set (lens_ids).
+    /// Current 20-neighbor set (mesh_keys).
     neighbors: HashSet<String>,
 }
 
@@ -44,7 +47,7 @@ impl SpiralTopology {
         Self {
             our_index: None,
             our_coord: None,
-            our_lens_id: None,
+            our_mesh_key: None,
             occupied: HashMap::new(),
             peer_positions: HashMap::new(),
             neighbors: HashSet::new(),
@@ -56,7 +59,7 @@ impl SpiralTopology {
     /// Enumerates slots in spiral order from origin, claims the first one
     /// not already occupied. This is SPIRAL self-assembly — first-come,
     /// first-served, sequential from center.
-    pub fn claim_position(&mut self, our_lens_id: &str) -> Spiral3DIndex {
+    pub fn claim_position(&mut self, our_mesh_key: &str) -> Spiral3DIndex {
         // Find first unclaimed slot in spiral order.
         let mut i = 0u64;
         let idx = loop {
@@ -71,37 +74,37 @@ impl SpiralTopology {
         let coord = spiral3d_to_coord(idx);
         self.our_index = Some(idx);
         self.our_coord = Some(coord);
-        self.our_lens_id = Some(our_lens_id.to_string());
-        self.occupied.insert(coord, our_lens_id.to_string());
+        self.our_mesh_key = Some(our_mesh_key.to_string());
+        self.occupied.insert(coord, our_mesh_key.to_string());
         self.recompute_neighbors();
         idx
     }
 
     /// Restore a persisted SPIRAL position on restart.
-    pub fn set_position(&mut self, our_lens_id: &str, index: Spiral3DIndex) {
+    pub fn set_position(&mut self, our_mesh_key: &str, index: Spiral3DIndex) {
         let coord = spiral3d_to_coord(index);
         self.our_index = Some(index);
         self.our_coord = Some(coord);
-        self.our_lens_id = Some(our_lens_id.to_string());
-        self.occupied.insert(coord, our_lens_id.to_string());
+        self.our_mesh_key = Some(our_mesh_key.to_string());
+        self.occupied.insert(coord, our_mesh_key.to_string());
         self.recompute_neighbors();
     }
 
     /// Register a peer's claimed SPIRAL slot. Returns true if our neighbor
     /// set changed.
-    pub fn add_peer(&mut self, lens_id: &str, index: Spiral3DIndex) -> bool {
+    pub fn add_peer(&mut self, mesh_key: &str, index: Spiral3DIndex) -> bool {
         let coord = spiral3d_to_coord(index);
 
         // Don't overwrite an existing occupant at this coord (first-writer-wins).
         if let Some(existing) = self.occupied.get(&coord) {
-            if existing != lens_id {
+            if existing != mesh_key {
                 return false;
             }
         }
 
-        self.occupied.insert(coord, lens_id.to_string());
+        self.occupied.insert(coord, mesh_key.to_string());
         self.peer_positions
-            .insert(lens_id.to_string(), (index, coord));
+            .insert(mesh_key.to_string(), (index, coord));
 
         let old_neighbors = self.neighbors.clone();
         self.recompute_neighbors();
@@ -109,10 +112,10 @@ impl SpiralTopology {
     }
 
     /// Remove a peer from the topology. Returns true if our neighbor set changed.
-    pub fn remove_peer(&mut self, lens_id: &str) -> bool {
-        if let Some((_, coord)) = self.peer_positions.remove(lens_id) {
-            // Only remove from occupied if this lens_id still owns the slot.
-            if self.occupied.get(&coord).map(|s| s.as_str()) == Some(lens_id) {
+    pub fn remove_peer(&mut self, mesh_key: &str) -> bool {
+        if let Some((_, coord)) = self.peer_positions.remove(mesh_key) {
+            // Only remove from occupied if this mesh_key still owns the slot.
+            if self.occupied.get(&coord).map(|s| s.as_str()) == Some(mesh_key) {
                 self.occupied.remove(&coord);
             }
 
@@ -136,21 +139,21 @@ impl SpiralTopology {
         let connections = compute_all_connections(&occupied_set, our_coord);
 
         for conn in connections {
-            if let Some(lens_id) = self.occupied.get(&conn.target) {
+            if let Some(mesh_key) = self.occupied.get(&conn.target) {
                 // Don't include ourselves as a neighbor.
-                if self.our_lens_id.as_deref() != Some(lens_id.as_str()) {
-                    self.neighbors.insert(lens_id.clone());
+                if self.our_mesh_key.as_deref() != Some(mesh_key.as_str()) {
+                    self.neighbors.insert(mesh_key.clone());
                 }
             }
         }
     }
 
     /// Check if a peer is in our current SPIRAL neighbor set.
-    pub fn is_neighbor(&self, lens_id: &str) -> bool {
-        self.neighbors.contains(lens_id)
+    pub fn is_neighbor(&self, mesh_key: &str) -> bool {
+        self.neighbors.contains(mesh_key)
     }
 
-    /// Get all current SPIRAL neighbor lens_ids.
+    /// Get all current SPIRAL neighbor mesh_keys.
     pub fn neighbors(&self) -> &HashSet<String> {
         &self.neighbors
     }
@@ -166,8 +169,8 @@ impl SpiralTopology {
     }
 
     /// Get a peer's SPIRAL index.
-    pub fn peer_index(&self, lens_id: &str) -> Option<Spiral3DIndex> {
-        self.peer_positions.get(lens_id).map(|(idx, _)| *idx)
+    pub fn peer_index(&self, mesh_key: &str) -> Option<Spiral3DIndex> {
+        self.peer_positions.get(mesh_key).map(|(idx, _)| *idx)
     }
 
     /// Number of occupied slots in the topology.
@@ -180,7 +183,7 @@ impl SpiralTopology {
         self.our_index.is_some()
     }
 
-    /// Get all unique SPIRAL neighbor lens_ids as a Vec.
+    /// Get all unique SPIRAL neighbor mesh_keys as a Vec.
     ///
     /// With fewer than 20 nodes, gap-and-wrap deduplicates to the actual
     /// unique peers — 5 nodes means each node connects to the other 4.
@@ -188,10 +191,10 @@ impl SpiralTopology {
         self.neighbors.iter().cloned().collect()
     }
 
-    /// Get world coordinates for a peer by lens_id.
-    pub fn peer_world_coord(&self, lens_id: &str) -> Option<[f64; 3]> {
+    /// Get world coordinates for a peer by mesh_key.
+    pub fn peer_world_coord(&self, mesh_key: &str) -> Option<[f64; 3]> {
         self.peer_positions
-            .get(lens_id)
+            .get(mesh_key)
             .map(|(_, coord)| hex_to_world(*coord))
     }
 

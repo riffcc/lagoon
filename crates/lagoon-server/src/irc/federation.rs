@@ -7,6 +7,7 @@
 ///
 /// Also handles MESH protocol for topology exchange between peers.
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures::SinkExt;
@@ -22,11 +23,6 @@ use super::server::{broadcast, derive_node_name, MeshConnectionState, MeshPeerIn
 use super::transport::{self, TransportConfig};
 use base64::Engine as _;
 
-/// Peers with VDF steps below this fraction of our own are eviction candidates.
-const VDF_EVICTION_RATIO: f64 = 0.1;
-/// Peers not seen for this many seconds are considered stale for eviction.
-/// ~3 VDF rounds (each ~8s) — pods don't reconnect, so clean up fast.
-const VDF_STALE_SECS: u64 = 24;
 /// Maximum disconnected peers retained per SITE_NAME before dedup eviction.
 const MAX_DISCONNECTED_PER_SITE: usize = 5;
 /// Maximum safe JSON payload bytes for a single IRC MESH message.
@@ -88,19 +84,51 @@ fn send_chunked_mesh<T: serde::Serialize>(
     }
 }
 
+/// Prune relay connections to non-SPIRAL peers.
+///
+/// SPIRAL is the sole authority on which direct connections we maintain.
+/// Non-neighbors are reachable transitively via Yggdrasil forwarding.
+fn prune_non_spiral_relays(st: &mut super::server::ServerState) {
+    if !st.mesh.spiral.is_claimed() {
+        return;
+    }
+
+    let to_prune: Vec<String> = st.federation.relays.iter()
+        .filter(|(_, handle)| {
+            // Never prune bootstrap peers — they're the network backbone.
+            if handle.is_bootstrap {
+                return false;
+            }
+            let is_neighbor = st.mesh.known_peers.iter()
+                .find(|(_, p)| p.node_name == handle.remote_host)
+                .map(|(pid, _)| st.mesh.spiral.is_neighbor(pid))
+                .unwrap_or(false);
+            !is_neighbor
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+
+    for node_name in to_prune {
+        if let Some(handle) = st.federation.relays.remove(&node_name) {
+            info!(node = %node_name, "mesh: pruned non-SPIRAL relay");
+            handle.task_handle.abort();
+        }
+    }
+}
+
 /// Evict excess disconnected peers per SITE_NAME, keeping the most recently
-/// seen ones up to `MAX_DISCONNECTED_PER_SITE`. Returns evicted peer IDs.
+/// seen ones up to `MAX_DISCONNECTED_PER_SITE`. Returns evicted mesh keys.
 fn dedup_peers_per_site(
     mesh: &mut super::server::MeshState,
-    our_peer_id: &str,
+    our_mesh_key: &str,
 ) -> Vec<String> {
-    // Group disconnected peer IDs by site_name.
+    // Group disconnected mesh keys by site_name.
     let mut by_site: HashMap<String, Vec<(String, u64)>> = HashMap::new();
-    for (peer_id, peer) in mesh.known_peers.iter() {
-        if peer_id == our_peer_id {
+    for (mkey, peer) in mesh.known_peers.iter() {
+        if mkey == our_mesh_key {
             continue;
         }
-        let connected = mesh.connections.get(peer_id).copied()
+        let connected = mesh.connections.get(mkey).copied()
             == Some(MeshConnectionState::Connected);
         if connected {
             continue;
@@ -108,7 +136,7 @@ fn dedup_peers_per_site(
         by_site
             .entry(peer.site_name.clone())
             .or_default()
-            .push((peer_id.clone(), peer.last_seen));
+            .push((mkey.clone(), peer.last_seen));
     }
 
     let mut evicted = Vec::new();
@@ -118,17 +146,17 @@ fn dedup_peers_per_site(
         }
         // Sort by last_seen descending — keep the freshest.
         peers.sort_by(|a, b| b.1.cmp(&a.1));
-        for (peer_id, _) in peers.into_iter().skip(MAX_DISCONNECTED_PER_SITE) {
-            if let Some(peer) = mesh.known_peers.remove(&peer_id) {
+        for (mkey, _) in peers.into_iter().skip(MAX_DISCONNECTED_PER_SITE) {
+            if let Some(peer) = mesh.known_peers.remove(&mkey) {
                 info!(
-                    peer_id = %peer_id,
+                    mesh_key = %mkey,
                     site_name = %peer.site_name,
                     last_seen = peer.last_seen,
                     "mesh: evicting excess disconnected peer for site dedup"
                 );
-                mesh.spiral.remove_peer(&peer_id);
+                mesh.spiral.remove_peer(&mkey);
             }
-            evicted.push(peer_id);
+            evicted.push(mkey);
         }
     }
     evicted
@@ -196,6 +224,9 @@ pub struct RelayHandle {
     pub is_bootstrap: bool,
     /// Last measured IRC-layer round-trip time in milliseconds (from PING/PONG).
     pub last_rtt_ms: Option<f64>,
+    /// The node_name of the remote peer, set after MESH HELLO exchange.
+    /// Used to detect duplicate connections to the same node under different relay keys.
+    pub remote_node_name: Option<String>,
 }
 
 /// Commands sent from the server to a relay task.
@@ -217,6 +248,9 @@ pub enum RelayCommand {
     MeshHello { json: String },
     /// Shut down the relay connection entirely.
     Shutdown,
+    /// Drop the current connection and reconnect (e.g. self-connection detected
+    /// via anycast DNS — next resolution may hit a different machine).
+    Reconnect,
 }
 
 /// Events sent from a relay task back to the server for local dispatch.
@@ -255,7 +289,8 @@ pub enum RelayEvent {
     /// Received MESH HELLO from a remote peer.
     MeshHello {
         remote_host: String,
-        lens_id: String,
+        /// Cryptographic peer identity (`"b3b3/{hex}"`), NOT the lens/domain.
+        peer_id: String,
         server_name: String,
         public_key_hex: String,
         spiral_index: Option<u64>,
@@ -265,6 +300,13 @@ pub enum RelayEvent {
         yggdrasil_addr: Option<String>,
         site_name: String,
         node_name: String,
+        vdf_resonance_credit: Option<f64>,
+        vdf_actual_rate_hz: Option<f64>,
+        ygg_peer_uri: Option<String>,
+        /// TCP peer address of the relay connection — used by APE to derive
+        /// an underlay Ygg peer URI (`tcp://[ip]:9443`). This is a known-good
+        /// address to a confirmed-different node (peer_id verified).
+        relay_peer_addr: Option<SocketAddr>,
     },
     /// Received MESH PEERS from a remote peer.
     MeshPeers {
@@ -357,18 +399,34 @@ fn format_remote_prefix(nick: &str, remote_host: &str) -> String {
 
 /// Spawn the federation event processor that listens for relay events
 /// and dispatches them to local users.
-/// Query Yggdrasil metrics if admin socket is available (async, non-blocking).
-async fn refresh_ygg_metrics(
-    socket: &Option<String>,
+/// Query Yggdrasil peer metrics from the embedded node (if available).
+fn refresh_ygg_metrics_embedded(
+    ygg_node: &Option<Arc<yggbridge::YggNode>>,
 ) -> Option<Vec<super::yggdrasil::YggPeer>> {
-    let path = socket.as_ref()?;
-    match super::yggdrasil::query_peers(path).await {
-        Ok(peers) => Some(peers),
-        Err(e) => {
-            tracing::debug!("yggdrasil admin socket query failed: {e}");
-            None
-        }
-    }
+    let node = ygg_node.as_ref()?;
+    let peers = node.peers();
+    Some(
+        peers
+            .into_iter()
+            .map(|p| {
+                let address = super::yggdrasil::key_to_address(&p.key)
+                    .map(|a| a.to_string())
+                    .unwrap_or_default();
+                super::yggdrasil::YggPeer {
+                    address,
+                    remote: p.uri,
+                    bytes_sent: p.tx_bytes,
+                    bytes_recvd: p.rx_bytes,
+                    latency: p.latency_ms * 1_000_000.0, // ms → ns
+                    key: p.key,
+                    port: 0,
+                    uptime: p.uptime,
+                    up: p.up,
+                    inbound: p.inbound,
+                }
+            })
+            .collect(),
+    )
 }
 
 pub fn spawn_event_processor(
@@ -376,8 +434,11 @@ pub fn spawn_event_processor(
     mut event_rx: mpsc::UnboundedReceiver<RelayEvent>,
 ) {
     tokio::spawn(async move {
-        // Detect Yggdrasil admin socket once at startup.
-        let ygg_socket = super::yggdrasil::detect_admin_socket();
+        // Get a reference to the embedded Ygg node for metrics queries.
+        let ygg_node = {
+            let st = state.read().await;
+            st.transport_config.ygg_node.clone()
+        };
 
         while let Some(event) = event_rx.recv().await {
             match event {
@@ -535,7 +596,7 @@ pub fn spawn_event_processor(
                 }
                 RelayEvent::Disconnected { remote_host } => {
                     // Query Ygg metrics before acquiring write lock.
-                    let ygg_peers = refresh_ygg_metrics(&ygg_socket).await;
+                    let ygg_peers = refresh_ygg_metrics_embedded(&ygg_node);
 
                     let mut st = state.write().await;
 
@@ -568,7 +629,7 @@ pub fn spawn_event_processor(
                         relay.task_handle.abort();
                     }
 
-                    // Find and remove connection state by lens_id.
+                    // Find and remove connection state by mesh_key.
                     let disconnected_ids: Vec<String> = st
                         .mesh
                         .known_peers
@@ -615,7 +676,7 @@ pub fn spawn_event_processor(
 
                 RelayEvent::MeshHello {
                     remote_host,
-                    lens_id,
+                    peer_id,
                     server_name,
                     public_key_hex,
                     spiral_index,
@@ -625,6 +686,10 @@ pub fn spawn_event_processor(
                     yggdrasil_addr,
                     site_name,
                     node_name,
+                    vdf_resonance_credit,
+                    vdf_actual_rate_hz,
+                    ygg_peer_uri,
+                    relay_peer_addr,
                 } => {
                     // Backfill node_name/site_name for old peers that don't send them.
                     let node_name = if node_name.is_empty() {
@@ -638,12 +703,15 @@ pub fn spawn_event_processor(
                         site_name
                     };
 
+                    // peer_id (public key) = the node's identity.
+                    let mkey = peer_id.clone();
+
                     // Verify PeerID matches public key.
                     if let Ok(pubkey_bytes) = hex::decode(&public_key_hex) {
                         if pubkey_bytes.len() == 32 {
                             let mut key = [0u8; 32];
                             key.copy_from_slice(&pubkey_bytes);
-                            if !lens::verify_peer_id(&lens_id, &key) {
+                            if !lens::verify_peer_id(&peer_id, &key) {
                                 warn!(
                                     remote_host,
                                     "mesh: rejected HELLO — PeerID doesn't match pubkey"
@@ -654,7 +722,7 @@ pub fn spawn_event_processor(
                     }
 
                     // Query Yggdrasil metrics BEFORE acquiring write lock.
-                    let ygg_peers = refresh_ygg_metrics(&ygg_socket).await;
+                    let ygg_peers = refresh_ygg_metrics_embedded(&ygg_node);
 
                     let mut st = state.write().await;
 
@@ -663,27 +731,33 @@ pub fn spawn_event_processor(
                         st.mesh.ygg_metrics.update(peers);
                     }
 
-                    // Detect self-connection (DNS alias, misconfigured peer, etc).
-                    if lens_id == st.lens.peer_id {
+                    // Detect self-connection via peer_id (public key).
+                    //
+                    // With anycast DNS (e.g. `anycast-mesh.internal`), self-connection
+                    // is transient — the next DNS resolution may hit a different machine.
+                    // Send Reconnect (not Shutdown) so the relay retries with backoff.
+                    let our_pid = st.lens.peer_id.clone();
+                    if mkey == our_pid {
                         warn!(
                             remote_host,
-                            "mesh: self-connection detected — disconnecting"
+                            mesh_key = %mkey,
+                            "mesh: self-connection detected — will reconnect (anycast)"
                         );
-                        if let Some(relay) = st.federation.relays.remove(&remote_host) {
-                            let _ = relay.outgoing_tx.send(RelayCommand::Shutdown);
+                        // DON'T remove the relay — it stays in state for reconnection.
+                        if let Some(relay) = st.federation.relays.get(&remote_host) {
+                            let _ = relay.outgoing_tx.send(RelayCommand::Reconnect);
                         }
-                        st.mesh.connections.remove(&lens_id);
-                        st.notify_topology_change();
+                        st.mesh.connections.remove(&mkey);
                         continue;
                     }
 
                     // Check defederation.
-                    if st.mesh.defederated.contains(&lens_id)
+                    if st.mesh.defederated.contains(&peer_id)
                         || st.mesh.defederated.contains(&server_name)
                     {
                         warn!(
                             remote_host,
-                            lens_id,
+                            peer_id,
                             "mesh: rejected HELLO — peer is defederated"
                         );
                         continue;
@@ -691,7 +765,8 @@ pub fn spawn_event_processor(
 
                     info!(
                         remote_host,
-                        lens_id,
+                        mesh_key = %mkey,
+                        peer_id,
                         server_name,
                         "mesh: received HELLO"
                     );
@@ -712,16 +787,19 @@ pub fn spawn_event_processor(
                     if let Some(step) = vdf_step {
                         info!(
                             remote_host,
-                            lens_id = %lens_id,
+                            mesh_key = %mkey,
                             vdf_step = step,
                             "mesh: peer VDF state"
                         );
                     }
 
+                    // With 2D mesh keying, same (site_name, node_name) = same key.
+                    // No stale identity eviction needed — insert just overwrites
+                    // the existing entry if the node restarted with a new key.
                     st.mesh.known_peers.insert(
-                        lens_id.clone(),
+                        mkey.clone(),
                         MeshPeerInfo {
-                            lens_id: lens_id.clone(),
+                            peer_id: peer_id.clone(),
                             server_name: server_name.clone(),
                             public_key_hex,
                             port: peer_port,
@@ -734,79 +812,108 @@ pub fn spawn_event_processor(
                             yggdrasil_addr,
                             site_name: site_name.clone(),
                             node_name: node_name.clone(),
+                            vdf_resonance_credit,
+                            vdf_actual_rate_hz,
+                            ygg_peer_uri: ygg_peer_uri.clone(),
                         },
                     );
                     st.mesh
                         .connections
-                        .insert(lens_id.clone(), MeshConnectionState::Connected);
+                        .insert(mkey.clone(), MeshConnectionState::Connected);
+
+                    // APE: dynamically peer with this node's Yggdrasil overlay.
+                    //
+                    // Strategy: prefer the UNDERLAY address (relay TCP peer IP on
+                    // port 9443) over the OVERLAY address from ygg_peer_uri.
+                    //
+                    // Why: The overlay address (`tcp://[200:xxxx::]:9443`) only
+                    // works if we're already on the Ygg overlay. For a fresh node
+                    // bootstrapping via anycast, we're NOT on the overlay yet.
+                    // But the IRC relay already has a TCP connection to a confirmed-
+                    // different node — use that IP as the underlay Ygg peer.
+                    //
+                    // DNS self-connection is impossible here because MESH HELLO
+                    // peer_id already verified this is a different node.
+                    if let Some(ref ygg) = st.transport_config.ygg_node {
+                        // First try: underlay address from relay TCP peer.
+                        let underlay_uri = relay_peer_addr.map(|addr| {
+                            format!("tcp://[{}]:9443", addr.ip())
+                        });
+
+                        let uri_to_use = underlay_uri.as_deref()
+                            .or(ygg_peer_uri.as_deref());
+
+                        if let Some(uri) = uri_to_use {
+                            match ygg.add_peer(uri) {
+                                Ok(()) => info!(
+                                    uri,
+                                    peer_id,
+                                    "APE: added Yggdrasil peer from MESH HELLO"
+                                ),
+                                Err(e) => warn!(
+                                    uri,
+                                    peer_id,
+                                    error = %e,
+                                    "APE: failed to add Yggdrasil peer"
+                                ),
+                            }
+                        }
+                    }
 
                     // Register SPIRAL position if the peer has claimed one.
                     if let Some(idx) = spiral_index {
                         st.mesh.spiral.add_peer(
-                            &lens_id,
+                            &mkey,
                             citadel_topology::Spiral3DIndex::new(idx),
                         );
                     }
 
                     // Register peer with latency gossip + update SPIRAL neighbor set.
                     st.mesh.latency_gossip.register_peer(
-                        lens_id.clone(), node_name.clone(),
+                        mkey.clone(), node_name.clone(),
                     );
                     let neighbors = st.mesh.spiral.neighbors().clone();
                     st.mesh.latency_gossip.set_spiral_neighbors(neighbors);
 
+                    // Prune relay connections to non-SPIRAL peers now that the
+                    // neighbor set may have changed.
+                    prune_non_spiral_relays(&mut st);
+
                     st.notify_topology_change();
 
-                    // VDF slot eviction: scan for stale peers whose VDF work
-                    // is below threshold. Event-driven — runs on every HELLO.
-                    let our_vdf_step = st
-                        .mesh
-                        .vdf_state_rx
-                        .as_ref()
-                        .map(|rx| rx.borrow().total_steps)
-                        .unwrap_or(0);
-
-                    if our_vdf_step > 0 {
-                        let eviction_threshold =
-                            (our_vdf_step as f64 * VDF_EVICTION_RATIO) as u64;
+                    // Staleness eviction: remove disconnected peers we haven't
+                    // heard from in 5 minutes. Event-driven — runs on every HELLO.
+                    // Future: VDF-advancement tracking (proof-challenge-response)
+                    // will replace this with cryptographic liveness detection.
+                    const STALE_PEER_SECS: u64 = 300;
+                    {
                         let mut evicted = Vec::new();
 
-                        for (peer_id, peer) in &st.mesh.known_peers {
-                            // Skip self.
-                            if *peer_id == st.lens.peer_id {
+                        for (peer_mkey, peer) in &st.mesh.known_peers {
+                            if *peer_mkey == our_pid {
                                 continue;
                             }
-                            // Skip currently connected peers.
-                            if st.mesh.connections.contains_key(peer_id) {
+                            if st.mesh.connections.contains_key(peer_mkey) {
                                 continue;
                             }
-                            // Check VDF threshold (slotless peers have vdf_step=0,
-                            // so they're evicted once stale — prevents ephemeral
-                            // pod identities from accumulating without bound).
-                            let peer_vdf = peer.vdf_step.unwrap_or(0);
-                            if peer_vdf >= eviction_threshold {
+                            if now.saturating_sub(peer.last_seen) < STALE_PEER_SECS {
                                 continue;
                             }
-                            // Check staleness.
-                            if now.saturating_sub(peer.last_seen) < VDF_STALE_SECS {
-                                continue;
-                            }
-
-                            evicted.push(peer_id.clone());
+                            evicted.push(peer_mkey.clone());
                         }
 
-                        for peer_id in &evicted {
-                            if let Some(peer) = st.mesh.known_peers.remove(peer_id) {
+                        for evicted_key in &evicted {
+                            if let Some(peer) = st.mesh.known_peers.remove(evicted_key) {
                                 info!(
-                                    peer_id,
+                                    mesh_key = %evicted_key,
                                     server_name = %peer.server_name,
                                     vdf_step = ?peer.vdf_step,
                                     last_seen = peer.last_seen,
-                                    threshold = eviction_threshold,
-                                    "mesh: evicting stale peer — VDF below threshold"
+                                    stale_secs = STALE_PEER_SECS,
+                                    "mesh: evicting stale peer — not seen recently"
                                 );
-                                st.mesh.spiral.remove_peer(peer_id);
-                                st.mesh.latency_gossip.remove_peer(peer_id);
+                                st.mesh.spiral.remove_peer(evicted_key);
+                                st.mesh.latency_gossip.remove_peer(evicted_key);
                             }
                         }
 
@@ -818,10 +925,16 @@ pub fn spawn_event_processor(
                     }
 
                     // Per-site dedup: cap disconnected peers per SITE_NAME.
-                    let our_id = st.lens.peer_id.clone();
-                    let site_evicted = dedup_peers_per_site(&mut st.mesh, &our_id);
+                    let site_evicted = dedup_peers_per_site(&mut st.mesh, &our_pid);
                     if !site_evicted.is_empty() {
                         st.notify_topology_change();
+                    }
+
+                    // Track which node each relay is connected to.
+                    // This lets us detect when two relay keys reach the same node
+                    // (e.g. LAGOON_PEERS key "iad" and inbound node "node-XXXX").
+                    if let Some(relay) = st.federation.relays.get_mut(&remote_host) {
+                        relay.remote_node_name = Some(node_name.clone());
                     }
 
                     // Connection reciprocity: if this peer connected to us and
@@ -829,10 +942,20 @@ pub fn spawn_event_processor(
                     // This ensures bidirectional connectivity in the mesh.
                     // NOTE: must happen BEFORE sending MESH PEERS/TOPOLOGY/SPORE,
                     // because those sends go via st.federation.relays.
-                    if !st.federation.relays.contains_key(&node_name) {
+                    //
+                    // Skip if we already reach this peer via any existing relay:
+                    // - By node_name key (direct match)
+                    // - By remote_host key (outbound relay, e.g. "lhr" from LAGOON_PEERS)
+                    // - By node_name (another relay already identified this node)
+                    let already_reached =
+                        st.federation.relays.contains_key(&node_name)
+                        || (remote_host != node_name
+                            && st.federation.relays.contains_key(&remote_host))
+                        || st.federation.relays.values().any(|r|
+                            r.remote_node_name.as_deref() == Some(node_name.as_str()));
+                    if !already_reached {
                         let should_connect = !st.mesh.spiral.is_claimed()
-                            || st.full_telemetry
-                            || st.mesh.spiral.is_neighbor(&lens_id);
+                            || st.mesh.spiral.is_neighbor(&mkey);
 
                         if should_connect {
                             info!(
@@ -849,7 +972,7 @@ pub fn spawn_event_processor(
                             let peer_ygg_addr = st
                                 .mesh
                                 .known_peers
-                                .get(&lens_id)
+                                .get(&mkey)
                                 .and_then(|p| p.yggdrasil_addr.as_deref())
                                 .and_then(|s| s.parse().ok());
 
@@ -891,6 +1014,7 @@ pub fn spawn_event_processor(
                                     mesh_connected: true,
                                     is_bootstrap: false,
                                     last_rtt_ms: None,
+                                    remote_node_name: Some(node_name.clone()),
                                 },
                             );
                         }
@@ -944,6 +1068,37 @@ pub fn spawn_event_processor(
                             }
                         }
                     }
+
+                    // Dedup: if two relays now point to the same node (same
+                    // remote_node_name), shut down the non-bootstrap one.
+                    // Handles the race where an inbound HELLO created a reciprocal
+                    // before the outbound relay's HELLO identified the same node.
+                    let dupe_key: Option<String> = st.federation.relays.iter()
+                        .find(|(k, r)| {
+                            *k != &remote_host
+                                && r.remote_node_name.as_deref() == Some(node_name.as_str())
+                        })
+                        .map(|(k, _)| k.clone());
+                    if let Some(dupe) = dupe_key {
+                        let dupe_is_bootstrap = st.federation.relays
+                            .get(&dupe).map_or(false, |r| r.is_bootstrap);
+                        let this_is_bootstrap = st.federation.relays
+                            .get(&remote_host).map_or(false, |r| r.is_bootstrap);
+                        // Keep the bootstrap relay; remove the reciprocal.
+                        let remove_key = if dupe_is_bootstrap && !this_is_bootstrap {
+                            remote_host.clone()
+                        } else {
+                            dupe
+                        };
+                        if let Some(removed) = st.federation.relays.remove(&remove_key) {
+                            info!(
+                                removed = %remove_key,
+                                node_name,
+                                "mesh: deduplicating — two connections to same node"
+                            );
+                            let _ = removed.outgoing_tx.send(RelayCommand::Shutdown);
+                        }
+                    }
                 }
 
                 RelayEvent::MeshPeers {
@@ -951,7 +1106,7 @@ pub fn spawn_event_processor(
                     peers,
                 } => {
                     // Query Yggdrasil metrics before acquiring write lock.
-                    let ygg_peers = refresh_ygg_metrics(&ygg_socket).await;
+                    let ygg_peers = refresh_ygg_metrics_embedded(&ygg_node);
 
                     let mut st = state.write().await;
 
@@ -972,32 +1127,47 @@ pub fn spawn_event_processor(
                             peer.site_name = super::server::derive_site_name(&peer.server_name);
                         }
 
-                        if st.mesh.defederated.contains(&peer.lens_id)
+                        // Identity = peer_id (public key).
+                        let mkey = peer.peer_id.clone();
+
+                        if st.mesh.defederated.contains(&peer.peer_id)
                             || st.mesh.defederated.contains(&peer.server_name)
                         {
                             continue;
                         }
-                        if peer.lens_id == st.lens.peer_id {
-                            continue; // Don't add ourselves.
+                        // Don't add ourselves.
+                        let our_pid = st.lens.peer_id.clone();
+                        if mkey == our_pid {
+                            continue;
                         }
 
                         // Register SPIRAL position from gossiped peer info.
                         if let Some(idx) = peer.spiral_index {
                             st.mesh.spiral.add_peer(
-                                &peer.lens_id,
+                                &mkey,
                                 citadel_topology::Spiral3DIndex::new(idx),
                             );
                         }
 
-                        // Register with latency gossip (peer_id → node_name routing).
+                        // Register with latency gossip (mesh_key → node_name routing).
                         st.mesh.latency_gossip.register_peer(
-                            peer.lens_id.clone(), peer.node_name.clone(),
+                            mkey.clone(), peer.node_name.clone(),
                         );
 
-                        if !st.mesh.known_peers.contains_key(&peer.lens_id) {
+                        if !st.mesh.known_peers.contains_key(&mkey) {
+                            // With 2D mesh keying, same (site, node) = same key.
+                            // If a CONNECTED entry already exists for this key,
+                            // the live connection is authoritative — don't overwrite.
+                            if st.mesh.connections.get(&mkey).copied()
+                                == Some(MeshConnectionState::Connected)
+                            {
+                                continue;
+                            }
+
                             info!(
                                 remote_host,
-                                peer_id = %peer.lens_id,
+                                mesh_key = %mkey,
+                                peer_id = %peer.peer_id,
                                 server = %peer.server_name,
                                 node = %peer.node_name,
                                 port = peer.port,
@@ -1010,13 +1180,15 @@ pub fn spawn_event_processor(
                             let port = peer.port;
                             let tls = peer.tls;
                             newly_discovered.push(peer.clone());
-                            st.mesh.known_peers.insert(peer.lens_id.clone(), peer);
+                            st.mesh.known_peers.insert(mkey.clone(), peer);
                             changed = true;
                             new_peer_servers.push((peer_node_name, server_name, port, tls));
-                        } else if let Some(existing) = st.mesh.known_peers.get_mut(&peer.lens_id) {
+                        } else if let Some(existing) = st.mesh.known_peers.get_mut(&mkey) {
                             // Update telemetry if incoming data is fresher.
                             if peer.last_seen > existing.last_seen {
                                 existing.last_seen = peer.last_seen;
+                                existing.peer_id = peer.peer_id.clone();
+                                existing.public_key_hex = peer.public_key_hex.clone();
                                 existing.vdf_hash = peer.vdf_hash.clone();
                                 existing.vdf_step = peer.vdf_step;
                                 // SPIRAL slot: first-writer-wins.
@@ -1024,7 +1196,7 @@ pub fn spawn_event_processor(
                                     existing.spiral_index = peer.spiral_index;
                                     if let Some(idx) = peer.spiral_index {
                                         st.mesh.spiral.add_peer(
-                                            &peer.lens_id,
+                                            &mkey,
                                             citadel_topology::Spiral3DIndex::new(idx),
                                         );
                                     }
@@ -1036,13 +1208,16 @@ pub fn spawn_event_processor(
 
                     // Per-site dedup BEFORE re-gossip — prevents evict/re-discover loops
                     // where evicted peers get re-gossiped, re-inserted, evicted again.
-                    let our_id = st.lens.peer_id.clone();
-                    let site_evicted = dedup_peers_per_site(&mut st.mesh, &our_id);
+                    let our_pid = st.lens.peer_id.clone();
+                    let site_evicted = dedup_peers_per_site(&mut st.mesh, &our_pid);
                     if !site_evicted.is_empty() {
                         changed = true;
                         // Remove evicted peers from newly_discovered so we don't
                         // re-gossip entries that were just evicted.
-                        newly_discovered.retain(|p| !site_evicted.contains(&p.lens_id));
+                        let evicted_pids: HashSet<String> = site_evicted.iter().cloned().collect();
+                        newly_discovered.retain(|p| {
+                            !evicted_pids.contains(&p.peer_id)
+                        });
                         // Also remove from new_peer_servers (matched by node_name).
                         let evicted_nodes: HashSet<String> = site_evicted.iter()
                             .filter_map(|id| st.mesh.known_peers.get(id))
@@ -1069,10 +1244,11 @@ pub fn spawn_event_processor(
                     // If we haven't claimed a SPIRAL position yet, claim one now
                     // that we have occupancy data from the network.
                     if !st.mesh.spiral.is_claimed() {
-                        let our_peer_id = st.lens.peer_id.clone();
-                        let idx = st.mesh.spiral.claim_position(&our_peer_id);
+                        let our_pid = st.lens.peer_id.clone();
+                        let idx = st.mesh.spiral.claim_position(&our_pid);
                         info!(
                             spiral_index = idx.value(),
+                            peer_id = %our_pid,
                             "mesh: claimed SPIRAL slot"
                         );
 
@@ -1095,6 +1271,10 @@ pub fn spawn_event_processor(
                                 json: hello_json.clone(),
                             });
                         }
+
+                        // Now that SPIRAL is active, drop all non-SPIRAL relays.
+                        // Bootstrap connections served their purpose — discovery is done.
+                        prune_non_spiral_relays(&mut st);
                     }
 
                     if changed {
@@ -1135,17 +1315,17 @@ pub fn spawn_event_processor(
                             }
 
                             // SPIRAL gate: if we have a position, only connect
-                            // to SPIRAL neighbors. Override: full_telemetry
-                            // connects to ALL peers regardless of SPIRAL.
-                            if spiral_active && !st.full_telemetry {
-                                let is_neighbor = st.mesh.known_peers.values()
-                                    .find(|p| p.node_name == node_name)
-                                    .map(|p| st.mesh.spiral.is_neighbor(&p.lens_id))
+                            // to SPIRAL neighbors. Non-SPIRAL peers are reachable
+                            // transitively through the overlay.
+                            if spiral_active {
+                                let is_neighbor = st.mesh.known_peers.iter()
+                                    .find(|(_, p)| p.node_name == node_name)
+                                    .map(|(pid, _)| st.mesh.spiral.is_neighbor(pid))
                                     .unwrap_or(false);
                                 if !is_neighbor {
-                                    info!(
+                                    tracing::debug!(
                                         peer = %node_name,
-                                        "mesh: skipping non-SPIRAL-neighbor"
+                                        "mesh: skipping non-SPIRAL-neighbor (reachable via overlay)"
                                     );
                                     continue;
                                 }
@@ -1180,8 +1360,13 @@ pub fn spawn_event_processor(
                             };
 
                             // Add transport hints for this peer so connect() knows
-                            // how to reach it. If we have a Yggdrasil address,
-                            // resolve() will use it directly — no DNS needed.
+                            // how to reach it.
+                            //
+                            // When peer_ygg_addr is set, connect() takes the overlay
+                            // WebSocket path (ws://[ygg_addr]:8080/api/federation/ws)
+                            // automatically — no DNS, no TLS, Ygg encrypts transport.
+                            // The port/tls fields are irrelevant for overlay peers
+                            // because the transport layer overrides them.
                             let mut tc_with_peer = (*tc).clone();
                             tc_with_peer.peers.entry(connect_key.clone()).or_insert(
                                 transport::PeerEntry {
@@ -1212,6 +1397,7 @@ pub fn spawn_event_processor(
                                     mesh_connected: true,
                                     is_bootstrap: false,
                                     last_rtt_ms: None,
+                                    remote_node_name: None,
                                 },
                             );
                         }
@@ -1225,10 +1411,10 @@ pub fn spawn_event_processor(
                         let has_ygg_spiral_neighbor = st.federation.relays.iter()
                             .filter(|(_, relay)| relay.mesh_connected && !relay.is_bootstrap)
                             .any(|(host, _)| {
-                                st.mesh.known_peers.values()
-                                    .find(|p| p.node_name == **host)
-                                    .map(|p| {
-                                        st.mesh.spiral.is_neighbor(&p.lens_id)
+                                st.mesh.known_peers.iter()
+                                    .find(|(_, p)| p.node_name == **host)
+                                    .map(|(pid, p)| {
+                                        st.mesh.spiral.is_neighbor(pid)
                                             && p.yggdrasil_addr.is_some()
                                     })
                                     .unwrap_or(false)
@@ -1238,9 +1424,11 @@ pub fn spawn_event_processor(
                             let to_prune: Vec<String> = st.federation.relays.iter()
                                 .filter(|(_, relay)| relay.is_bootstrap)
                                 .filter(|(host, _)| {
-                                    st.mesh.known_peers.values()
-                                        .find(|p| p.node_name == **host)
-                                        .map(|p| !st.mesh.spiral.is_neighbor(&p.lens_id))
+                                    st.mesh.known_peers.iter()
+                                        .find(|(_, p)| p.node_name == **host)
+                                        .map(|(pid, _)| {
+                                            !st.mesh.spiral.is_neighbor(pid)
+                                        })
                                         .unwrap_or(false)
                                 })
                                 .map(|(host, _)| host.clone())
@@ -1258,30 +1446,9 @@ pub fn spawn_event_processor(
                         }
                     }
 
-                    // --- General non-neighbor pruning (only when NOT full_telemetry) ---
-                    // User-initiated relays (mesh_connected=false) are never pruned.
-                    if st.mesh.spiral.is_claimed() && !st.full_telemetry {
-                        let to_prune: Vec<String> = st.federation.relays.iter()
-                            .filter(|(_, relay)| relay.mesh_connected && !relay.is_bootstrap)
-                            .filter(|(host, _)| {
-                                st.mesh.known_peers.values()
-                                    .find(|p| p.node_name == **host)
-                                    .map(|p| !st.mesh.spiral.is_neighbor(&p.lens_id))
-                                    .unwrap_or(false)
-                            })
-                            .map(|(host, _)| host.clone())
-                            .collect();
-
-                        for host in to_prune {
-                            info!(
-                                peer = %host,
-                                "mesh: disconnecting non-SPIRAL-neighbor relay"
-                            );
-                            if let Some(relay) = st.federation.relays.remove(&host) {
-                                let _ = relay.outgoing_tx.send(RelayCommand::Shutdown);
-                            }
-                        }
-                    }
+                    // Prune non-SPIRAL relays. SPIRAL is the sole authority
+                    // on which direct connections we maintain.
+                    prune_non_spiral_relays(&mut st);
                 }
 
                 RelayEvent::MeshTopology {
@@ -1351,7 +1518,7 @@ pub fn spawn_event_processor(
 
                 RelayEvent::MeshSync { remote_host } => {
                     // Query Ygg metrics before responding.
-                    let ygg_peers = refresh_ygg_metrics(&ygg_socket).await;
+                    let ygg_peers = refresh_ygg_metrics_embedded(&ygg_node);
 
                     // A peer wants our full peer table — respond with MESH PEERS.
                     let mut st = state.write().await;
@@ -1493,9 +1660,9 @@ pub fn spawn_event_processor(
                             .map(|d| d.as_millis() as i64)
                             .unwrap_or(0);
 
-                        let our_peer_id = st.lens.peer_id.clone();
+                        let our_pid = st.lens.peer_id.clone();
                         let edge = super::proof_store::ProofStore::edge_key(
-                            &our_peer_id, &peer_id,
+                            &our_pid, &peer_id,
                         );
 
                         // Simple measurement payload (full PoLP crypto is Phase 3).
@@ -1567,7 +1734,7 @@ pub fn spawn_event_processor(
 
                         let st = state.read().await;
 
-                        let from_peer_id = st.mesh.known_peers.iter()
+                        let from_mkey = st.mesh.known_peers.iter()
                             .find(|(_, p)| p.node_name == remote_host)
                             .map(|(id, _)| id.clone())
                             .unwrap_or_default();
@@ -1576,7 +1743,7 @@ pub fn spawn_event_processor(
                         let our_proof_data = st.mesh.proof_store.proof_data_for_gossip();
 
                         if let Some(action) = st.mesh.latency_gossip.on_have_list_received(
-                            &from_peer_id,
+                            &from_mkey,
                             &spore_bytes,
                             our_spore,
                             &our_proof_data,
@@ -1811,6 +1978,7 @@ async fn backoff_drain(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(RelayCommand::Shutdown) => return false,
+                    Some(RelayCommand::Reconnect) => {} // Already reconnecting.
                     Some(RelayCommand::MeshHello { json }) => {
                         *saved_mesh_hello = Some(json);
                     }
@@ -1842,27 +2010,37 @@ async fn relay_task(
     // Alias for backward compat with log and event field names.
     let remote_host = relay_key;
 
-    let max_attempts: u32 = 10;
     let mut consecutive_failures: u32 = 0;
     let mut saved_mesh_hello: Option<String> = None;
+    // When true, don't reset consecutive_failures on next successful connect
+    // (self-connection via anycast — TCP connect succeeds but MESH HELLO detects
+    // same node, so we need escalating backoff not constant 2s retries).
+    let mut self_connect_backoff = false;
 
     'reconnect: loop {
     let mut relay_nick = base_relay_nick.clone();
 
-    let stream = match transport::connect(&connect_target, &transport_config).await {
-        Ok(s) => {
-            consecutive_failures = 0;
-            s
+    let (stream, relay_peer_addr) = match transport::connect(&connect_target, &transport_config).await {
+        Ok(r) => {
+            if self_connect_backoff {
+                self_connect_backoff = false;
+                // Don't reset — let backoff escalate across self-connections.
+            } else {
+                consecutive_failures = 0;
+            }
+            (r.stream, r.peer_addr)
         }
         Err(e) => {
             consecutive_failures += 1;
-            if consecutive_failures >= max_attempts {
-                warn!(%remote_host, %connect_target, attempts = consecutive_failures,
-                    "federation: giving up after repeated connect failures: {e}");
-                break 'reconnect;
+            // Log at warn for first few failures, then demote to debug to
+            // avoid log spam for persistently-unreachable peers.
+            if consecutive_failures <= 3 {
+                warn!(%remote_host, %connect_target, attempt = consecutive_failures,
+                    "federation: connect failed, will retry: {e}");
+            } else if consecutive_failures % 30 == 0 {
+                warn!(%remote_host, %connect_target, attempt = consecutive_failures,
+                    "federation: still failing to connect: {e}");
             }
-            warn!(%remote_host, %connect_target, attempt = consecutive_failures,
-                "federation: connect failed, will retry: {e}");
             if !backoff_drain(&mut cmd_rx, &mut saved_mesh_hello, consecutive_failures).await {
                 return;
             }
@@ -1897,10 +2075,6 @@ async fn relay_task(
             .is_err()
     {
         consecutive_failures += 1;
-        if consecutive_failures >= max_attempts {
-            warn!(remote_host, "federation: giving up after registration failure");
-            break 'reconnect;
-        }
         warn!(remote_host, attempt = consecutive_failures,
             "federation: registration send failed, will retry");
         if !backoff_drain(&mut cmd_rx, &mut saved_mesh_hello, consecutive_failures).await {
@@ -2176,7 +2350,7 @@ async fn relay_task(
                                         };
                                         let _ = event_tx.send(RelayEvent::MeshHello {
                                             remote_host: remote_host.clone(),
-                                            lens_id: hello.peer_id,
+                                            peer_id: hello.peer_id,
                                             server_name: hello.server_name,
                                             public_key_hex: hello.public_key_hex,
                                             spiral_index: hello.spiral_index,
@@ -2186,6 +2360,10 @@ async fn relay_task(
                                             yggdrasil_addr: hello.yggdrasil_addr,
                                             site_name,
                                             node_name,
+                                            vdf_resonance_credit: hello.vdf_resonance_credit,
+                                            vdf_actual_rate_hz: hello.vdf_actual_rate_hz,
+                                            ygg_peer_uri: hello.ygg_peer_uri,
+                                            relay_peer_addr,
                                         });
                                     } else {
                                         warn!(remote_host, "mesh: invalid HELLO payload");
@@ -2284,6 +2462,17 @@ async fn relay_task(
                         let _ = framed.send(quit).await;
                         return;
                     }
+                    RelayCommand::Reconnect => {
+                        info!(remote_host, "federation: reconnect requested (self-connection via anycast)");
+                        self_connect_backoff = true; // Escalate backoff across retries
+                        let quit = Message {
+                            prefix: None,
+                            command: "QUIT".into(),
+                            params: vec!["Reconnecting".into()],
+                        };
+                        let _ = framed.send(quit).await;
+                        break; // Break inner loop → reconnect loop with backoff
+                    }
                     RelayCommand::JoinChannel { remote_channel, local_channel } => {
                         if registered {
                             channels.insert(remote_channel.clone(), TaskChannel {
@@ -2365,11 +2554,6 @@ async fn relay_task(
 
     // Inner loop broke — connection lost. Try to reconnect.
     consecutive_failures += 1;
-    if consecutive_failures >= max_attempts {
-        warn!(remote_host, attempts = consecutive_failures,
-            "federation: giving up after repeated disconnections");
-        break 'reconnect;
-    }
     info!(remote_host, attempt = consecutive_failures,
         "federation: connection lost, will reconnect");
     if !backoff_drain(&mut cmd_rx, &mut saved_mesh_hello, consecutive_failures).await {
@@ -2377,8 +2561,6 @@ async fn relay_task(
     }
 
     } // end 'reconnect loop
-
-    let _ = event_tx.send(RelayEvent::Disconnected { remote_host });
 }
 
 /// JSON payload for MESH HELLO.
@@ -2408,23 +2590,53 @@ struct MeshHelloPayload {
     /// Node identity within site.
     #[serde(default)]
     pub node_name: String,
+    /// Resonance credit — how precisely this node tracks its target VDF rate [0, 1].
+    #[serde(default)]
+    pub vdf_resonance_credit: Option<f64>,
+    /// Actual measured VDF tick rate (Hz, exponential moving average).
+    #[serde(default)]
+    pub vdf_actual_rate_hz: Option<f64>,
+    /// Yggdrasil peer URI for overlay peering (e.g. `tcp://[200:xxxx::]:9443`).
+    #[serde(default)]
+    pub ygg_peer_uri: Option<String>,
 }
 
 /// Build a MeshHelloPayload from server state (use inside read lock).
 fn build_hello_payload(st: &super::server::ServerState) -> MeshHelloPayload {
-    let (vdf_genesis, vdf_hash, vdf_step) = st
+    let (vdf_genesis, vdf_hash, vdf_step, vdf_resonance_credit, vdf_actual_rate_hz) = st
         .mesh
         .vdf_state_rx
         .as_ref()
         .map(|rx| {
             let vdf = rx.borrow();
+            let (credit, rate) = vdf
+                .resonance
+                .as_ref()
+                .map(|r| (Some(r.credit), Some(r.actual_rate_hz)))
+                .unwrap_or((None, None));
             (
                 Some(hex::encode(vdf.genesis)),
                 Some(hex::encode(vdf.current_hash)),
                 Some(vdf.total_steps),
+                credit,
+                rate,
             )
         })
-        .unwrap_or((None, None, None));
+        .unwrap_or((None, None, None, None, None));
+
+    // Ygg overlay address (for identity/routing, NOT for peering).
+    let yggdrasil_addr = st
+        .transport_config
+        .ygg_node
+        .as_ref()
+        .map(|n| n.address().to_string())
+        .or_else(|| transport::detect_yggdrasil_addr().map(|a| a.to_string()));
+    // Ygg peer URI = UNDERLAY address.  You don't tunnel Ygg through Ygg.
+    // The underlay is the real network (public internet, Fly 6PN, LAN).
+    let ygg_peer_uri = transport::detect_underlay_addr().map(|addr| match addr {
+        std::net::IpAddr::V6(v6) => format!("tcp://[{v6}]:9443"),
+        std::net::IpAddr::V4(v4) => format!("tcp://{v4}:9443"),
+    });
 
     MeshHelloPayload {
         peer_id: st.lens.peer_id.clone(),
@@ -2434,9 +2646,12 @@ fn build_hello_payload(st: &super::server::ServerState) -> MeshHelloPayload {
         vdf_genesis,
         vdf_hash,
         vdf_step,
-        yggdrasil_addr: transport::detect_yggdrasil_addr().map(|a| a.to_string()),
+        yggdrasil_addr,
         site_name: st.lens.site_name.clone(),
         node_name: st.lens.node_name.clone(),
+        vdf_resonance_credit,
+        vdf_actual_rate_hz,
+        ygg_peer_uri,
     }
 }
 
@@ -2453,8 +2668,8 @@ pub fn spawn_mesh_connector(state: SharedState, transport_config: Arc<TransportC
         tokio::spawn(async move {
             let mut st = state.write().await;
             if !st.mesh.spiral.is_claimed() {
-                let our_peer_id = st.lens.peer_id.clone();
-                let idx = st.mesh.spiral.claim_position(&our_peer_id);
+                let our_pid = st.lens.peer_id.clone();
+                let idx = st.mesh.spiral.claim_position(&our_pid);
                 info!(
                     spiral_index = idx.value(),
                     "mesh: claimed SPIRAL slot (no peers configured)"
@@ -2534,6 +2749,7 @@ pub fn spawn_mesh_connector(state: SharedState, transport_config: Arc<TransportC
                     mesh_connected: true,
                     is_bootstrap: true,
                     last_rtt_ms: None,
+                    remote_node_name: None,
                 },
             );
         }

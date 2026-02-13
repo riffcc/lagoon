@@ -78,7 +78,7 @@ async fn mesh_state_tracks_peers() {
         st.mesh.known_peers.insert(
             peer_id.peer_id.clone(),
             MeshPeerInfo {
-                lens_id: peer_id.peer_id.clone(),
+                peer_id: peer_id.peer_id.clone(),
                 server_name: "peer.lagun.co".into(),
                 public_key_hex: peer_id.public_key_hex.clone(),
                 ..Default::default()
@@ -110,7 +110,7 @@ async fn topology_snapshot_includes_self_and_peers() {
         st.mesh.known_peers.insert(
             peer1.peer_id.clone(),
             MeshPeerInfo {
-                lens_id: peer1.peer_id.clone(),
+                peer_id: peer1.peer_id.clone(),
                 server_name: "peer1.lagun.co".into(),
                 public_key_hex: peer1.public_key_hex.clone(),
                 ..Default::default()
@@ -123,7 +123,7 @@ async fn topology_snapshot_includes_self_and_peers() {
         st.mesh.known_peers.insert(
             peer2.peer_id.clone(),
             MeshPeerInfo {
-                lens_id: peer2.peer_id.clone(),
+                peer_id: peer2.peer_id.clone(),
                 server_name: "peer2.lagun.co".into(),
                 public_key_hex: peer2.public_key_hex.clone(),
                 ..Default::default()
@@ -290,7 +290,7 @@ async fn defederation_blocks_peer() {
         st.mesh.known_peers.insert(
             peer.peer_id.clone(),
             MeshPeerInfo {
-                lens_id: peer.peer_id.clone(),
+                peer_id: peer.peer_id.clone(),
                 server_name: "blocked.lagun.co".into(),
                 public_key_hex: peer.public_key_hex.clone(),
                 ..Default::default()
@@ -434,7 +434,7 @@ async fn mesh_snapshot_watch_channel_updates() {
         st.mesh.known_peers.insert(
             peer.peer_id.clone(),
             MeshPeerInfo {
-                lens_id: peer.peer_id.clone(),
+                peer_id: peer.peer_id.clone(),
                 server_name: "dynamic.lagun.co".into(),
                 public_key_hex: peer.public_key_hex.clone(),
                 ..Default::default()
@@ -617,7 +617,7 @@ fn tls_client_config_integration() {
 async fn duplicate_server_names_unique_nodes() {
     let (state, _rx) = make_test_state("hub.lagun.co");
 
-    // Two CDN containers sharing the same server_name but different lens_ids.
+    // Two CDN containers sharing the same server_name but different mesh_keys.
     let cdn1 = lens::generate_identity("lagun.co");
     let cdn2 = lens::generate_identity("lagun.co");
     assert_ne!(cdn1.peer_id, cdn2.peer_id);
@@ -627,7 +627,7 @@ async fn duplicate_server_names_unique_nodes() {
         st.mesh.known_peers.insert(
             cdn1.peer_id.clone(),
             MeshPeerInfo {
-                lens_id: cdn1.peer_id.clone(),
+                peer_id: cdn1.peer_id.clone(),
                 server_name: "lagun.co".into(),
                 public_key_hex: cdn1.public_key_hex.clone(),
                 ..Default::default()
@@ -640,7 +640,7 @@ async fn duplicate_server_names_unique_nodes() {
         st.mesh.known_peers.insert(
             cdn2.peer_id.clone(),
             MeshPeerInfo {
-                lens_id: cdn2.peer_id.clone(),
+                peer_id: cdn2.peer_id.clone(),
                 server_name: "lagun.co".into(),
                 public_key_hex: cdn2.public_key_hex.clone(),
                 ..Default::default()
@@ -665,7 +665,7 @@ async fn duplicate_server_names_unique_nodes() {
     assert_eq!(cdn_nodes.len(), 2);
     assert!(cdn_nodes[0].connected);
     assert!(cdn_nodes[1].connected);
-    assert_ne!(cdn_nodes[0].lens_id, cdn_nodes[1].lens_id);
+    assert_ne!(cdn_nodes[0].mesh_key, cdn_nodes[1].mesh_key);
 
     // Both should have links.
     assert_eq!(snapshot.links.len(), 2);
@@ -692,7 +692,7 @@ async fn web_client_appears_in_topology() {
         .iter()
         .find(|n| n.node_type == "browser")
         .unwrap();
-    assert_eq!(browser.lens_id, "web/alice");
+    assert_eq!(browser.mesh_key, "web/alice");
     assert_eq!(browser.node_type, "browser");
     assert!(browser.connected);
     assert!(!browser.is_self);
@@ -743,7 +743,7 @@ async fn disconnect_cleans_up_connection_state() {
         st.mesh.known_peers.insert(
             peer.peer_id.clone(),
             MeshPeerInfo {
-                lens_id: peer.peer_id.clone(),
+                peer_id: peer.peer_id.clone(),
                 server_name: "remote.lagun.co".into(),
                 public_key_hex: peer.public_key_hex.clone(),
                 ..Default::default()
@@ -798,7 +798,7 @@ async fn disconnect_reclaims_spiral_slot() {
         st.mesh.known_peers.insert(
             peer.peer_id.clone(),
             MeshPeerInfo {
-                lens_id: peer.peer_id.clone(),
+                peer_id: peer.peer_id.clone(),
                 server_name: "peer.lagun.co".into(),
                 public_key_hex: peer.public_key_hex.clone(),
                 ..Default::default()

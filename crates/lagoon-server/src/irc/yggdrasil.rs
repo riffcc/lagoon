@@ -31,8 +31,14 @@ pub enum YggError {
 // ---------------------------------------------------------------------------
 
 /// A single peer from Yggdrasil's `getPeers` response.
+///
+/// Handles both standard Yggdrasil (returns `address` as Ygg IPv6) and
+/// yggstack (returns `key` as Ed25519 public key hex, no `address` field).
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct YggPeer {
+    /// Yggdrasil IPv6 overlay address (e.g. `200:abcd::1`).
+    /// Missing from yggstack responses — derived from `key` via [`key_to_address`].
+    #[serde(default)]
     pub address: String,
     /// Remote peering URI (e.g. `tcp://195.5.161.109:12345`).
     #[serde(default)]
@@ -45,12 +51,19 @@ pub struct YggPeer {
     /// `time.Duration` which serializes as integer nanoseconds).
     #[serde(default)]
     pub latency: f64,
+    /// Ed25519 public key hex (yggstack provides this instead of `address`).
     #[serde(default)]
     pub key: String,
     #[serde(default)]
     pub port: u64,
     #[serde(default)]
     pub uptime: f64,
+    /// Whether the peer connection is up (yggstack field).
+    #[serde(default)]
+    pub up: bool,
+    /// Whether this is an inbound connection (yggstack field).
+    #[serde(default)]
+    pub inbound: bool,
 }
 
 /// Top-level `getPeers` response envelope.
@@ -70,16 +83,135 @@ struct GetPeersInner {
 
 /// Parse the peers field — Yggdrasil has returned both array and map formats
 /// across versions.  We handle both.
+///
+/// After parsing, derives missing `address` fields from `key` (yggstack
+/// returns Ed25519 public key hex instead of the Ygg IPv6 address).
 fn parse_peers(value: serde_json::Value) -> Vec<YggPeer> {
-    // Try array first (0.5+).
+    let mut peers = Vec::new();
+
+    // Try array first (0.5+ / yggstack).
     if let Ok(arr) = serde_json::from_value::<Vec<YggPeer>>(value.clone()) {
-        return arr;
+        peers = arr;
+    } else if let Ok(map) = serde_json::from_value::<HashMap<String, YggPeer>>(value) {
+        // Map format (older versions: address → peer object).
+        peers = map.into_values().collect();
     }
-    // Try map (older versions: address → peer object).
-    if let Ok(map) = serde_json::from_value::<HashMap<String, YggPeer>>(value) {
-        return map.into_values().collect();
+
+    // Derive address from key when missing (yggstack compat).
+    for peer in &mut peers {
+        if peer.address.is_empty() && !peer.key.is_empty() {
+            if let Some(addr) = key_to_address(&peer.key) {
+                peer.address = addr.to_string();
+            }
+        }
     }
-    Vec::new()
+
+    peers
+}
+
+// ---------------------------------------------------------------------------
+// Yggdrasil address derivation from Ed25519 public key
+// ---------------------------------------------------------------------------
+
+/// Derive a Yggdrasil IPv6 address from an Ed25519 public key (hex-encoded).
+///
+/// Reimplements the algorithm from `address.AddrForKey` in yggdrasil-go:
+/// 1. Bitwise invert the 32-byte public key
+/// 2. Count leading 1-bits in the inverted key (`ones`)
+/// 3. Skip leading 1s and the first 0 bit
+/// 4. Collect remaining bits into bytes
+/// 5. Address = `[0x02, ones, remaining_bits...]` (16 bytes total)
+pub fn key_to_address(key_hex: &str) -> Option<std::net::Ipv6Addr> {
+    let key_bytes = hex::decode(key_hex).ok()?;
+    if key_bytes.len() != 32 {
+        return None;
+    }
+
+    // Bitwise invert all bytes.
+    let mut buf = [0u8; 32];
+    for (i, &b) in key_bytes.iter().enumerate() {
+        buf[i] = !b;
+    }
+
+    // Walk bits: count leading 1s, skip first 0, collect rest.
+    // Go uses `byte` which wraps on overflow — we match that behavior.
+    let mut ones: u8 = 0;
+    let mut done = false;
+    let mut bits: u8 = 0;
+    let mut n_bits = 0;
+    let mut temp = Vec::with_capacity(32);
+
+    for idx in 0..(8 * 32) {
+        let bit = (buf[idx / 8] >> (7 - (idx % 8))) & 1;
+        if !done && bit != 0 {
+            ones = ones.wrapping_add(1);
+            continue;
+        }
+        if !done {
+            // First 0 bit after leading 1s — skip it.
+            done = true;
+            continue;
+        }
+        bits = (bits << 1) | bit;
+        n_bits += 1;
+        if n_bits == 8 {
+            n_bits = 0;
+            temp.push(bits);
+            bits = 0;
+        }
+    }
+
+    // Assemble: [prefix(0x02), ones, remaining_bits...]
+    let mut addr = [0u8; 16];
+    addr[0] = 0x02;
+    addr[1] = ones;
+    let copy_len = temp.len().min(14); // 16 - 2 = 14 bytes available
+    addr[2..2 + copy_len].copy_from_slice(&temp[..copy_len]);
+
+    Some(std::net::Ipv6Addr::from(addr))
+}
+
+// ---------------------------------------------------------------------------
+// Remote URI hostname resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve DNS hostnames in a peer's `remote` URI to IP addresses.
+///
+/// Yggstack's `remote` field may contain unresolved hostnames
+/// (e.g. `tcp://lhr.anycast-mesh.internal:9443`). We need resolved IPs
+/// so that [`find_peer_by_remote_ip`] can match federation targets.
+async fn resolve_remote_hostname(remote: &str) -> Option<String> {
+    // Extract scheme and host:port.
+    let (scheme, host_port) = if let Some(idx) = remote.find("://") {
+        (&remote[..idx], &remote[idx + 3..])
+    } else {
+        ("tcp", remote)
+    };
+
+    // Bracketed IPv6 — already resolved, skip.
+    if host_port.starts_with('[') {
+        return None;
+    }
+
+    // Split host:port.
+    let (host, port) = host_port.rsplit_once(':')?;
+
+    // If host already parses as an IP, skip.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+
+    // Resolve hostname via tokio (uses getaddrinfo / glibc).
+    let lookup = format!("{host}:{port}");
+    let mut addrs = tokio::net::lookup_host(&lookup).await.ok()?;
+    let first = addrs.next()?;
+    let ip = first.ip();
+
+    // Reconstruct URI with resolved IP.
+    match ip {
+        std::net::IpAddr::V4(v4) => Some(format!("{scheme}://{v4}:{port}")),
+        std::net::IpAddr::V6(v6) => Some(format!("{scheme}://[{v6}]:{port}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +229,6 @@ pub fn find_peer_by_remote_ip(
     peers: &[YggPeer],
     target_ip: &std::net::IpAddr,
 ) -> Option<std::net::Ipv6Addr> {
-    let target_str = target_ip.to_string();
     for peer in peers {
         if peer.remote.is_empty() {
             continue;
@@ -108,9 +239,22 @@ pub fn find_peer_by_remote_ip(
             .find("://")
             .map(|i| &peer.remote[i + 3..])
             .unwrap_or(&peer.remote);
-        // Strip port to get bare IP.
-        let ip_str = host_port.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_port);
-        if ip_str == target_str {
+        // Handle bracketed IPv6: [addr]:port → addr
+        let ip_str = if host_port.starts_with('[') {
+            host_port
+                .find(']')
+                .map(|i| &host_port[1..i])
+                .unwrap_or(host_port)
+        } else {
+            // IPv4 or unbracketed: strip port after last colon.
+            host_port.rsplit_once(':').map(|(h, _)| h).unwrap_or(host_port)
+        };
+        // Parse as IpAddr for correct comparison (handles different IPv6 representations).
+        let matches = ip_str
+            .parse::<std::net::IpAddr>()
+            .map(|peer_ip| &peer_ip == target_ip)
+            .unwrap_or(false);
+        if matches {
             if let Ok(ygg_addr) = peer.address.parse::<std::net::Ipv6Addr>() {
                 return Some(ygg_addr);
             }
@@ -149,11 +293,27 @@ pub async fn query_peers(socket_path: &str) -> Result<Vec<YggPeer>, YggError> {
 
     let envelope: GetPeersResponse = serde_json::from_slice(&response_bytes)?;
 
-    let peers = envelope
+    let mut peers = envelope
         .response
         .and_then(|r| r.peers)
         .map(parse_peers)
         .unwrap_or_default();
+
+    // Resolve DNS hostnames in `remote` fields so find_peer_by_remote_ip
+    // can match federation targets by IP address.
+    for peer in &mut peers {
+        if let Some(resolved) = resolve_remote_hostname(&peer.remote).await {
+            debug!(
+                original = %peer.remote,
+                resolved = %resolved,
+                address = %peer.address,
+                "yggdrasil: resolved peer remote hostname"
+            );
+            peer.remote = resolved;
+        }
+    }
+
+    debug!(peer_count = peers.len(), "yggdrasil: getPeers parsed");
 
     Ok(peers)
 }
@@ -372,6 +532,8 @@ mod tests {
             key: String::new(),
             port: 1,
             uptime: 0.0,
+            up: false,
+            inbound: false,
         }
     }
 
@@ -545,9 +707,179 @@ mod tests {
     }
 
     #[test]
+    fn find_peer_by_remote_ip_bracketed_ipv6() {
+        let peers = vec![YggPeer {
+            remote: "tcp://[2a09:8280:5d::d2:e42f:0]:9443".into(),
+            ..test_peer("200:fcf:205:9dec:ff7b:e2f:7b00:51ac")
+        }];
+        let target: std::net::IpAddr = "2a09:8280:5d::d2:e42f:0".parse().unwrap();
+        let result = find_peer_by_remote_ip(&peers, &target);
+        assert_eq!(
+            result,
+            Some("200:fcf:205:9dec:ff7b:e2f:7b00:51ac".parse().unwrap())
+        );
+    }
+
+    #[test]
     fn find_peer_by_remote_ip_empty_remote() {
         let peers = vec![test_peer("200:abcd::1")];
         let target: std::net::IpAddr = "195.5.161.109".parse().unwrap();
         assert!(find_peer_by_remote_ip(&peers, &target).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // key_to_address tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn key_to_address_produces_200_prefix() {
+        // Any valid 32-byte key should produce a 200::/7 address.
+        let key = "a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1";
+        let addr = key_to_address(key).unwrap();
+        let octets = addr.octets();
+        // 200::/7 means first byte is 0x02 or 0x03
+        assert!(octets[0] == 0x02 || octets[0] == 0x03, "got {:02x}", octets[0]);
+    }
+
+    #[test]
+    fn key_to_address_deterministic() {
+        let key = "deadbeefcafebabe1234567890abcdef1122334455667788aabbccddeeff0011";
+        let a = key_to_address(key).unwrap();
+        let b = key_to_address(key).unwrap();
+        assert_eq!(a, b, "same key must produce same address");
+    }
+
+    #[test]
+    fn key_to_address_different_keys_different_addrs() {
+        let k1 = "a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1";
+        let k2 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let a1 = key_to_address(k1).unwrap();
+        let a2 = key_to_address(k2).unwrap();
+        assert_ne!(a1, a2);
+    }
+
+    #[test]
+    fn key_to_address_invalid_hex() {
+        assert!(key_to_address("not_hex").is_none());
+    }
+
+    #[test]
+    fn key_to_address_wrong_length() {
+        assert!(key_to_address("aabbccdd").is_none());
+    }
+
+    #[test]
+    fn key_to_address_all_zeros() {
+        // All-zeros key → inverted = all-ones → 256 leading 1 bits.
+        // Go's `byte` wraps: 256 → 0. No 0-bit is ever found, so `done`
+        // stays false and `temp` is empty.
+        // Address: [0x02, 0x00, 0, 0, ...] (matches Go wrapping behavior).
+        let key = "0000000000000000000000000000000000000000000000000000000000000000";
+        let addr = key_to_address(key).unwrap();
+        let octets = addr.octets();
+        assert_eq!(octets[0], 0x02);
+        assert_eq!(octets[1], 0x00); // wraps: 256 → 0
+    }
+
+    #[test]
+    fn key_to_address_all_ff() {
+        // All-0xFF key → inverted = all-zeros → 0 leading 1s, first 0 bit
+        // skipped, remaining = zeros (starting from bit 1).
+        let key = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let addr = key_to_address(key).unwrap();
+        let octets = addr.octets();
+        assert_eq!(octets[0], 0x02);
+        assert_eq!(octets[1], 0x00); // zero leading ones
+    }
+
+    // -----------------------------------------------------------------------
+    // yggstack-format getPeers response parsing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_yggstack_format_peers() {
+        // Yggstack returns peers with `key` instead of `address`, and extra
+        // fields like `cost`, `inbound`, `up`, etc.
+        let json = r#"{
+            "request": "getpeers",
+            "status": "success",
+            "response": {
+                "peers": [
+                    {
+                        "cost": 65535,
+                        "inbound": false,
+                        "key": "deadbeefcafebabe1234567890abcdef1122334455667788aabbccddeeff0011",
+                        "last_error": "",
+                        "last_error_time": "0001-01-01T00:00:00Z",
+                        "port": 1,
+                        "priority": 0,
+                        "remote": "tcp://[fdaa:0:bca3:a7b:0:0:eb5a:2]:9443",
+                        "up": true
+                    }
+                ]
+            }
+        }"#;
+
+        let envelope: GetPeersResponse = serde_json::from_str(json).unwrap();
+        let peers = envelope
+            .response
+            .and_then(|r| r.peers)
+            .map(parse_peers)
+            .unwrap_or_default();
+
+        assert_eq!(peers.len(), 1);
+        // Address should be derived from key.
+        assert!(!peers[0].address.is_empty(), "address should be derived from key");
+        assert!(peers[0].address.starts_with("2"), "should be 200::/7 address");
+        assert_eq!(peers[0].remote, "tcp://[fdaa:0:bca3:a7b:0:0:eb5a:2]:9443");
+        assert!(peers[0].up);
+        assert!(!peers[0].inbound);
+    }
+
+    #[test]
+    fn parse_yggstack_format_with_hostname_remote() {
+        // Yggstack may return DNS hostnames in `remote` (before entrypoint resolves).
+        let json = r#"{
+            "response": {
+                "peers": [
+                    {
+                        "key": "deadbeefcafebabe1234567890abcdef1122334455667788aabbccddeeff0011",
+                        "remote": "tcp://lhr.anycast-mesh.internal:9443",
+                        "up": true,
+                        "port": 1
+                    }
+                ]
+            }
+        }"#;
+
+        let envelope: GetPeersResponse = serde_json::from_str(json).unwrap();
+        let peers = envelope
+            .response
+            .and_then(|r| r.peers)
+            .map(parse_peers)
+            .unwrap_or_default();
+
+        assert_eq!(peers.len(), 1);
+        assert!(!peers[0].address.is_empty());
+        assert_eq!(peers[0].key, "deadbeefcafebabe1234567890abcdef1122334455667788aabbccddeeff0011");
+    }
+
+    #[test]
+    fn find_peer_by_remote_ip_with_derived_address() {
+        // Simulate a yggstack peer with address derived from key.
+        let key = "deadbeefcafebabe1234567890abcdef1122334455667788aabbccddeeff0011";
+        let derived_addr = key_to_address(key).unwrap();
+
+        let peers = vec![YggPeer {
+            address: derived_addr.to_string(),
+            remote: "tcp://[fdaa:0:bca3:a7b:0:0:eb5a:2]:9443".into(),
+            key: key.into(),
+            up: true,
+            ..test_peer("")
+        }];
+
+        let target: std::net::IpAddr = "fdaa:0:bca3:a7b:0:0:eb5a:2".parse().unwrap();
+        let result = find_peer_by_remote_ip(&peers, &target);
+        assert_eq!(result, Some(derived_addr));
     }
 }
