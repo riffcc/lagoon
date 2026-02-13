@@ -199,8 +199,19 @@ fn prune_non_spiral_relays(st: &mut super::server::ServerState) {
         return;
     }
 
+    // Don't prune if we have very few connections. With a small mesh, every
+    // connection is precious. Pruning is for shedding excess connections in a
+    // large topology, not for killing the only links in a 3-node cluster.
+    let non_bootstrap = st.federation.relays.values()
+        .filter(|h| !h.is_bootstrap)
+        .count();
+    let neighbor_count = st.mesh.spiral.neighbors().len();
+    if non_bootstrap <= neighbor_count.max(2) {
+        return;
+    }
+
     let to_prune: Vec<String> = st.federation.relays.iter()
-        .filter(|(_, handle)| {
+        .filter(|(key, handle)| {
             // Never prune bootstrap peers — they're the network backbone.
             if handle.is_bootstrap {
                 return false;
@@ -209,6 +220,15 @@ fn prune_non_spiral_relays(st: &mut super::server::ServerState) {
                 .find(|(_, p)| p.node_name == handle.remote_host)
                 .map(|(pid, _)| st.mesh.spiral.is_neighbor(pid))
                 .unwrap_or(false);
+            if !is_neighbor {
+                info!(
+                    relay = %key,
+                    remote_host = %handle.remote_host,
+                    neighbor_count,
+                    non_bootstrap,
+                    "mesh: prune candidate — not a SPIRAL neighbor"
+                );
+            }
             !is_neighbor
         })
         .map(|(key, _)| key.clone())
@@ -217,7 +237,7 @@ fn prune_non_spiral_relays(st: &mut super::server::ServerState) {
     for node_name in to_prune {
         if let Some(handle) = st.federation.relays.remove(&node_name) {
             info!(node = %node_name, "mesh: pruned non-SPIRAL relay");
-            handle.task_handle.abort();
+            let _ = handle.outgoing_tx.send(RelayCommand::Shutdown);
         }
     }
 }
@@ -2471,14 +2491,14 @@ async fn relay_task_native(
     let mut consecutive_failures: u32 = 0;
 
     'reconnect: loop {
+        let connected_at = std::time::Instant::now();
+
         let outcome = match transport::connect_native(&connect_target, &transport_config).await {
             Ok(transport::NativeWs::Ygg(ws)) => {
-                consecutive_failures = 0;
                 info!(%remote_host, "native relay: connected via Ygg overlay");
                 native_ws_loop(ws, &remote_host, &mut cmd_rx, &event_tx, &state).await
             }
             Ok(transport::NativeWs::Tls(ws)) => {
-                consecutive_failures = 0;
                 info!(%remote_host, "native relay: connected via TLS WebSocket");
                 native_ws_loop(ws, &remote_host, &mut cmd_rx, &event_tx, &state).await
             }
@@ -2498,11 +2518,23 @@ async fn relay_task_native(
             }
         };
 
+        // Only reset failure counter if the connection lived long enough to be
+        // productive. Self-connections (anycast routes to self) succeed at the
+        // WebSocket level but die immediately at Hello exchange. Without this
+        // guard, failures resets to 0 on every self-connect → backoff never
+        // escalates → rapid reconnect churn.
+        let connection_lived = connected_at.elapsed() > std::time::Duration::from_secs(10);
+
         match outcome {
             NativeLoopOutcome::Shutdown => return,
             NativeLoopOutcome::Reconnect => {
-                consecutive_failures += 1;
+                if connection_lived {
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                }
                 info!(%remote_host, attempt = consecutive_failures,
+                    lived_secs = connected_at.elapsed().as_secs(),
                     "native relay: connection lost, will reconnect");
                 if !backoff_drain_native(&mut cmd_rx, consecutive_failures).await {
                     return;
