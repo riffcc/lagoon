@@ -523,6 +523,16 @@ pub fn detect_yggdrasil_addr() -> Option<Ipv6Addr> {
 ///
 /// Reads `/proc/net/if_inet6` directly (no dependency on `ip` or `iproute2`).
 pub fn detect_underlay_addr() -> Option<IpAddr> {
+    // Collect all candidate addresses, then pick the best one.
+    // Priority: ULA (fc00::/7, private network) > global unicast > IPv4.
+    //
+    // ULA addresses (fd00::/8 in practice) are private-network addresses
+    // that are directly reachable between co-located machines. This is the
+    // IPv6 equivalent of RFC1918 (10.x, 172.16.x, 192.168.x). Provider-
+    // agnostic: works on any network with private IPv6 addressing.
+    let mut ula_addr: Option<Ipv6Addr> = None;
+    let mut global_addr: Option<Ipv6Addr> = None;
+
     if let Ok(content) = std::fs::read_to_string("/proc/net/if_inet6") {
         for line in content.lines() {
             let hex = line.split_whitespace().next().unwrap_or("");
@@ -543,9 +553,22 @@ pub fn detect_underlay_addr() -> Option<IpAddr> {
             let groups: Vec<&str> = (0..8).map(|i| &hex[i * 4..(i + 1) * 4]).collect();
             let addr_str = groups.join(":");
             if let Ok(addr) = addr_str.parse::<Ipv6Addr>() {
-                return Some(IpAddr::V6(addr));
+                // ULA = fc00::/7 (first byte fc or fd).
+                let first_byte = addr.octets()[0];
+                if first_byte == 0xfc || first_byte == 0xfd {
+                    if ula_addr.is_none() {
+                        ula_addr = Some(addr);
+                    }
+                } else if global_addr.is_none() {
+                    global_addr = Some(addr);
+                }
             }
         }
+    }
+
+    // Prefer ULA (private, locally reachable) over global unicast.
+    if let Some(addr) = ula_addr.or(global_addr) {
+        return Some(IpAddr::V6(addr));
     }
 
     // Fallback: try first non-loopback IPv4 from /proc/net/fib_trie or interfaces.
