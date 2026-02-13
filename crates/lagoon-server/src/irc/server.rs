@@ -296,7 +296,7 @@ impl MeshState {
             vdf_chain: None,
             ygg_metrics: super::yggdrasil::YggMetricsStore::new(),
             gossip: super::gossip::GossipRouter::new(public_key_bytes),
-            proof_store: super::proof_store::ProofStore::new(300_000), // 5 min TTL
+            proof_store: super::proof_store::ProofStore::new(60_000), // 60s TTL — 2 PING cycles
             latency_gossip: super::latency_gossip::LatencyGossip::new(
                 our_mesh_key.to_owned(),
                 10_000, // 10s sync interval
@@ -345,6 +345,22 @@ pub struct MeshNodeReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub vdf_resonance_credit: Option<f64>,
+    /// How many peers this node knows about (only populated for self).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub peer_count: Option<u32>,
+    /// How many peers are connected via relay (only populated for self).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub connected_count: Option<u32>,
+    /// How many Yggdrasil overlay peers are up (only populated for self).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub ygg_up_count: Option<u32>,
+    /// How many known peers are disconnected (only populated for self).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub disconnected_count: Option<u32>,
 }
 
 /// A single link in a mesh topology snapshot.
@@ -530,6 +546,16 @@ impl ServerState {
             .map(|n| n.address().to_string());
         let our_vdf_credit = self.mesh.vdf_state_rx.as_ref()
             .and_then(|rx| rx.borrow().resonance.as_ref().map(|r| r.credit));
+
+        // Self peer stats.
+        let total_peers = self.mesh.known_peers.len() as u32;
+        let connected_peers = self.mesh.connections.values()
+            .filter(|&&s| s == MeshConnectionState::Connected)
+            .count() as u32;
+        let ygg_up = self.transport_config.ygg_node.as_ref()
+            .map(|n| n.peers().iter().filter(|p| p.up).count() as u32)
+            .unwrap_or(0);
+
         nodes.push(MeshNodeReport {
             mesh_key: our_pid.clone(),
             server_name: self.lens.server_name.clone(),
@@ -544,6 +570,10 @@ impl ServerState {
             node_name: self.lens.node_name.clone(),
             ygg_addr: our_ygg_addr,
             vdf_resonance_credit: our_vdf_credit,
+            peer_count: Some(total_peers),
+            connected_count: Some(connected_peers),
+            ygg_up_count: Some(ygg_up),
+            disconnected_count: Some(total_peers - connected_peers),
         });
 
         // Add known peers.
@@ -568,6 +598,10 @@ impl ServerState {
                 node_name: peer_info.node_name.clone(),
                 ygg_addr: peer_info.yggdrasil_addr.as_ref().map(|a| a.to_string()),
                 vdf_resonance_credit: peer_info.vdf_resonance_credit,
+                peer_count: None,
+                connected_count: None,
+                ygg_up_count: None,
+                disconnected_count: None,
             });
             if connected {
                 // Latency priority: proof_store → relay PING/PONG → Yggdrasil.
@@ -621,6 +655,10 @@ impl ServerState {
                 node_name: self.lens.node_name.clone(),
                 ygg_addr: None,
                 vdf_resonance_credit: None,
+                peer_count: None,
+                connected_count: None,
+                ygg_up_count: None,
+                disconnected_count: None,
             });
             links.push(MeshLinkReport {
                 source: our_pid.clone(),

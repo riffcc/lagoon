@@ -326,6 +326,8 @@ pub enum RelayEvent {
     MeshVdfProof {
         remote_host: String,
         proof_json: String,
+        /// Mesh key from HELLO — O(1) lookup into known_peers.
+        mesh_key: Option<String>,
     },
     /// Received MESH SYNC — a peer wants our full peer table.
     MeshSync {
@@ -354,6 +356,8 @@ pub enum RelayEvent {
     LatencyMeasured {
         remote_host: String,
         rtt_ms: f64,
+        /// Mesh key from HELLO — O(1) lookup into known_peers.
+        mesh_key: Option<String>,
     },
     /// Received MESH LATENCY_HAVE — remote peer's latency proof SPORE.
     LatencyHaveList {
@@ -885,7 +889,7 @@ pub fn spawn_event_processor(
                     // heard from in 5 minutes. Event-driven — runs on every HELLO.
                     // Future: VDF-advancement tracking (proof-challenge-response)
                     // will replace this with cryptographic liveness detection.
-                    const STALE_PEER_SECS: u64 = 300;
+                    const STALE_PEER_SECS: u64 = 10;
                     {
                         let mut evicted = Vec::new();
 
@@ -1491,23 +1495,27 @@ pub fn spawn_event_processor(
                 RelayEvent::MeshVdfProof {
                     remote_host,
                     proof_json,
+                    mesh_key,
                 } => {
-                    // A peer sent us a ZK proof of their VDF chain.
                     match serde_json::from_str::<lagoon_vdf::VdfProof>(&proof_json) {
                         Ok(proof) => {
                             if proof.verify() {
+                                // VDF proof verified = this peer is alive and doing work.
+                                // Update vdf_step — VDF IS the heartbeat.
+                                if let Some(ref mkey) = mesh_key {
+                                    let mut st = state.write().await;
+                                    if let Some(peer) = st.mesh.known_peers.get_mut(mkey) {
+                                        peer.vdf_step = Some(proof.steps);
+                                    }
+                                }
                                 info!(
                                     remote_host,
+                                    mesh_key = ?mesh_key,
                                     steps = proof.steps,
-                                    spiral_slot = ?proof.spiral_slot,
-                                    genesis = lagoon_vdf::to_hex_short(&proof.genesis, 8),
-                                    "mesh: VDF proof VERIFIED"
+                                    "mesh: VDF proof VERIFIED — heartbeat"
                                 );
                             } else {
-                                warn!(
-                                    remote_host,
-                                    "mesh: VDF proof FAILED verification"
-                                );
+                                warn!(remote_host, "mesh: VDF proof FAILED verification");
                             }
                         }
                         Err(e) => {
@@ -1641,7 +1649,7 @@ pub fn spawn_event_processor(
                     }
                 }
 
-                RelayEvent::LatencyMeasured { remote_host, rtt_ms } => {
+                RelayEvent::LatencyMeasured { remote_host, rtt_ms, mesh_key } => {
                     let mut st = state.write().await;
 
                     // Store on relay handle (backward compat / direct lookup).
@@ -1649,12 +1657,7 @@ pub fn spawn_event_processor(
                         relay.last_rtt_ms = Some(rtt_ms);
                     }
 
-                    // Find peer_id for this node_name so we can key the proof.
-                    let peer_id = st.mesh.known_peers.iter()
-                        .find(|(_, p)| p.node_name == remote_host)
-                        .map(|(id, _)| id.clone());
-
-                    if let Some(peer_id) = peer_id {
+                    if let Some(peer_id) = mesh_key {
                         let now_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as i64)
@@ -2012,6 +2015,9 @@ async fn relay_task(
 
     let mut consecutive_failures: u32 = 0;
     let mut saved_mesh_hello: Option<String> = None;
+    // Peer identity — set once MESH HELLO is received. Threaded into
+    // subsequent events so handlers can do O(1) lookup by mesh_key.
+    let mut remote_mesh_key: Option<String> = None;
     // When true, don't reset consecutive_failures on next successful connect
     // (self-connection via anycast — TCP connect succeeds but MESH HELLO detects
     // same node, so we need escalating backoff not constant 2s retries).
@@ -2197,6 +2203,7 @@ async fn relay_task(
                         let _ = event_tx.send(RelayEvent::LatencyMeasured {
                             remote_host: remote_host.clone(),
                             rtt_ms,
+                            mesh_key: remote_mesh_key.clone(),
                         });
                     }
 
@@ -2348,6 +2355,10 @@ async fn relay_task(
                                         } else {
                                             hello.node_name
                                         };
+                                        // Store mesh_key for this relay so subsequent
+                                        // events can carry it (O(1) peer lookup).
+                                        let mkey = format!("{site_name}/{node_name}");
+                                        remote_mesh_key = Some(mkey);
                                         let _ = event_tx.send(RelayEvent::MeshHello {
                                             remote_host: remote_host.clone(),
                                             peer_id: hello.peer_id,
@@ -2392,6 +2403,7 @@ async fn relay_task(
                                     let _ = event_tx.send(RelayEvent::MeshVdfProof {
                                         remote_host: remote_host.clone(),
                                         proof_json: json,
+                                        mesh_key: remote_mesh_key.clone(),
                                     });
                                 }
                                 "SYNC" => {
