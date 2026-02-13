@@ -337,6 +337,14 @@ pub struct MeshNodeReport {
     /// Node identity within site.
     #[serde(default)]
     pub node_name: String,
+    /// Yggdrasil overlay address (e.g. `"200:abcd::1"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub ygg_addr: Option<String>,
+    /// VDF resonance credit [0, 1] — how precisely this node tracks the target tick rate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub vdf_resonance_credit: Option<f64>,
 }
 
 /// A single link in a mesh topology snapshot.
@@ -517,6 +525,11 @@ impl ServerState {
 
         // Add self.
         let our_vdf_step = self.mesh.vdf_state_rx.as_ref().map(|rx| rx.borrow().total_steps);
+        let our_ygg_addr = self.transport_config.ygg_node
+            .as_ref()
+            .map(|n| n.address().to_string());
+        let our_vdf_credit = self.mesh.vdf_state_rx.as_ref()
+            .and_then(|rx| rx.borrow().resonance.as_ref().map(|r| r.credit));
         nodes.push(MeshNodeReport {
             mesh_key: our_pid.clone(),
             server_name: self.lens.server_name.clone(),
@@ -529,6 +542,8 @@ impl ServerState {
             spiral_coord: self.mesh.spiral.our_world_coord(),
             site_name: self.lens.site_name.clone(),
             node_name: self.lens.node_name.clone(),
+            ygg_addr: our_ygg_addr,
+            vdf_resonance_credit: our_vdf_credit,
         });
 
         // Add known peers.
@@ -551,6 +566,8 @@ impl ServerState {
                 spiral_coord: self.mesh.spiral.peer_world_coord(mkey),
                 site_name: peer_info.site_name.clone(),
                 node_name: peer_info.node_name.clone(),
+                ygg_addr: peer_info.yggdrasil_addr.as_ref().map(|a| a.to_string()),
+                vdf_resonance_credit: peer_info.vdf_resonance_credit,
             });
             if connected {
                 // Latency priority: proof_store → relay PING/PONG → Yggdrasil.
@@ -602,6 +619,8 @@ impl ServerState {
                 spiral_coord: None,
                 site_name: self.lens.site_name.clone(),
                 node_name: self.lens.node_name.clone(),
+                ygg_addr: None,
+                vdf_resonance_credit: None,
             });
             links.push(MeshLinkReport {
                 source: our_pid.clone(),

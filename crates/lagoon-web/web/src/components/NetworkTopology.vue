@@ -7,6 +7,8 @@ const props = defineProps({
 
 const container = ref(null)
 const mode = ref('') // '3d', '2d', or '' (loading)
+const hoveredNode = ref(null)
+const panelPos = ref({ x: 0, y: 0 })
 let graph = null
 let ws = null
 let showBeams = true
@@ -32,7 +34,46 @@ function nodeColor(node) {
 
 function nodeLabel(node) {
   if (node.node_type === 'browser') return node.mesh_key.replace('web/', '')
+  if (node.node_name && node.node_name !== node.server_name) {
+    return `${node.server_name} (${node.node_name})`
+  }
   return node.server_name
+}
+
+/** Count links touching a given node ID in the current graph data. */
+function countNodeLinks(nodeId) {
+  if (!graph) return { total: 0, connected: 0, disconnected: 0 }
+  const data = graph.graphData()
+  const getId = x => typeof x === 'object' ? x.id : x
+  let total = 0
+  let connected = 0
+  for (const link of data.links) {
+    if (getId(link.source) === nodeId || getId(link.target) === nodeId) {
+      total++
+      // Links with latency or upload data are "live"
+      if (link.latency_ms || link.upload_bps) connected++
+    }
+  }
+  return { total, connected, disconnected: total - connected }
+}
+
+/** Handle node hover — show/hide info panel. */
+function onNodeHover(node, event) {
+  if (node) {
+    hoveredNode.value = node
+    if (event) {
+      panelPos.value = { x: event.clientX + 16, y: event.clientY + 16 }
+    }
+  } else {
+    hoveredNode.value = null
+  }
+}
+
+/** Track mouse position for panel placement while hovering. */
+function onMouseMove(event) {
+  if (hoveredNode.value) {
+    panelPos.value = { x: event.clientX + 16, y: event.clientY + 16 }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +275,10 @@ async function try3D() {
       })
       .linkDirectionalParticleWidth(1.5)
       .linkDirectionalParticleColor(link => linkColorByType(link))
+      .onNodeHover((node, prevNode) => {
+        onNodeHover(node)
+        if (container.value) container.value.style.cursor = node ? 'pointer' : 'default'
+      })
 
     // Force layout: repulsion + latency-proportional link distance.
     configureForces(g)
@@ -327,6 +372,10 @@ async function try2D() {
     })
     .linkDirectionalParticleWidth(1.5)
     .linkDirectionalParticleColor(link => linkColorByType(link))
+    .onNodeHover((node, prevNode) => {
+      onNodeHover(node)
+      if (container.value) container.value.style.cursor = node ? 'pointer' : 'default'
+    })
 
   // Latency-based link distance.
   configureForces(g)
@@ -390,6 +439,12 @@ function updateGraph(snapshot) {
       existing.is_self = n.is_self
       existing.connected = n.connected
       existing.node_type = n.node_type || 'server'
+      existing.node_name = n.node_name || ''
+      existing.site_name = n.site_name || ''
+      existing.ygg_addr = n.ygg_addr || null
+      existing.vdf_resonance_credit = n.vdf_resonance_credit ?? null
+      existing.spiral_index = n.spiral_index ?? null
+      existing.is_spiral_neighbor = n.is_spiral_neighbor || false
     } else {
       // New node — must rebuild.
       structureChanged = true
@@ -446,6 +501,12 @@ function updateGraph(snapshot) {
         is_self: n.is_self,
         connected: n.connected,
         node_type: n.node_type || 'server',
+        node_name: n.node_name || '',
+        site_name: n.site_name || '',
+        ygg_addr: n.ygg_addr || null,
+        vdf_resonance_credit: n.vdf_resonance_credit ?? null,
+        spiral_index: n.spiral_index ?? null,
+        is_spiral_neighbor: n.is_spiral_neighbor || false,
       }
       // Preserve previous position so d3 doesn't reset the simulation.
       if (prev) {
@@ -513,10 +574,12 @@ onMounted(async () => {
   }
   connectWs()
   window.addEventListener('keydown', onKeyDown)
+  window.addEventListener('mousemove', onMouseMove)
 })
 
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeyDown)
+  window.removeEventListener('mousemove', onMouseMove)
   if (ws) ws.close()
   if (resizeObserver) resizeObserver.disconnect()
   if (graph) graph._destructor?.()
@@ -530,6 +593,50 @@ onUnmounted(() => {
     </div>
   </div>
   <div v-else class="topology-container" ref="container"></div>
+
+  <!-- Node hover info panel -->
+  <div
+    v-if="hoveredNode"
+    class="node-panel"
+    :style="{ left: panelPos.x + 'px', top: panelPos.y + 'px' }"
+  >
+    <div class="panel-header">
+      <span class="panel-name">{{ hoveredNode.server_name }}</span>
+      <span v-if="hoveredNode.node_name && hoveredNode.node_name !== hoveredNode.server_name" class="panel-pod">({{ hoveredNode.node_name }})</span>
+    </div>
+    <div class="panel-row">
+      <span class="panel-label">Mesh Key</span>
+      <span class="panel-value mono">{{ hoveredNode.mesh_key?.substring(0, 24) }}...</span>
+    </div>
+    <div v-if="hoveredNode.ygg_addr" class="panel-row">
+      <span class="panel-label">Ygg Address</span>
+      <span class="panel-value mono">{{ hoveredNode.ygg_addr }}</span>
+    </div>
+    <div v-if="hoveredNode.spiral_index != null" class="panel-row">
+      <span class="panel-label">SPIRAL Slot</span>
+      <span class="panel-value">#{{ hoveredNode.spiral_index }}</span>
+    </div>
+    <div v-if="hoveredNode.vdf_resonance_credit != null" class="panel-row">
+      <span class="panel-label">VDF Credit</span>
+      <span class="panel-value" :class="hoveredNode.vdf_resonance_credit > 0.99 ? 'credit-good' : hoveredNode.vdf_resonance_credit > 0.5 ? 'credit-ok' : 'credit-bad'">
+        {{ (hoveredNode.vdf_resonance_credit * 100).toFixed(4) }}%
+      </span>
+    </div>
+    <div class="panel-row">
+      <span class="panel-label">Status</span>
+      <span class="panel-value" :class="hoveredNode.connected ? 'status-up' : 'status-down'">
+        {{ hoveredNode.is_self ? 'self' : hoveredNode.connected ? 'connected' : 'disconnected' }}
+      </span>
+    </div>
+    <div v-if="hoveredNode.is_spiral_neighbor" class="panel-row">
+      <span class="panel-label">Relation</span>
+      <span class="panel-value spiral-tag">SPIRAL neighbor</span>
+    </div>
+    <div class="panel-row">
+      <span class="panel-label">Links</span>
+      <span class="panel-value">{{ countNodeLinks(hoveredNode.id || hoveredNode.mesh_key).total }}</span>
+    </div>
+  </div>
 </template>
 
 <style scoped>
@@ -554,4 +661,68 @@ onUnmounted(() => {
   max-width: 400px;
   padding: 2rem;
 }
+
+.node-panel {
+  position: fixed;
+  z-index: 1000;
+  background: #1f2335;
+  border: 1px solid #3b4261;
+  border-radius: 8px;
+  padding: 12px 16px;
+  min-width: 260px;
+  max-width: 400px;
+  pointer-events: none;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 12px;
+  color: #c0caf5;
+}
+
+.panel-header {
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #3b4261;
+}
+
+.panel-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: #7aa2f7;
+}
+
+.panel-pod {
+  font-size: 12px;
+  color: #565f89;
+  margin-left: 6px;
+}
+
+.panel-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 2px 0;
+  gap: 12px;
+}
+
+.panel-label {
+  color: #565f89;
+  white-space: nowrap;
+}
+
+.panel-value {
+  color: #c0caf5;
+  text-align: right;
+}
+
+.panel-value.mono {
+  font-size: 11px;
+  color: #a9b1d6;
+}
+
+.status-up { color: #9ece6a; }
+.status-down { color: #f7768e; }
+.credit-good { color: #9ece6a; }
+.credit-ok { color: #e0af68; }
+.credit-bad { color: #f7768e; }
+.spiral-tag { color: #7aa2f7; }
 </style>
