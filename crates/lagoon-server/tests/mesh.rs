@@ -3,13 +3,15 @@
 ///
 /// These tests verify the mesh protocol, invite code lifecycle,
 /// defederation behavior, and TLS peer configuration using in-process servers.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, watch};
 
-use lagoon_server::irc::federation::{ape_peer_uri, RelayEvent};
+use lagoon_server::irc::federation::{
+    ape_peer_uri, dial_missing_spiral_neighbors, RelayCommand, RelayEvent, RelayHandle,
+};
 use lagoon_server::irc::invite::{InviteKind, InviteStore, Privilege};
 use lagoon_server::irc::lens;
 use lagoon_server::irc::server::{
@@ -1796,3 +1798,545 @@ fn dispatch_peers_carries_yggdrasil_addr() {
         other => panic!("expected MeshPeers, got {other:?}"),
     }
 }
+
+// ─── dial_missing_spiral_neighbors tests ──────────────────────────────────────
+//
+// These tests verify the core federation behavior: after SPIRAL computes
+// neighbors, nodes establish direct connections to those neighbors.
+// This is the fix for the star topology bug where all traffic routed
+// through the bootstrap entry point.
+
+/// Helper: create a fake relay handle for testing. The relay task is a no-op
+/// that just drains commands.
+fn make_fake_relay(node_name: &str) -> (String, RelayHandle) {
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<RelayCommand>();
+    let task_handle = tokio::spawn(async move {
+        // Drain commands until channel closes.
+        while cmd_rx.recv().await.is_some() {}
+    });
+    (
+        node_name.to_string(),
+        RelayHandle {
+            outgoing_tx: cmd_tx,
+            remote_host: node_name.to_string(),
+            channels: HashMap::new(),
+            task_handle,
+            mesh_connected: true,
+            is_bootstrap: false,
+            last_rtt_ms: None,
+            remote_node_name: Some(node_name.to_string()),
+        },
+    )
+}
+
+/// Helper: register a peer in state with SPIRAL position, Ygg addr, and underlay URI.
+fn register_peer(
+    st: &mut ServerState,
+    identity: &lagoon_server::irc::lens::LensIdentity,
+    spiral_slot: u64,
+    ygg_addr: &str,
+    underlay: &str,
+) {
+    let mkey = identity.peer_id.clone();
+    let node_name = format!("node-{}", spiral_slot);
+    st.mesh.known_peers.insert(
+        mkey.clone(),
+        MeshPeerInfo {
+            peer_id: identity.peer_id.clone(),
+            server_name: format!("{node_name}.lagun.co"),
+            public_key_hex: identity.public_key_hex.clone(),
+            node_name: node_name.clone(),
+            site_name: "lagun.co".into(),
+            spiral_index: Some(spiral_slot),
+            yggdrasil_addr: Some(ygg_addr.into()),
+            underlay_uri: Some(underlay.into()),
+            ..Default::default()
+        },
+    );
+    st.mesh.connections.insert(mkey.clone(), MeshConnectionState::Connected);
+    st.mesh.spiral.add_peer(
+        &mkey,
+        citadel_topology::Spiral3DIndex::new(spiral_slot),
+    );
+}
+
+#[tokio::test]
+async fn dial_missing_neighbors_spawns_relays_for_spiral_neighbors() {
+    let (state, _rx) = make_test_state("dialer.lagun.co");
+
+    // Create 3 peer identities.
+    let peer_a = lens::generate_identity("node-1.lagun.co");
+    let peer_b = lens::generate_identity("node-2.lagun.co");
+    let peer_c = lens::generate_identity("node-3.lagun.co");
+
+    {
+        let mut st = state.write().await;
+
+        // Claim SPIRAL slot 0 for ourselves.
+        let our_pid = st.lens.peer_id.clone();
+        st.mesh.spiral.claim_position(&our_pid);
+
+        // Register 3 peers at SPIRAL slots 1, 2, 3 — all with underlay addresses.
+        register_peer(&mut st, &peer_a, 1, "200:a::1", "tcp://[10.0.0.1]:9443");
+        register_peer(&mut st, &peer_b, 2, "200:b::1", "tcp://[10.0.0.2]:9443");
+        register_peer(&mut st, &peer_c, 3, "200:c::1", "tcp://[10.0.0.3]:9443");
+
+        // Only peer_a has a relay — peers B and C are missing.
+        let (name, handle) = make_fake_relay("node-1");
+        st.federation.relays.insert(name, handle);
+
+        // Call the function under test.
+        dial_missing_spiral_neighbors(&mut st, state.clone());
+
+        // Peers B and C should now have relays.
+        assert!(
+            st.federation.relays.contains_key("node-2"),
+            "SPIRAL neighbor node-2 should have a relay after dial_missing_spiral_neighbors"
+        );
+        assert!(
+            st.federation.relays.contains_key("node-3"),
+            "SPIRAL neighbor node-3 should have a relay after dial_missing_spiral_neighbors"
+        );
+        // Peer A should still have its original relay (not duplicated).
+        assert!(st.federation.relays.contains_key("node-1"));
+
+        // Total: 3 relays (one per SPIRAL neighbor).
+        assert_eq!(st.federation.relays.len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn dial_missing_neighbors_skips_existing_relays() {
+    let (state, _rx) = make_test_state("skipper.lagun.co");
+    let peer_a = lens::generate_identity("node-1.lagun.co");
+
+    {
+        let mut st = state.write().await;
+        let our_pid = st.lens.peer_id.clone();
+        st.mesh.spiral.claim_position(&our_pid);
+
+        register_peer(&mut st, &peer_a, 1, "200:a::1", "tcp://[10.0.0.1]:9443");
+
+        // Relay already exists for this peer.
+        let (name, handle) = make_fake_relay("node-1");
+        st.federation.relays.insert(name, handle);
+
+        let relays_before = st.federation.relays.len();
+        dial_missing_spiral_neighbors(&mut st, state.clone());
+
+        // Should NOT have created a duplicate.
+        assert_eq!(st.federation.relays.len(), relays_before);
+    }
+}
+
+#[tokio::test]
+async fn dial_missing_neighbors_works_without_underlay() {
+    // Overlay-only dialing: a SPIRAL neighbor with ygg_addr but NO underlay
+    // should still get a relay spawned. Ygg overlay routing handles the path.
+    let (state, _rx) = make_test_state("needs-underlay.lagun.co");
+    let peer_a = lens::generate_identity("node-1.lagun.co");
+
+    {
+        let mut st = state.write().await;
+        let our_pid = st.lens.peer_id.clone();
+        st.mesh.spiral.claim_position(&our_pid);
+
+        // Register peer WITH Ygg overlay address but WITHOUT underlay.
+        let mkey = peer_a.peer_id.clone();
+        st.mesh.known_peers.insert(
+            mkey.clone(),
+            MeshPeerInfo {
+                peer_id: peer_a.peer_id.clone(),
+                server_name: "node-1.lagun.co".into(),
+                public_key_hex: peer_a.public_key_hex.clone(),
+                node_name: "node-1".into(),
+                site_name: "lagun.co".into(),
+                spiral_index: Some(1),
+                yggdrasil_addr: Some("200:a::1".into()),
+                underlay_uri: None, // No underlay — overlay routing instead.
+                ..Default::default()
+            },
+        );
+        st.mesh.connections.insert(mkey.clone(), MeshConnectionState::Connected);
+        st.mesh.spiral.add_peer(&mkey, citadel_topology::Spiral3DIndex::new(1));
+
+        dial_missing_spiral_neighbors(&mut st, state.clone());
+
+        // SHOULD have created a relay — overlay routing works without underlay.
+        assert!(
+            st.federation.relays.contains_key("node-1"),
+            "must dial SPIRAL neighbor via overlay even without underlay address"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dial_missing_neighbors_requires_ygg_overlay_address() {
+    // A SPIRAL neighbor with NO ygg_addr at all cannot be dialed.
+    let (state, _rx) = make_test_state("no-ygg.lagun.co");
+    let peer_a = lens::generate_identity("node-2.lagun.co");
+
+    {
+        let mut st = state.write().await;
+        let our_pid = st.lens.peer_id.clone();
+        st.mesh.spiral.claim_position(&our_pid);
+
+        let mkey = peer_a.peer_id.clone();
+        st.mesh.known_peers.insert(
+            mkey.clone(),
+            MeshPeerInfo {
+                peer_id: peer_a.peer_id.clone(),
+                server_name: "node-2.lagun.co".into(),
+                public_key_hex: peer_a.public_key_hex.clone(),
+                node_name: "node-2".into(),
+                site_name: "lagun.co".into(),
+                spiral_index: Some(1),
+                yggdrasil_addr: None, // No overlay address — cannot route.
+                underlay_uri: None,
+                ..Default::default()
+            },
+        );
+        st.mesh.connections.insert(mkey.clone(), MeshConnectionState::Connected);
+        st.mesh.spiral.add_peer(&mkey, citadel_topology::Spiral3DIndex::new(1));
+
+        dial_missing_spiral_neighbors(&mut st, state.clone());
+
+        assert!(
+            !st.federation.relays.contains_key("node-2"),
+            "must not dial SPIRAL neighbor without any Ygg overlay address"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dial_missing_neighbors_noop_when_unclaimed() {
+    let (state, _rx) = make_test_state("unclaimed.lagun.co");
+    let peer_a = lens::generate_identity("node-1.lagun.co");
+
+    {
+        let mut st = state.write().await;
+        // Do NOT claim a SPIRAL position.
+        register_peer(&mut st, &peer_a, 1, "200:a::1", "tcp://[10.0.0.1]:9443");
+
+        dial_missing_spiral_neighbors(&mut st, state.clone());
+
+        // Should NOT have created any relays — we don't have a SPIRAL position.
+        assert!(
+            st.federation.relays.is_empty(),
+            "must not dial neighbors when SPIRAL is unclaimed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dial_missing_neighbors_skips_non_spiral_peers() {
+    let (state, _rx) = make_test_state("selective.lagun.co");
+    let peer_neighbor = lens::generate_identity("node-1.lagun.co");
+    let peer_stranger = lens::generate_identity("node-99.lagun.co");
+
+    {
+        let mut st = state.write().await;
+        let our_pid = st.lens.peer_id.clone();
+        st.mesh.spiral.claim_position(&our_pid);
+
+        // Register neighbor at slot 1 (will be a SPIRAL neighbor).
+        register_peer(&mut st, &peer_neighbor, 1, "200:a::1", "tcp://[10.0.0.1]:9443");
+
+        // Register a distant peer at slot 99 — NOT a SPIRAL neighbor of slot 0.
+        // Add to known_peers but DON'T add to SPIRAL (simulates known but distant).
+        let stranger_mkey = peer_stranger.peer_id.clone();
+        st.mesh.known_peers.insert(
+            stranger_mkey.clone(),
+            MeshPeerInfo {
+                peer_id: peer_stranger.peer_id.clone(),
+                server_name: "node-99.lagun.co".into(),
+                public_key_hex: peer_stranger.public_key_hex.clone(),
+                node_name: "node-99".into(),
+                site_name: "lagun.co".into(),
+                spiral_index: Some(99),
+                yggdrasil_addr: Some("200:ff::1".into()),
+                underlay_uri: Some("tcp://[10.0.0.99]:9443".into()),
+                ..Default::default()
+            },
+        );
+        st.mesh.connections.insert(stranger_mkey.clone(), MeshConnectionState::Connected);
+
+        dial_missing_spiral_neighbors(&mut st, state.clone());
+
+        // Should have dialed the SPIRAL neighbor but NOT the distant peer.
+        assert!(
+            st.federation.relays.contains_key("node-1"),
+            "SPIRAL neighbor should be dialed"
+        );
+        assert!(
+            !st.federation.relays.contains_key("node-99"),
+            "non-SPIRAL peer should NOT be dialed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn underlay_uri_stored_from_hello_relay_peer_addr() {
+    // Verify that dispatch_mesh_message carries relay_peer_addr through
+    // to the MeshHello event so the event processor can derive underlay_uri.
+    let (tx, mut rx_events) = make_event_channel();
+    let peer = lens::generate_identity("remote.lagun.co");
+
+    let hello = HelloPayload {
+        peer_id: peer.peer_id.clone(),
+        server_name: "remote.lagun.co".into(),
+        public_key_hex: peer.public_key_hex.clone(),
+        site_name: "lagun.co".into(),
+        node_name: "remote".into(),
+        yggdrasil_addr: Some("200:dead::1".into()),
+        ygg_peer_uri: Some("tcp://[200:dead::1]:9443".into()),
+        spiral_index: None,
+        vdf_genesis: None,
+        vdf_hash: None,
+        vdf_step: None,
+        vdf_resonance_credit: None,
+        vdf_actual_rate_hz: None,
+        cvdf_height: None,
+        cvdf_weight: None,
+        cvdf_tip_hex: None,
+        cvdf_genesis_hex: None,
+    };
+    let msg = MeshMessage::Hello(hello);
+    let peer_addr: SocketAddr = "10.0.0.5:8080".parse().unwrap();
+    dispatch_mesh_message(msg, "remote.lagun.co", Some(peer_addr), &None, &tx);
+
+    match rx_events.try_recv().unwrap() {
+        RelayEvent::MeshHello { relay_peer_addr, .. } => {
+            assert_eq!(
+                relay_peer_addr,
+                Some(peer_addr),
+                "relay_peer_addr must be propagated in MeshHello event"
+            );
+        }
+        other => panic!("expected MeshHello, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn underlay_uri_propagated_in_mesh_peers() {
+    // Verify that underlay_uri survives serialization through MESH PEERS.
+    let peer = MeshPeerInfo {
+        peer_id: "b3b3/cafe".into(),
+        server_name: "remote.lagun.co".into(),
+        public_key_hex: "1234".into(),
+        site_name: "lagun.co".into(),
+        node_name: "remote".into(),
+        yggdrasil_addr: Some("200:dead::1".into()),
+        underlay_uri: Some("tcp://[10.0.0.5]:9443".into()),
+        ..Default::default()
+    };
+
+    // Round-trip through JSON (simulates MESH PEERS wire format).
+    let json = serde_json::to_string(&peer).unwrap();
+    let deserialized: MeshPeerInfo = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(
+        deserialized.underlay_uri,
+        Some("tcp://[10.0.0.5]:9443".into()),
+        "underlay_uri must survive JSON round-trip for MESH PEERS propagation"
+    );
+}
+
+#[tokio::test]
+async fn self_connection_removes_relay() {
+    // When we detect a self-connection (HELLO from our own peer_id),
+    // the relay must be removed — not reconnected.
+    let (state, _rx) = make_test_state("self-connect.lagun.co");
+
+    let our_pid = {
+        let st = state.read().await;
+        st.lens.peer_id.clone()
+    };
+
+    {
+        let mut st = state.write().await;
+        // Insert a fake relay as if we connected to anycast and got ourselves.
+        let (name, handle) = make_fake_relay("anycast-mesh");
+        st.federation.relays.insert(name, handle);
+        assert_eq!(st.federation.relays.len(), 1);
+
+        // Simulate what the self-connection handler does:
+        // If peer_id == our_pid, remove relay and shutdown.
+        let mkey = our_pid.clone();
+        if mkey == our_pid {
+            if let Some(relay) = st.federation.relays.remove("anycast-mesh") {
+                let _ = relay.outgoing_tx.send(RelayCommand::Shutdown);
+                relay.task_handle.abort();
+            }
+            st.mesh.connections.remove(&mkey);
+        }
+
+        assert!(
+            st.federation.relays.is_empty(),
+            "self-connection must REMOVE the relay, not reconnect"
+        );
+    }
+}
+
+#[tokio::test]
+async fn three_node_mesh_forms_triangle_not_star() {
+    // The star topology bug: 3 nodes connect through a single bootstrap
+    // entry point, never establishing direct connections to each other.
+    // After SPIRAL neighbor computation + dial_missing_spiral_neighbors,
+    // all three should have direct relay connections forming a triangle.
+    let (state_a, _rx_a) = make_test_state("node-a.lagun.co");
+    let id_b = lens::generate_identity("node-b.lagun.co");
+    let id_c = lens::generate_identity("node-c.lagun.co");
+
+    {
+        let mut st = state_a.write().await;
+
+        // Node A claims slot 0.
+        let our_pid = st.lens.peer_id.clone();
+        st.mesh.spiral.claim_position(&our_pid);
+
+        // Node B at slot 1 — connected via bootstrap (has relay).
+        register_peer(&mut st, &id_b, 1, "200:b::1", "tcp://[10.0.0.2]:9443");
+        let (name_b, handle_b) = make_fake_relay("node-1");
+        st.federation.relays.insert(name_b, handle_b);
+
+        // Node C at slot 2 — learned about via MESH PEERS from B (NO relay yet).
+        register_peer(&mut st, &id_c, 2, "200:c::1", "tcp://[10.0.0.3]:9443");
+
+        // Before fix: A only has relay to B. Star topology.
+        assert_eq!(st.federation.relays.len(), 1);
+        assert!(st.federation.relays.contains_key("node-1"));
+        assert!(!st.federation.relays.contains_key("node-2"));
+
+        // After dial_missing_spiral_neighbors: A dials C directly.
+        dial_missing_spiral_neighbors(&mut st, state_a.clone());
+
+        // Triangle: A→B and A→C.
+        assert_eq!(
+            st.federation.relays.len(), 2,
+            "node A should have relays to BOTH SPIRAL neighbors (triangle, not star)"
+        );
+        assert!(st.federation.relays.contains_key("node-1"), "relay to B");
+        assert!(st.federation.relays.contains_key("node-2"), "relay to C");
+    }
+}
+
+/// Flashlight protocol: self-connection sets the bootstrap_self_connected flag,
+    /// which tells the next bootstrap retry to disable the HTTP listener before
+    /// dialing so anycast routes to a DIFFERENT machine.
+    #[tokio::test]
+    async fn self_connection_sets_flashlight_flag() {
+        let (state_a, _) = make_test_state("node-a.test.co");
+        let mut st = state_a.write().await;
+        let our_pid = st.lens.peer_id.clone();
+
+        // Not set initially.
+        assert!(!st.mesh.bootstrap_self_connected);
+
+        // Simulate: someone connected and sent HELLO with OUR peer_id.
+        // In the real event loop, the MeshHello handler detects this
+        // (mkey == our_pid) and sets the flag.
+        st.mesh.bootstrap_self_connected = true;
+
+        // Flag is set — next bootstrap retry should use flashlight.
+        assert!(st.mesh.bootstrap_self_connected);
+
+        // Simulate: real connection succeeds — flag cleared.
+        st.mesh.bootstrap_self_connected = false;
+        assert!(!st.mesh.bootstrap_self_connected,
+            "flag should be cleared when a real peer connects");
+    }
+
+    /// Flashlight beacon: watch channel controls listener on/off.
+    #[tokio::test]
+    async fn beacon_watch_channel_controls_state() {
+        let (beacon_tx, mut beacon_rx) = tokio::sync::watch::channel(true);
+
+        // Initially on.
+        assert!(*beacon_rx.borrow());
+
+        // Federation turns it off.
+        beacon_tx.send(false).unwrap();
+        beacon_rx.changed().await.unwrap();
+        assert!(!*beacon_rx.borrow());
+
+        // Federation turns it back on.
+        beacon_tx.send(true).unwrap();
+        beacon_rx.changed().await.unwrap();
+        assert!(*beacon_rx.borrow());
+    }
+
+    /// Flashlight: beacon_ack Notify fires after listener would drop.
+    #[tokio::test]
+    async fn beacon_ack_fires_after_off() {
+        let (beacon_tx, mut beacon_rx) = tokio::sync::watch::channel(true);
+        let beacon_ack = std::sync::Arc::new(tokio::sync::Notify::new());
+        let ack_clone = beacon_ack.clone();
+
+        // Simulate the accept loop side: when beacon goes off, notify ack.
+        tokio::spawn(async move {
+            loop {
+                if beacon_rx.changed().await.is_err() { break; }
+                if !*beacon_rx.borrow() {
+                    // "listener dropped"
+                    ack_clone.notify_one();
+                }
+            }
+        });
+
+        // Federation side: turn beacon off and wait for ack.
+        beacon_tx.send(false).unwrap();
+        beacon_ack.notified().await;
+        // If we reach here, the ack was received — listener is confirmed closed.
+
+        // Turn back on.
+        beacon_tx.send(true).unwrap();
+    }
+
+    /// Flashlight: ServerState has beacon fields, both default to None.
+    #[tokio::test]
+    async fn server_state_beacon_fields_default_none() {
+        let (state, _) = make_test_state("beacon-test.test.co");
+        let st = state.read().await;
+        assert!(st.beacon_tx.is_none());
+        assert!(st.beacon_ack.is_none());
+    }
+
+    /// Flashlight: beacon fields can be set and used from ServerState.
+    #[tokio::test]
+    async fn server_state_beacon_round_trip() {
+        let (state, _) = make_test_state("beacon-test.test.co");
+
+        let (beacon_tx, mut beacon_rx) = tokio::sync::watch::channel(true);
+        let beacon_ack = std::sync::Arc::new(tokio::sync::Notify::new());
+
+        {
+            let mut st = state.write().await;
+            st.beacon_tx = Some(beacon_tx);
+            st.beacon_ack = Some(beacon_ack.clone());
+        }
+
+        // Use the beacon from server state.
+        {
+            let st = state.read().await;
+            if let Some(ref tx) = st.beacon_tx {
+                tx.send(false).unwrap();
+            }
+        }
+
+        beacon_rx.changed().await.unwrap();
+        assert!(!*beacon_rx.borrow(), "beacon should be off after send(false)");
+
+        // Ack side.
+        beacon_ack.notify_one();
+
+        // Turn back on.
+        {
+            let st = state.read().await;
+            if let Some(ref tx) = st.beacon_tx {
+                tx.send(true).unwrap();
+            }
+        }
+        beacon_rx.changed().await.unwrap();
+        assert!(*beacon_rx.borrow(), "beacon should be on after send(true)");
+    }

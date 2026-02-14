@@ -236,6 +236,16 @@ pub fn dispatch_mesh_message(
             });
             None
         }
+        MeshMessage::Redirect { peers } => {
+            // Redirect = "I already know you, here are peers to connect to."
+            // Dispatch peers for discovery. The caller handles the
+            // "don't reconnect" signal — we just deliver the data.
+            let _ = event_tx.send(RelayEvent::MeshPeers {
+                remote_host: remote_host.to_string(),
+                peers,
+            });
+            None
+        }
     }
 }
 
@@ -288,6 +298,132 @@ fn prune_non_spiral_relays(st: &mut super::server::ServerState) {
             info!(node = %node_name, "mesh: pruned non-SPIRAL relay");
             let _ = handle.outgoing_tx.send(RelayCommand::Shutdown);
         }
+    }
+}
+
+/// Dial any SPIRAL neighbors that we don't have a relay connection to.
+///
+/// Called after the SPIRAL neighbor set changes (HELLO, SPIRAL claim, disconnect).
+/// For each neighbor with a known underlay address and no existing relay:
+/// 1. Add them as a Ygg underlay peer (direct link, not routed through overlay)
+/// 2. Spawn a WebSocket relay over that direct link
+///
+/// The mesh IS an Ygg mesh — every SPIRAL neighbor gets a direct underlay connection.
+pub fn dial_missing_spiral_neighbors(
+    st: &mut super::server::ServerState,
+    state: super::server::SharedState,
+) {
+    if !st.mesh.spiral.is_claimed() {
+        return;
+    }
+
+    let our_pid = st.lens.peer_id.clone();
+    let neighbor_keys: Vec<String> = st.mesh.spiral.neighbors().iter().cloned().collect();
+    let event_tx = st.federation_event_tx.clone();
+    let tc = st.transport_config.clone();
+    let ygg_node = st.transport_config.ygg_node.clone();
+
+    for neighbor_mkey in &neighbor_keys {
+        if *neighbor_mkey == our_pid {
+            continue;
+        }
+
+        let peer = match st.mesh.known_peers.get(neighbor_mkey) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let node_name = peer.node_name.clone();
+        let port = peer.port;
+        let tls = peer.tls;
+
+        // Skip if we already have a relay to this node.
+        if st.federation.relays.contains_key(&node_name) {
+            continue;
+        }
+        if st.federation.relays.values().any(|r|
+            r.remote_node_name.as_deref() == Some(node_name.as_str()))
+        {
+            continue;
+        }
+
+        // Need a Ygg overlay address for the WebSocket relay connection.
+        // The relay connects via ws://[ygg_addr]:port/api/mesh/ws —
+        // Ygg overlay routing handles the path through intermediate nodes.
+        let peer_ygg_addr: Option<std::net::Ipv6Addr> = peer
+            .yggdrasil_addr
+            .as_deref()
+            .and_then(|s| s.parse().ok());
+        if peer_ygg_addr.is_none() {
+            tracing::debug!(
+                peer = %node_name,
+                neighbor_mkey = %neighbor_mkey,
+                "mesh: SPIRAL neighbor has no Ygg overlay address — cannot route relay"
+            );
+            continue;
+        }
+
+        // Optional: if we have an underlay URI (real IP), add a direct Ygg
+        // link for lowest-latency path. Without it, overlay routing through
+        // intermediate nodes still works — just potentially higher latency.
+        if let Some(ref underlay) = peer.underlay_uri {
+            if let Some(ref ygg) = ygg_node {
+                match ygg.add_peer(underlay) {
+                    Ok(()) => info!(
+                        underlay_uri = %underlay,
+                        peer = %node_name,
+                        "mesh: added SPIRAL neighbor as Ygg underlay peer"
+                    ),
+                    Err(e) => warn!(
+                        underlay_uri = %underlay,
+                        peer = %node_name,
+                        error = %e,
+                        "mesh: failed to add SPIRAL neighbor as Ygg underlay peer"
+                    ),
+                }
+            }
+        }
+
+        // Step 2: Spawn WebSocket relay — connects via Ygg overlay routing.
+        info!(
+            peer = %node_name,
+            neighbor_mkey = %neighbor_mkey,
+            has_underlay = peer.underlay_uri.is_some(),
+            "mesh: dialing SPIRAL neighbor"
+        );
+
+        let connect_key = node_name.clone();
+        let mut tc_with_peer = (*tc).clone();
+        tc_with_peer.peers.entry(connect_key.clone()).or_insert(
+            transport::PeerEntry {
+                yggdrasil_addr: peer_ygg_addr,
+                port,
+                tls,
+            },
+        );
+        let tc_arc = Arc::new(tc_with_peer);
+
+        let (cmd_tx, task_handle) = spawn_native_relay(
+            node_name.clone(),
+            connect_key,
+            event_tx.clone(),
+            tc_arc,
+            state.clone(),
+        );
+
+        st.federation.relays.insert(
+            node_name.clone(),
+            RelayHandle {
+                outgoing_tx: cmd_tx,
+                remote_host: node_name,
+                channels: HashMap::new(),
+                task_handle,
+                mesh_connected: true,
+                is_bootstrap: false,
+                last_rtt_ms: None,
+                remote_node_name: None,
+            },
+        );
     }
 }
 
@@ -429,8 +565,7 @@ pub enum RelayCommand {
     MeshHello { json: String },
     /// Shut down the relay connection entirely.
     Shutdown,
-    /// Drop the current connection and reconnect (e.g. self-connection detected
-    /// via anycast DNS — next resolution may hit a different machine).
+    /// Drop the current connection and reconnect (connection lost by remote).
     Reconnect,
 }
 
@@ -728,6 +863,17 @@ pub fn spawn_event_processor(
         // Skip the first immediate tick.
         vdf_challenge_interval.tick().await;
 
+        // Bootstrap retry: if we have no real connections, periodically
+        // re-attempt LAGOON_PEERS. Stops trying once real connections exist.
+        let mut bootstrap_retry_interval = tokio::time::interval(
+            std::time::Duration::from_secs(30),
+        );
+        bootstrap_retry_interval.set_missed_tick_behavior(
+            tokio::time::MissedTickBehavior::Skip,
+        );
+        // Skip the first immediate tick — spawn_mesh_connector handles initial connect.
+        bootstrap_retry_interval.tick().await;
+
         loop {
         tokio::select! {
             Some(event) = event_rx.recv() => {
@@ -945,8 +1091,22 @@ pub fn spawn_event_processor(
                         let neighbors = st.mesh.spiral.neighbors().clone();
                         st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
                         st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
+                        // Dial any SPIRAL neighbors we lost a relay to.
+                        dial_missing_spiral_neighbors(&mut st, state.clone());
                         publish_connection_snapshot(&mut st);
                         st.notify_topology_change();
+                    }
+
+                    // Flashlight: if the beacon is off and we just lost our last
+                    // relay, turn it back on so the next bootstrap retry can run
+                    // (and so inbound connections can reach us).
+                    if st.federation.relays.is_empty() {
+                        if let Some(ref tx) = st.beacon_tx {
+                            if !*tx.borrow() {
+                                let _ = tx.send(true);
+                                info!("flashlight: beacon ON — relay disconnected, re-enabling listener");
+                            }
+                        }
                     }
                 }
                 RelayEvent::Connected { local_channel } => {
@@ -1036,21 +1196,27 @@ pub fn spawn_event_processor(
 
                     // Detect self-connection via peer_id (public key).
                     //
-                    // With anycast DNS (e.g. `anycast-mesh.internal`), self-connection
-                    // is transient — the next DNS resolution may hit a different machine.
-                    // Send Reconnect (not Shutdown) so the relay retries with backoff.
+                    // Self-connection means we dialed anycast and reached ourselves.
+                    // This is normal: we're either the only node or the nearest to
+                    // ourselves. Shut down the relay — the bootstrap retry interval
+                    // will periodically re-attempt LAGOON_PEERS, and other nodes
+                    // will dial us when they start.
                     let our_pid = st.lens.peer_id.clone();
                     if mkey == our_pid {
-                        warn!(
+                        info!(
                             remote_host,
                             mesh_key = %mkey,
-                            "mesh: self-connection detected — will reconnect (anycast)"
+                            "mesh: self-connection detected — shutting down relay, \
+                             next bootstrap retry will use flashlight protocol"
                         );
-                        // DON'T remove the relay — it stays in state for reconnection.
-                        if let Some(relay) = st.federation.relays.get(&remote_host) {
-                            let _ = relay.outgoing_tx.send(RelayCommand::Reconnect);
+                        if let Some(relay) = st.federation.relays.remove(&remote_host) {
+                            let _ = relay.outgoing_tx.send(RelayCommand::Shutdown);
+                            relay.task_handle.abort();
                         }
                         st.mesh.connections.remove(&mkey);
+                        // Flag for flashlight: next bootstrap retry disables the
+                        // listener so anycast routes to a different machine.
+                        st.mesh.bootstrap_self_connected = true;
                         continue;
                     }
 
@@ -1096,9 +1262,13 @@ pub fn spawn_event_processor(
                         );
                     }
 
-                    // With 2D mesh keying, same (site_name, node_name) = same key.
-                    // No stale identity eviction needed — insert just overwrites
-                    // the existing entry if the node restarted with a new key.
+                    // Mesh key = peer_id (public key). Unique per node.
+                    // Derive underlay URI from relay's TCP peer address.
+                    // This is a real IP (not an overlay address) — confirmed
+                    // different node via peer_id verification in HELLO.
+                    let underlay_uri = relay_peer_addr
+                        .map(|addr| format!("tcp://[{}]:9443", addr.ip()));
+
                     st.mesh.known_peers.insert(
                         mkey.clone(),
                         MeshPeerInfo {
@@ -1118,6 +1288,7 @@ pub fn spawn_event_processor(
                             vdf_resonance_credit,
                             vdf_actual_rate_hz,
                             ygg_peer_uri: ygg_peer_uri.clone(),
+                            underlay_uri,
                             prev_vdf_step: None,
                             // HELLO with a VDF step = first proof of life.
                             last_vdf_advance: if vdf_step.is_some() { now } else { 0 },
@@ -1202,9 +1373,21 @@ pub fn spawn_event_processor(
                     // neighbor set may have changed.
                     prune_non_spiral_relays(&mut st);
 
+                    // Dial any SPIRAL neighbors we don't have a relay to yet.
+                    dial_missing_spiral_neighbors(&mut st, state.clone());
+
                     // Publish connection snapshot — we just connected to a new peer.
                     publish_connection_snapshot(&mut st);
                     st.notify_topology_change();
+
+                    // Flashlight: connected to a different node — beacon back on.
+                    if st.mesh.bootstrap_self_connected {
+                        st.mesh.bootstrap_self_connected = false;
+                        if let Some(ref tx) = st.beacon_tx {
+                            let _ = tx.send(true);
+                            info!("flashlight: beacon ON — connected to real peer");
+                        }
+                    }
 
                     // VDF-based liveness eviction.  VDF IS the heartbeat.
                     // If a peer's VDF step hasn't advanced in 10 seconds, it's dead.
@@ -1212,6 +1395,10 @@ pub fn spawn_event_processor(
                     // "Connected" at the Ygg overlay level.  VDF non-participation
                     // is the ONLY authority on liveness.
                     const VDF_DEAD_SECS: u64 = 10;
+                    // Gossip-learned peers (Known state) haven't had a
+                    // channel to prove VDF liveness — give them time to
+                    // be dialed before evicting.
+                    const GOSSIP_GRACE_SECS: u64 = 120;
                     {
                         let mut evicted = Vec::new();
 
@@ -1219,13 +1406,16 @@ pub fn spawn_event_processor(
                             if *peer_mkey == our_pid {
                                 continue;
                             }
-                            // Peer hasn't sent any VDF yet — use last_seen as fallback
-                            // (new peer that hasn't had time to prove work).
+                            // Only apply short VDF deadline to Connected peers.
+                            // Known/gossip-learned peers get a longer grace period.
+                            let is_connected = st.mesh.connections.get(peer_mkey).copied()
+                                == Some(MeshConnectionState::Connected);
+                            let deadline = if is_connected { VDF_DEAD_SECS } else { GOSSIP_GRACE_SECS };
                             if peer.last_vdf_advance == 0 {
-                                if now.saturating_sub(peer.last_seen) < VDF_DEAD_SECS {
+                                if now.saturating_sub(peer.last_seen) < deadline {
                                     continue;
                                 }
-                            } else if now.saturating_sub(peer.last_vdf_advance) < VDF_DEAD_SECS {
+                            } else if now.saturating_sub(peer.last_vdf_advance) < deadline {
                                 continue;
                             }
                             evicted.push(peer_mkey.clone());
@@ -1425,6 +1615,21 @@ pub fn spawn_event_processor(
                             let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
                                 MeshMessage::Peers { peers: peers_list },
                             ));
+                        }
+                    }
+
+                    // Notify ALL existing peers about the new arrival.
+                    // Without this, only the new peer learns about existing peers
+                    // (via the PEERS we just sent above). Existing peers never
+                    // hear about the newcomer → star topology instead of triangle.
+                    if let Some(new_peer_info) = st.mesh.known_peers.get(&mkey).cloned() {
+                        let announce = vec![new_peer_info];
+                        for (host, relay) in &st.federation.relays {
+                            if *host != remote_host && relay.mesh_connected {
+                                let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                    MeshMessage::Peers { peers: announce.clone() },
+                                ));
+                            }
                         }
                     }
 
@@ -1732,6 +1937,8 @@ pub fn spawn_event_processor(
                         let neighbors = st.mesh.spiral.neighbors().clone();
                         st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
                         st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
+                        // Dial any SPIRAL neighbors we don't have a relay to.
+                        dial_missing_spiral_neighbors(&mut st, state.clone());
                         st.notify_topology_change();
                     }
 
@@ -2568,6 +2775,10 @@ pub fn spawn_event_processor(
                     .unwrap_or_default()
                     .as_secs();
                 const VDF_DEAD_SECS: u64 = 10;
+                // Gossip-learned peers (Known state) haven't had a
+                // channel to prove VDF liveness — give them time to
+                // be dialed before evicting.
+                const GOSSIP_GRACE_SECS: u64 = 120;
 
                 let mut st = state.write().await;
                 let our_pid_w = st.lens.peer_id.clone();
@@ -2577,11 +2788,14 @@ pub fn spawn_event_processor(
                     if *peer_mkey == our_pid_w {
                         continue;
                     }
+                    let is_connected = st.mesh.connections.get(peer_mkey).copied()
+                        == Some(MeshConnectionState::Connected);
+                    let deadline = if is_connected { VDF_DEAD_SECS } else { GOSSIP_GRACE_SECS };
                     if peer.last_vdf_advance == 0 {
-                        if now.saturating_sub(peer.last_seen) < VDF_DEAD_SECS {
+                        if now.saturating_sub(peer.last_seen) < deadline {
                             continue;
                         }
-                    } else if now.saturating_sub(peer.last_vdf_advance) < VDF_DEAD_SECS {
+                    } else if now.saturating_sub(peer.last_vdf_advance) < deadline {
                         continue;
                     }
                     evicted.push(peer_mkey.clone());
@@ -2685,6 +2899,108 @@ pub fn spawn_event_processor(
                         }
                     }
                 }
+            }
+
+            // Bootstrap retry: if we have no relay connections at all, re-attempt
+            // LAGOON_PEERS. This handles the case where we self-connected (only node
+            // or nearest to ourselves via anycast) and shut down the relay. We keep
+            // trying every 30s until we have real connections. Once connected, this
+            // arm is a no-op.
+            //
+            // FLASHLIGHT PROTOCOL: if the previous attempt self-connected, we disable
+            // the HTTP listener before dialing so anycast routes to a DIFFERENT machine.
+            // Like turning off your lighthouse to see if there are other lighthouses.
+            _ = bootstrap_retry_interval.tick() => {
+                // Phase 1: check state, optionally disable beacon.
+                let (use_flashlight, beacon_ack) = {
+                    let st = state.read().await;
+                    if !st.federation.relays.is_empty() {
+                        continue;
+                    }
+                    let flash = st.mesh.bootstrap_self_connected
+                        && st.beacon_tx.is_some();
+                    let ack = st.beacon_ack.clone();
+                    if flash {
+                        if let Some(ref tx) = st.beacon_tx {
+                            let _ = tx.send(false);
+                        }
+                    }
+                    (flash, ack)
+                };
+                // read lock dropped
+
+                // Phase 2: wait for listener to close (deterministic, no polling).
+                if use_flashlight {
+                    if let Some(ref ack) = beacon_ack {
+                        info!("flashlight: beacon OFF — waiting for listener drop");
+                        ack.notified().await;
+                        info!("flashlight: listener confirmed closed — dialing anycast");
+                    }
+                }
+
+                // Phase 3: dial.
+                let mut st = state.write().await;
+                // Re-check — an inbound connection may have arrived while we waited.
+                if !st.federation.relays.is_empty() {
+                    if use_flashlight {
+                        if let Some(ref tx) = st.beacon_tx {
+                            let _ = tx.send(true);
+                        }
+                    }
+                    continue;
+                }
+                let tc = st.transport_config.clone();
+                let peers: Vec<String> = tc.peers.keys().cloned().collect();
+                if peers.is_empty() {
+                    if use_flashlight {
+                        if let Some(ref tx) = st.beacon_tx {
+                            let _ = tx.send(true);
+                        }
+                    }
+                    continue;
+                }
+                let event_tx = st.federation_event_tx.clone();
+                for peer_host in peers {
+                    let node = super::server::derive_node_name(&peer_host);
+                    if node == *NODE_NAME {
+                        continue;
+                    }
+                    if st.federation.relays.contains_key(&node) {
+                        continue;
+                    }
+                    if st.mesh.defederated.contains(&peer_host) {
+                        continue;
+                    }
+                    info!(
+                        peer = %peer_host,
+                        node = %node,
+                        flashlight = use_flashlight,
+                        "mesh: bootstrap retry — no connections, re-attempting"
+                    );
+                    let (cmd_tx, task_handle) = spawn_native_relay(
+                        node.clone(),
+                        peer_host,
+                        event_tx.clone(),
+                        Arc::clone(&tc),
+                        state.clone(),
+                    );
+                    st.federation.relays.insert(
+                        node.clone(),
+                        RelayHandle {
+                            outgoing_tx: cmd_tx,
+                            remote_host: node,
+                            channels: HashMap::new(),
+                            task_handle,
+                            mesh_connected: true,
+                            is_bootstrap: true,
+                            last_rtt_ms: None,
+                            remote_node_name: None,
+                        },
+                    );
+                }
+                // Beacon stays OFF — will be turned ON by MeshHello handler
+                // when a real peer connects, or by Disconnected handler if
+                // the connection fails.
             }
 
             else => break,
@@ -3161,6 +3477,11 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
                     Some(Ok(TungsMsg::Text(text))) => {
                         match MeshMessage::from_json(&text) {
                             Ok(msg) => {
+                                // Redirect = hub already knows us, tells us to
+                                // connect to other peers instead. Dispatch the
+                                // peers, send Disconnected to clean up our relay
+                                // handle, and exit without reconnecting.
+                                let is_redirect = matches!(&msg, MeshMessage::Redirect { .. });
                                 // dispatch_mesh_message returns Some(hello) for Hello
                                 // messages — we already handled the first one above,
                                 // but a re-Hello (VDF state change) is valid.
@@ -3171,6 +3492,17 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
                                     &remote_mesh_key,
                                     event_tx,
                                 );
+                                if is_redirect {
+                                    info!(
+                                        relay_key,
+                                        "native relay: received redirect — \
+                                         peers dispatched, shutting down"
+                                    );
+                                    let _ = event_tx.send(RelayEvent::Disconnected {
+                                        remote_host: relay_key.to_string(),
+                                    });
+                                    return NativeLoopOutcome::Shutdown;
+                                }
                             }
                             Err(e) => {
                                 warn!(
@@ -3338,9 +3670,7 @@ async fn relay_task(
     // Peer identity — set once MESH HELLO is received. Threaded into
     // subsequent events so handlers can do O(1) lookup by mesh_key.
     let mut remote_mesh_key: Option<String> = None;
-    // When true, don't reset consecutive_failures on next successful connect
-    // (self-connection via anycast — TCP connect succeeds but MESH HELLO detects
-    // same node, so we need escalating backoff not constant 2s retries).
+    // When true, don't reset consecutive_failures on next successful connect.
     let mut self_connect_backoff = false;
 
     'reconnect: loop {
@@ -3836,7 +4166,7 @@ async fn relay_task(
                         return;
                     }
                     RelayCommand::Reconnect => {
-                        info!(remote_host, "federation: reconnect requested (self-connection via anycast)");
+                        info!(remote_host, "federation: reconnect requested");
                         self_connect_backoff = true; // Escalate backoff across retries
                         let quit = Message {
                             prefix: None,
@@ -4226,6 +4556,9 @@ fn mesh_message_to_irc(msg: &MeshMessage) -> Message {
             ("SOCKET_MIGRATE".into(), serde_json::json!({ "migration": migration, "client_peer_id": client_peer_id }).to_string())
         }
         MeshMessage::Cvdf { data } => ("CVDF".into(), data.clone()),
+        MeshMessage::Redirect { peers } => {
+            ("REDIRECT".into(), serde_json::to_string(peers).unwrap_or_default())
+        }
     };
     let mut params = vec![sub];
     if !payload.is_empty() {

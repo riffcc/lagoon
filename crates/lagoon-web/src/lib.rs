@@ -19,6 +19,8 @@ use tower_http::{
     services::ServeDir,
     trace::TraceLayer,
 };
+use std::sync::Arc;
+use tokio::sync::{Notify, watch};
 use tracing::{debug, info};
 
 use crate::state::AppState;
@@ -108,6 +110,17 @@ pub async fn run_with_irc() -> Result<(), Box<dyn std::error::Error + Send + Syn
     let (irc_state, topology_rx, _irc_handles, _vdf_shutdown) =
         lagoon_server::irc::server::start(&addrs).await?;
 
+    // Flashlight beacon — lets the federation event loop disable the HTTP
+    // listener to avoid self-connecting through anycast.  When the beacon is
+    // off, Fly/CDN proxy gets RST and routes to a DIFFERENT machine.
+    let (beacon_tx, beacon_rx) = watch::channel(true);
+    let beacon_ack = Arc::new(Notify::new());
+    {
+        let mut st = irc_state.write().await;
+        st.beacon_tx = Some(beacon_tx);
+        st.beacon_ack = Some(beacon_ack.clone());
+    }
+
     // Extract Ygg node for overlay web gateway listener.
     let ygg_node = {
         let st = irc_state.read().await;
@@ -136,7 +149,7 @@ pub async fn run_with_irc() -> Result<(), Box<dyn std::error::Error + Send + Syn
     if use_tls {
         serve_tls(app).await
     } else {
-        serve_plain(app).await
+        serve_plain_beacon(app, beacon_rx, beacon_ack).await
     }
 }
 
@@ -147,6 +160,72 @@ async fn serve_plain(app: Router) -> Result<(), Box<dyn std::error::Error + Send
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Serve over plain HTTP with beacon control for flashlight bootstrap.
+///
+/// Like `serve_plain`, but the federation event loop can turn the listener
+/// off (beacon=false) and back on (beacon=true).  When the listener is off,
+/// new TCP connections to our port get RST, causing Fly/CDN proxy to route
+/// anycast traffic to a DIFFERENT machine — breaking self-connection loops.
+///
+/// The Ygg overlay listener (ygg_serve) is NOT affected — only the TCP
+/// listener behind the CDN/proxy is controlled.
+async fn serve_plain_beacon(
+    app: Router,
+    mut beacon_rx: watch::Receiver<bool>,
+    beacon_ack: Arc<Notify>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let addr = std::env::var("LAGOON_WEB_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+
+    loop {
+        // Bind and accept while beacon is on.
+        let listener = tokio::net::TcpListener::bind(&addr).await?;
+        info!("beacon ON — listening on http://{addr}");
+
+        loop {
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, remote_addr) = result?;
+                    let app = app.clone();
+                    tokio::spawn(async move {
+                        let io = TokioIo::new(stream);
+                        let service = hyper::service::service_fn(
+                            move |req: hyper::Request<hyper::body::Incoming>| {
+                                let mut app = app.clone();
+                                async move { app.call(req.map(axum::body::Body::new)).await }
+                            },
+                        );
+                        let builder =
+                            hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
+                        if let Err(e) = builder.serve_connection_with_upgrades(io, service).await {
+                            debug!("connection error from {remote_addr}: {e}");
+                        }
+                    });
+                }
+                _ = beacon_rx.changed() => {
+                    if !*beacon_rx.borrow() {
+                        info!("beacon OFF — closing listener on {addr}");
+                        break; // drops listener
+                    }
+                }
+            }
+        }
+
+        // Listener dropped — port is closed, anycast routes elsewhere.
+        // Notify the federation event loop that the listener is gone.
+        beacon_ack.notify_one();
+
+        // Wait for beacon to turn back on.
+        loop {
+            if beacon_rx.changed().await.is_err() {
+                return Ok(()); // sender dropped, server shutting down
+            }
+            if *beacon_rx.borrow() {
+                break; // rebind
+            }
+        }
+    }
 }
 
 /// Serve over HTTPS with auto-generated self-signed certs.

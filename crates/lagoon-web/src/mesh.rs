@@ -23,6 +23,7 @@ use tracing::{info, warn};
 use lagoon_server::irc::federation::{
     build_wire_hello, dispatch_mesh_message, RelayCommand, RelayEvent, RelayHandle,
 };
+use lagoon_server::irc::server::MeshConnectionState;
 use lagoon_server::irc::wire::{HelloPayload, MeshMessage};
 
 use crate::state::AppState;
@@ -96,6 +97,43 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
     let our_hello_msg = MeshMessage::Hello(our_hello);
     if let Ok(json) = our_hello_msg.to_json() {
         if ws_tx.send(Message::Text(json.into())).await.is_err() {
+            return;
+        }
+    }
+
+    // ── Phase 1.5: Redirect if we already have a relay to this node ──────
+    //
+    // If we're already connected, this is a duplicate dial (e.g., remote
+    // hit anycast and reached us again). Send them our known peers so they
+    // can find their SPIRAL neighbors, then close. The Redirect message
+    // tells the remote not to reconnect to us.
+    {
+        let st = irc_state.read().await;
+        let already_connected = st.federation.relays.values().any(|r|
+            r.remote_node_name.as_deref() == Some(remote_node_name.as_str()));
+        if already_connected {
+            let our_pid = st.lens.peer_id.clone();
+            let redirect_peers: Vec<lagoon_server::irc::server::MeshPeerInfo> =
+                st.mesh.known_peers.iter()
+                    .filter(|(mkey, _)| {
+                        *mkey == &our_pid
+                            || st.mesh.connections.get(*mkey).copied()
+                                == Some(MeshConnectionState::Connected)
+                    })
+                    .map(|(_, p)| p.clone())
+                    .collect();
+            drop(st);
+
+            info!(
+                node = %remote_node_name,
+                redirect_peers = redirect_peers.len(),
+                "mesh ws: duplicate connection — redirecting to known peers"
+            );
+            let redirect_msg = MeshMessage::Redirect { peers: redirect_peers };
+            if let Ok(json) = redirect_msg.to_json() {
+                let _ = ws_tx.send(Message::Text(json.into())).await;
+            }
+            let _ = ws_tx.send(Message::Close(None)).await;
             return;
         }
     }

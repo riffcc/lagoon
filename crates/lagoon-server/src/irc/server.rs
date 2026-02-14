@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock};
 use futures::SinkExt;
 use serde::Serialize;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, watch, RwLock};
+use tokio::sync::{Notify, broadcast, mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::codec::Framed;
@@ -217,6 +217,12 @@ pub struct MeshPeerInfo {
     /// Yggdrasil peer URI for overlay peering (e.g. `tcp://[200:xxxx::]:9443`).
     #[serde(default)]
     pub ygg_peer_uri: Option<String>,
+    /// Yggdrasil underlay peer URI for direct peering (e.g. `tcp://[10.7.1.37]:9443`).
+    /// Derived from the relay's TCP peer address — a real IP, not an overlay address.
+    /// Propagated via MESH PEERS so nodes can establish direct Ygg underlay links
+    /// to SPIRAL neighbors they haven't directly connected to yet.
+    #[serde(default)]
+    pub underlay_uri: Option<String>,
     /// Previous VDF step — used to detect non-advancement.
     #[serde(skip)]
     pub prev_vdf_step: Option<u64>,
@@ -249,6 +255,7 @@ impl Default for MeshPeerInfo {
             vdf_resonance_credit: None,
             vdf_actual_rate_hz: None,
             ygg_peer_uri: None,
+            underlay_uri: None,
             prev_vdf_step: None,
             last_vdf_advance: 0,
         }
@@ -298,6 +305,11 @@ pub struct MeshState {
     /// CVDF cooperative VDF service — Citadel's cooperative chain as a framework service.
     /// None until the node has peers and initializes the chain.
     pub cvdf_service: Option<citadel_lens::service::CvdfService<super::cvdf_transport::LagoonCvdfTransport>>,
+    /// True when the last bootstrap attempt self-connected. When set, the
+    /// bootstrap retry stops dialing — we ARE the anycast endpoint, so
+    /// re-dialing will always reach ourselves. Cleared when a real inbound
+    /// connection arrives from a different peer_id.
+    pub bootstrap_self_connected: bool,
 }
 
 impl MeshState {
@@ -321,6 +333,7 @@ impl MeshState {
             connection_store: super::connection_store::ConnectionStore::new(120_000), // 120s TTL
             connection_gossip: super::connection_gossip::ConnectionGossip::new(10_000), // 10s sync interval
             cvdf_service: None,
+            bootstrap_self_connected: false,
         }
     }
 }
@@ -496,6 +509,14 @@ pub struct ServerState {
     /// WebAuthn authentication challenges: username → serialized PasskeyAuthentication.
     /// Populated locally on `login_begin` and via mesh broadcast from cluster peers.
     pub auth_challenges: HashMap<String, String>,
+    /// Beacon control — turns the HTTP listener on/off for "flashlight" bootstrap.
+    /// When bootstrap self-connects, the next retry disables the listener so anycast
+    /// routes the outbound dial to a DIFFERENT machine. None when not running with
+    /// an embedded web gateway.
+    pub beacon_tx: Option<watch::Sender<bool>>,
+    /// Beacon acknowledgement — accept loop notifies after listener drop so the
+    /// bootstrap retry knows it's safe to dial.
+    pub beacon_ack: Option<Arc<Notify>>,
 }
 
 /// Handle to send messages to a connected client.
@@ -555,6 +576,8 @@ impl ServerState {
             profile_store,
             reg_challenges: HashMap::new(),
             auth_challenges: HashMap::new(),
+            beacon_tx: None,
+            beacon_ack: None,
         }
     }
 

@@ -149,6 +149,13 @@ pub enum MeshMessage {
     /// Payload is base64-encoded bincode (same pattern as SPORE payloads).
     #[serde(rename = "cvdf")]
     Cvdf { data: String },
+
+    /// Redirect: hub already connected to this peer. Carries known peers
+    /// (especially SPIRAL neighbors) so the connecting node can dial them.
+    /// Sent before closing a duplicate connection. Recipient should process
+    /// the peers and NOT reconnect to this hub.
+    #[serde(rename = "redirect")]
+    Redirect { peers: Vec<MeshPeerInfo> },
 }
 
 impl MeshMessage {
@@ -698,6 +705,43 @@ mod tests {
         match decoded {
             SwitchboardMessage::PeerRedirect { method, .. } => assert_eq!(method, "repair"),
             other => panic!("expected PeerRedirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redirect_round_trip() {
+        let peer = MeshPeerInfo {
+            peer_id: "b3b3/redirect".into(),
+            server_name: "node-b.lagun.co".into(),
+            public_key_hex: "abcd".into(),
+            site_name: "lagun.co".into(),
+            node_name: "node-b".into(),
+            yggdrasil_addr: Some("200:b::1".into()),
+            ..Default::default()
+        };
+        let msg = MeshMessage::Redirect { peers: vec![peer] };
+        let json = msg.to_json().unwrap();
+        assert!(json.contains(r#""type":"redirect""#));
+
+        let decoded = MeshMessage::from_json(&json).unwrap();
+        match decoded {
+            MeshMessage::Redirect { peers } => {
+                assert_eq!(peers.len(), 1);
+                assert_eq!(peers[0].peer_id, "b3b3/redirect");
+                assert_eq!(peers[0].yggdrasil_addr.as_deref(), Some("200:b::1"));
+            }
+            other => panic!("expected Redirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redirect_empty_peers() {
+        let msg = MeshMessage::Redirect { peers: vec![] };
+        let json = msg.to_json().unwrap();
+        let decoded = MeshMessage::from_json(&json).unwrap();
+        match decoded {
+            MeshMessage::Redirect { peers } => assert!(peers.is_empty()),
+            other => panic!("expected Redirect, got {other:?}"),
         }
     }
 
