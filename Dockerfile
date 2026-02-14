@@ -5,13 +5,15 @@ FROM rust:1-bookworm AS rust-build
 RUN curl -fsSL https://go.dev/dl/go1.24.4.linux-amd64.tar.gz | tar -C /usr/local -xzf -
 ENV PATH="/usr/local/go/bin:${PATH}"
 
+# Cache-bust arg: pass --build-arg CACHEBUST=$(date +%s) to force rebuild
+# Placed before citadel clone to invalidate that layer when citadel changes
+ARG CACHEBUST=0
+
 # Clone citadel (path dependency) at the same absolute path Cargo.toml expects
 RUN git clone --depth 1 -b zorlin/v2-rewrite https://github.com/rifflabs/citadel.git \
     /mnt/riffcastle/lagun-project/citadel
 
 WORKDIR /build
-# Cache-bust arg: pass --build-arg CACHEBUST=$(date +%s) to force rebuild
-ARG CACHEBUST=0
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 # Remove web frontend source — we build that separately
