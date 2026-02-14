@@ -23,12 +23,16 @@ pub struct DebugMeshReport {
     pub relays: Vec<RelayReport>,
     /// All known mesh peers and their connection state.
     pub peers: Vec<PeerReport>,
+    /// SPIRAL topology view (our neighbors + full occupancy map).
+    pub spiral: SpiralReport,
     /// Yggdrasil overlay peers (live from admin socket).
     pub ygg_peers: Vec<YggPeerReport>,
     /// Gossip subsystem stats.
     pub gossip: GossipReport,
     /// Yggdrasil metrics cache.
     pub ygg_metrics: Vec<YggMetricsReport>,
+    /// Runtime health metrics.
+    pub runtime: RuntimeReport,
 }
 
 /// This node's identity information.
@@ -42,6 +46,8 @@ pub struct NodeIdentity {
     pub ygg_addr: Option<String>,
     /// Our Yggdrasil peer URI — what other nodes use to APE-peer with us.
     pub ygg_peer_uri: Option<String>,
+    /// Our claimed SPIRAL slot.
+    pub spiral_index: Option<u64>,
 }
 
 /// A single federation relay connection.
@@ -97,6 +103,8 @@ pub struct PeerReport {
     pub vdf_cumulative_credit: Option<f64>,
     /// Peer's Yggdrasil peer URI for APE overlay peering.
     pub ygg_peer_uri: Option<String>,
+    /// Peer's claimed SPIRAL slot (from HELLO/gossip).
+    pub spiral_index: Option<u64>,
 }
 
 /// A Yggdrasil overlay peer (live from admin socket query).
@@ -120,6 +128,22 @@ pub struct YggMetricsReport {
     pub upload_bps: f64,
     pub download_bps: f64,
     pub latency_ms: f64,
+}
+
+/// SPIRAL topology view for this node.
+#[derive(Serialize)]
+pub struct SpiralReport {
+    /// Our SPIRAL neighbors (peer_ids).
+    pub neighbors: Vec<String>,
+    /// Full occupancy map: slot -> peer_id.
+    pub occupied_slots: Vec<SpiralSlotReport>,
+}
+
+/// A single SPIRAL slot assignment.
+#[derive(Serialize)]
+pub struct SpiralSlotReport {
+    pub slot: u64,
+    pub peer_id: String,
 }
 
 /// Gossip subsystem statistics.
@@ -169,6 +193,19 @@ pub struct ResonanceReport {
     pub measured_ticks: u64,
 }
 
+/// Runtime health metrics for diagnosing leaks.
+#[derive(Serialize)]
+pub struct RuntimeReport {
+    /// Number of goroutines in the embedded Go runtime (yggbridge).
+    pub go_goroutines: i32,
+    /// Number of relay tasks currently in-flight (spawned, not yet HELLO'd).
+    pub pending_dials: usize,
+    /// Number of active relay connections (post-HELLO).
+    pub active_relays: usize,
+    /// Total relay tasks alive (including backoff between reconnects).
+    pub active_dial_count: usize,
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────
 
 /// GET /api/debug/mesh — comprehensive mesh debug view.
@@ -207,6 +244,7 @@ pub async fn get_debug_mesh(
         peer_id: st.lens.peer_id.clone(),
         ygg_addr,
         ygg_peer_uri,
+        spiral_index: st.lens.spiral_index,
     };
 
     // ── Relays ──
@@ -279,6 +317,7 @@ pub async fn get_debug_mesh(
                 vdf_actual_rate_hz: info.vdf_actual_rate_hz,
                 vdf_cumulative_credit: info.vdf_cumulative_credit,
                 ygg_peer_uri: info.ygg_peer_uri.clone(),
+                spiral_index: info.spiral_index,
             }
         })
         .collect();
@@ -326,10 +365,30 @@ pub async fn get_debug_mesh(
         })
         .collect();
 
+    // ── SPIRAL topology ──
+    let spiral = SpiralReport {
+        neighbors: st.mesh.spiral.all_neighbor_ids(),
+        occupied_slots: st
+            .mesh
+            .spiral
+            .occupied_slots()
+            .into_iter()
+            .map(|(slot, peer_id)| SpiralSlotReport { slot, peer_id })
+            .collect(),
+    };
+
     // ── Gossip stats ──
     let gossip = GossipReport {
         cache_size: st.mesh.gossip.cache_len(),
         sender_id: hex::encode(st.mesh.gossip.sender_id.to_be_bytes()),
+    };
+
+    // ── Runtime health ──
+    let runtime = RuntimeReport {
+        go_goroutines: yggbridge::goroutine_count(),
+        pending_dials: st.federation.pending_dials.len(),
+        active_relays: st.federation.relays.len(),
+        active_dial_count: st.federation.active_dial_count,
     };
 
     // ── Live Yggdrasil peer query ──
@@ -360,8 +419,10 @@ pub async fn get_debug_mesh(
         vdf,
         relays,
         peers,
+        spiral,
         ygg_peers,
         gossip,
         ygg_metrics,
+        runtime,
     }))
 }
