@@ -241,7 +241,13 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
                         }
                     }
                     Some(Ok(Message::Pong(_))) => {
-                        // RTT measurement opportunity.
+                        // Measure RTT from Ping→Pong round-trip.
+                        let rtt_ms = last_ping.elapsed().as_secs_f64() * 1000.0;
+                        let _ = event_tx.send(RelayEvent::LatencyMeasured {
+                            remote_host: remote_peer_id.clone(),
+                            rtt_ms,
+                            mesh_key: remote_mesh_key.clone(),
+                        });
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         info!(peer_id = %remote_peer_id, "mesh ws: connection closed");

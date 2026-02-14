@@ -3563,6 +3563,7 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     keepalive.tick().await; // skip first immediate tick
+    let mut last_ping_sent = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -3605,7 +3606,13 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
                         }
                     }
                     Some(Ok(TungsMsg::Pong(_))) => {
-                        // Keepalive response — peer is alive.
+                        // Measure RTT from Ping→Pong round-trip.
+                        let rtt_ms = last_ping_sent.elapsed().as_secs_f64() * 1000.0;
+                        let _ = event_tx.send(RelayEvent::LatencyMeasured {
+                            remote_host: remote_peer_id.clone(),
+                            rtt_ms,
+                            mesh_key: remote_mesh_key.clone(),
+                        });
                     }
                     Some(Ok(TungsMsg::Close(_))) | None => {
                         info!(%connect_target, peer_id = %remote_peer_id,
@@ -3667,8 +3674,9 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
                 }
             }
 
-            // Periodic keepalive ping.
+            // Periodic keepalive ping (also measures RTT on Pong).
             _ = keepalive.tick() => {
+                last_ping_sent = tokio::time::Instant::now();
                 if ws_tx.send(TungsMsg::Ping(vec![].into())).await.is_err() {
                     return NativeLoopOutcome::Reconnect;
                 }
