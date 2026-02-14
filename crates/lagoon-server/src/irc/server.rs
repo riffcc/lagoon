@@ -218,7 +218,7 @@ pub struct MeshPeerInfo {
     /// Flows through gossip (NOT serde(skip)) for SPIRAL slot collision resolution.
     #[serde(default)]
     pub vdf_cumulative_credit: Option<f64>,
-    /// Yggdrasil peer URI for overlay peering (e.g. `tcp://[200:xxxx::]:9443`).
+    /// Yggdrasil peer URI (self-reported underlay, e.g. `tcp://[fdaa::...]:9443`).
     #[serde(default)]
     pub ygg_peer_uri: Option<String>,
     /// Yggdrasil underlay peer URI for direct peering (e.g. `tcp://[10.7.1.37]:9443`).
@@ -315,6 +315,11 @@ pub struct MeshState {
     /// re-dialing will always reach ourselves. Cleared when a real inbound
     /// connection arrives from a different peer_id.
     pub bootstrap_self_connected: bool,
+    /// Our cluster's total VDF work — cached when building HELLO payloads.
+    /// This is the value we SEND in our HELLO. Used in merge evaluation so
+    /// we compare two independently-computed values (ours vs theirs from HELLO)
+    /// instead of recomputing ours (which would include the remote's credit).
+    pub our_cluster_vdf_work: f64,
 }
 
 impl MeshState {
@@ -339,6 +344,7 @@ impl MeshState {
             connection_gossip: super::connection_gossip::ConnectionGossip::new(10_000), // 10s sync interval
             cvdf_service: None,
             bootstrap_self_connected: false,
+            our_cluster_vdf_work: 0.0,
         }
     }
 }
@@ -508,12 +514,6 @@ pub struct ServerState {
     pub full_telemetry: bool,
     /// User profile CRDT store — local cache + mesh query support.
     pub profile_store: ProfileStore,
-    /// WebAuthn registration challenges: username → serialized PasskeyRegistration.
-    /// Populated locally on `register_begin` and via mesh broadcast from cluster peers.
-    pub reg_challenges: HashMap<String, String>,
-    /// WebAuthn authentication challenges: username → serialized PasskeyAuthentication.
-    /// Populated locally on `login_begin` and via mesh broadcast from cluster peers.
-    pub auth_challenges: HashMap<String, String>,
     /// Beacon control — turns the HTTP listener on/off for "flashlight" bootstrap.
     /// When bootstrap self-connects, the next retry disables the listener so anycast
     /// routes the outbound dial to a DIFFERENT machine. None when not running with
@@ -547,15 +547,14 @@ impl ServerState {
         let communities = CommunityStore::load_or_create(&data_dir);
         let profile_store = ProfileStore::load_or_create(&data_dir);
         let pubkey = super::lens::pubkey_bytes(&lens).expect("valid lens identity");
-        let mut mesh = MeshState::new(&pubkey, &lens.peer_id);
+        let mesh = MeshState::new(&pubkey, &lens.peer_id);
 
-        // Restore persisted SPIRAL position if available.
-        if let Some(idx) = lens.spiral_index {
-            mesh.spiral.set_position(
-                &lens.peer_id,
-                citadel_topology::Spiral3DIndex::new(idx),
-            );
-        }
+        // NOTE: We intentionally do NOT restore the persisted spiral_index here.
+        // The merge protocol assigns fresh SPIRAL slots when connections form.
+        // Persisted slots become stale across deploys (new peer IDs but old slot
+        // numbers) causing slot inflation (e.g. slot 239 in a 10-node cluster).
+        // The genesis path (no peers) still claims slot 0 correctly.
+        // Persistence remains for peer_id, VDF genesis, and other identity fields.
 
         Self {
             clients: HashMap::new(),
@@ -579,8 +578,6 @@ impl ServerState {
                 .map(|v| v != "0")
                 .unwrap_or(true), // ON by default
             profile_store,
-            reg_challenges: HashMap::new(),
-            auth_challenges: HashMap::new(),
             beacon_tx: None,
             beacon_ack: None,
         }
@@ -937,12 +934,13 @@ pub async fn start(
     {
         let mut st = state.write().await;
         let pubkey = super::lens::pubkey_bytes(&st.lens).expect("valid lens identity");
-        let genesis = super::vdf::derive_genesis(&pubkey);
+        let genesis = super::vdf::derive_genesis();
+        let chain_seed = super::vdf::derive_chain_seed(&genesis, &pubkey);
         let restored_total = st.lens.vdf_total_steps;
-        let chain = Arc::new(RwLock::new(lagoon_vdf::VdfChain::new(genesis)));
+        let chain = Arc::new(RwLock::new(lagoon_vdf::VdfChain::new(chain_seed)));
         let (vdf_state_tx, vdf_state_rx) = watch::channel(super::vdf::VdfState {
             genesis,
-            current_hash: genesis,
+            current_hash: chain_seed,
             session_steps: 0,
             total_steps: restored_total,
             resonance: None,
@@ -3291,6 +3289,8 @@ async fn handle_command(
                             cvdf_tip_hex: Option<String>,
                             #[serde(default)]
                             cvdf_genesis_hex: Option<String>,
+                            #[serde(default)]
+                            cluster_vdf_work: Option<f64>,
                         }
                         if let Ok(hello) = serde_json::from_str::<HelloPayload>(json) {
                             // Use node_name from HELLO if present, else derive from server_name.
@@ -3329,6 +3329,7 @@ async fn handle_command(
                                     cvdf_weight: hello.cvdf_weight,
                                     cvdf_tip_hex: hello.cvdf_tip_hex,
                                     cvdf_genesis_hex: hello.cvdf_genesis_hex,
+                                    cluster_vdf_work: hello.cluster_vdf_work,
                                 },
                             );
 

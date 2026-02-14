@@ -93,13 +93,13 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
     // Redirect (known peers) so the outbound side can detect self-connection
     // and activate the flashlight protocol.
     {
-        let st = irc_state.read().await;
+        let mut st = irc_state.write().await;
         if st.lens.peer_id == remote_peer_id {
             info!("mesh ws: self-connection detected — sending Hello + Redirect before closing");
 
             // Send our Hello so the outbound relay can detect self-connection
             // (peer_id match) and set the flashlight flag.
-            let our_hello = build_wire_hello(&st);
+            let our_hello = build_wire_hello(&mut st);
             let our_hello_msg = MeshMessage::Hello(our_hello);
             if let Ok(json) = our_hello_msg.to_json() {
                 let _ = ws_tx.send(Message::Text(json.into())).await;
@@ -124,8 +124,8 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
 
     // Send our Hello.
     let our_hello = {
-        let st = irc_state.read().await;
-        build_wire_hello(&st)
+        let mut st = irc_state.write().await;
+        build_wire_hello(&mut st)
     };
     let our_hello_msg = MeshMessage::Hello(our_hello);
     if let Ok(json) = our_hello_msg.to_json() {
@@ -274,8 +274,8 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
                     Some(RelayCommand::MeshHello { json: _ }) => {
                         // Re-send our Hello (e.g., after VDF state change).
                         let hello = {
-                            let st = irc_state.read().await;
-                            build_wire_hello(&st)
+                            let mut st = irc_state.write().await;
+                            build_wire_hello(&mut st)
                         };
                         let msg = MeshMessage::Hello(hello);
                         if let Ok(json) = msg.to_json() {

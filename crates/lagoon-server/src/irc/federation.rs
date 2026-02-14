@@ -98,6 +98,7 @@ pub fn dispatch_mesh_message(
                 cvdf_weight: hello.cvdf_weight,
                 cvdf_tip_hex: hello.cvdf_tip_hex.clone(),
                 cvdf_genesis_hex: hello.cvdf_genesis_hex.clone(),
+                cluster_vdf_work: hello.cluster_vdf_work,
             });
             Some(hello)
         }
@@ -206,22 +207,6 @@ pub fn dispatch_mesh_message(
             });
             None
         }
-        MeshMessage::RegChallenge { username, state } => {
-            let _ = event_tx.send(RelayEvent::RegChallenge {
-                remote_host: remote_host.to_string(),
-                username,
-                state,
-            });
-            None
-        }
-        MeshMessage::AuthChallenge { username, state } => {
-            let _ = event_tx.send(RelayEvent::AuthChallenge {
-                remote_host: remote_host.to_string(),
-                username,
-                state,
-            });
-            None
-        }
         MeshMessage::SocketMigrate { migration, client_peer_id } => {
             let _ = event_tx.send(RelayEvent::SocketMigrate {
                 remote_host: remote_host.to_string(),
@@ -259,13 +244,20 @@ fn prune_non_spiral_relays(st: &mut super::server::ServerState) {
         return;
     }
 
+    // Don't prune until we know enough peers for SPIRAL to be meaningful.
+    // If known_peers < neighbor_count, the topology is still converging and
+    // pruning would kill connections we need for gossip propagation.
+    let neighbor_count = st.mesh.spiral.neighbors().len();
+    if st.mesh.known_peers.len() < neighbor_count {
+        return;
+    }
+
     // Don't prune if we have very few connections. With a small mesh, every
     // connection is precious. Pruning is for shedding excess connections in a
     // large topology, not for killing the only links in a 3-node cluster.
     let non_bootstrap = st.federation.relays.values()
         .filter(|h| !h.is_bootstrap)
         .count();
-    let neighbor_count = st.mesh.spiral.neighbors().len();
     if non_bootstrap <= neighbor_count.max(2) {
         return;
     }
@@ -336,14 +328,38 @@ pub fn dial_missing_spiral_neighbors(
         let port = peer.port;
         let tls = peer.tls;
 
-        // Skip if we already have a relay to this peer (keyed by peer_id = neighbor_mkey).
-        if st.federation.relays.contains_key(neighbor_mkey) {
+        // ALWAYS try to add a direct Ygg underlay link for SPIRAL neighbors,
+        // even if we already have a relay. A relay might have been established
+        // via overlay routing (high latency) before the underlay URI was known.
+        // Adding the underlay peer gives Ygg a direct path, improving latency
+        // for ALL traffic to this neighbor — including existing relays.
+        let peer_uri = peer.underlay_uri.as_ref().or(peer.ygg_peer_uri.as_ref());
+        if let Some(ref uri) = peer_uri {
+            if let Some(ref ygg) = ygg_node {
+                match ygg.add_peer(uri) {
+                    Ok(()) => info!(
+                        underlay_uri = %uri,
+                        peer = %node_name,
+                        "mesh: added SPIRAL neighbor as Ygg underlay peer"
+                    ),
+                    Err(e) => warn!(
+                        underlay_uri = %uri,
+                        peer = %node_name,
+                        error = %e,
+                        "mesh: failed to add SPIRAL neighbor as Ygg underlay peer"
+                    ),
+                }
+            }
+        }
+
+        // Skip relay spawn if we already have one to this peer.
+        if st.federation.relays.contains_key(neighbor_mkey)
+            || st.federation.pending_dials.contains(&node_name)
+        {
             continue;
         }
 
         // Need a Ygg overlay address for the WebSocket relay connection.
-        // The relay connects via ws://[ygg_addr]:port/api/mesh/ws —
-        // Ygg overlay routing handles the path through intermediate nodes.
         let peer_ygg_addr: Option<std::net::Ipv6Addr> = peer
             .yggdrasil_addr
             .as_deref()
@@ -357,36 +373,19 @@ pub fn dial_missing_spiral_neighbors(
             continue;
         }
 
-        // Optional: if we have an underlay URI (real IP), add a direct Ygg
-        // link for lowest-latency path. Without it, overlay routing through
-        // intermediate nodes still works — just potentially higher latency.
-        if let Some(ref underlay) = peer.underlay_uri {
-            if let Some(ref ygg) = ygg_node {
-                match ygg.add_peer(underlay) {
-                    Ok(()) => info!(
-                        underlay_uri = %underlay,
-                        peer = %node_name,
-                        "mesh: added SPIRAL neighbor as Ygg underlay peer"
-                    ),
-                    Err(e) => warn!(
-                        underlay_uri = %underlay,
-                        peer = %node_name,
-                        error = %e,
-                        "mesh: failed to add SPIRAL neighbor as Ygg underlay peer"
-                    ),
-                }
-            }
-        }
-
-        // Step 2: Spawn WebSocket relay — connects via Ygg overlay routing.
         info!(
             peer = %node_name,
             neighbor_mkey = %neighbor_mkey,
-            has_underlay = peer.underlay_uri.is_some(),
+            has_underlay = peer_uri.is_some(),
             "mesh: dialing SPIRAL neighbor"
         );
 
         let connect_key = node_name.clone();
+        // Pre-insert BEFORE spawn — the spawned task needs the write lock
+        // (which we hold via &mut st), so it can't insert until we release.
+        // Without pre-insert, the loop spawns duplicates for the same peer.
+        st.federation.pending_dials.insert(connect_key.clone());
+
         let mut tc_with_peer = (*tc).clone();
         tc_with_peer.peers.entry(connect_key.clone()).or_insert(
             transport::PeerEntry {
@@ -615,6 +614,8 @@ pub enum RelayEvent {
         cvdf_tip_hex: Option<String>,
         /// CVDF genesis seed (hex).
         cvdf_genesis_hex: Option<String>,
+        /// Total VDF work of this node's entire connected graph.
+        cluster_vdf_work: Option<f64>,
     },
     /// Received MESH PEERS from a remote peer.
     MeshPeers {
@@ -708,18 +709,6 @@ pub enum RelayEvent {
         remote_host: String,
         payload_b64: String,
     },
-    /// Received REG_CHALLENGE — a cluster peer broadcast a WebAuthn registration challenge.
-    RegChallenge {
-        remote_host: String,
-        username: String,
-        state: String,
-    },
-    /// Received AUTH_CHALLENGE — a cluster peer broadcast a WebAuthn authentication challenge.
-    AuthChallenge {
-        remote_host: String,
-        username: String,
-        state: String,
-    },
     /// Received SOCKET_MIGRATE — a switchboard node froze a TCP socket via TCP_REPAIR
     /// and is delivering the migration state so we can restore it.
     SocketMigrate {
@@ -749,6 +738,11 @@ pub struct FederationManager {
     /// Number of relay tasks currently alive (including those in backoff between reconnects).
     /// Used by the bootstrap retry to avoid spawning duplicate tasks.
     pub active_dial_count: usize,
+    /// Peer IDs with relay tasks currently in-flight (spawned but not yet HELLO'd).
+    /// Prevents the spawn cascade where PEERS gossip triggers duplicate relay tasks
+    /// for the same peer before the first task completes its HELLO exchange.
+    /// Key = connect_target (node_name or server_name), not peer_id (unknown until HELLO).
+    pub pending_dials: HashSet<String>,
 }
 
 impl FederationManager {
@@ -756,6 +750,7 @@ impl FederationManager {
         Self {
             relays: HashMap::new(),
             active_dial_count: 0,
+            pending_dials: HashSet::new(),
         }
     }
 }
@@ -1062,6 +1057,9 @@ pub fn spawn_event_processor(
                     st.mesh.spiral.remove_peer(&remote_host);
 
                     if st.mesh.known_peers.contains_key(&remote_host) {
+                        // SPIRAL convergence: peer left, slot freed.
+                        // If their slot was lower than ours, move inward.
+                        reconverge_spiral(&mut st, state.clone());
                         let neighbors = st.mesh.spiral.neighbors().clone();
                         st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
                         st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
@@ -1127,6 +1125,7 @@ pub fn spawn_event_processor(
                     cvdf_weight,
                     cvdf_tip_hex,
                     cvdf_genesis_hex,
+                    cluster_vdf_work,
                 } => {
                     // Backfill node_name/site_name for old peers that don't send them.
                     let node_name = if node_name.is_empty() {
@@ -1241,6 +1240,13 @@ pub fn spawn_event_processor(
                     let underlay_uri = relay_peer_addr
                         .map(|addr| format!("tcp://[{}]:9443", addr.ip()));
 
+                    // Clone vdf_hash before moving into known_peers — needed for merge tiebreak.
+                    let remote_vdf_hash_for_merge = vdf_hash.clone();
+
+                    // Track whether this peer was already in our clump before this HELLO.
+                    // If they were, no cluster merge needed — same clump.
+                    let already_in_clump = st.mesh.known_peers.contains_key(&mkey);
+
                     st.mesh.known_peers.insert(
                         mkey.clone(),
                         MeshPeerInfo {
@@ -1290,112 +1296,30 @@ pub fn spawn_event_processor(
                         }
                     }
 
-                    // Register SPIRAL position if the peer has claimed one.
-                    let mut spiral_changed = false;
-                    if let Some(idx) = spiral_index {
-                        let added = st.mesh.spiral.add_peer(
-                            &mkey,
-                            citadel_topology::Spiral3DIndex::new(idx),
-                        );
-                        if !added {
-                            // COLLISION — two nodes claim the same SPIRAL slot.
-                            // Compare rolling resonance credit (last 3 cycles of precision work).
-                            // Higher credit keeps the slot. Tie → higher peer_id (deterministic).
-                            let our_idx = st.lens.spiral_index;
-                            if our_idx == Some(idx) {
-                                // WE collide with the remote peer at slot `idx`.
-                                let our_credit = st.mesh.vdf_state_rx.as_ref()
-                                    .and_then(|rx| rx.borrow().resonance.as_ref()
-                                        .map(|r| r.rolling_credit_3c))
-                                    .unwrap_or(0.0);
-                                let their_credit = vdf_cumulative_credit.unwrap_or(0.0);
-                                let we_yield = their_credit > our_credit
-                                    || (their_credit == our_credit && mkey > our_pid);
+                    // SPIRAL merge protocol: negotiate topology with the remote peer.
+                    // Compares cluster VDF work. Winner keeps topology, loser re-slots.
+                    let spiral_changed = evaluate_spiral_merge(
+                        &mut st,
+                        &mkey,
+                        spiral_index,
+                        cluster_vdf_work,
+                        vdf_cumulative_credit,
+                        remote_vdf_hash_for_merge.as_deref(),
+                        already_in_clump,
+                        state.clone(),
+                    );
 
-                                if we_yield {
-                                    info!(
-                                        our_credit,
-                                        their_credit,
-                                        slot = idx,
-                                        winner = %mkey,
-                                        "SPIRAL: slot collision — we yield (lower rolling credit)"
-                                    );
-                                    // Remove ourselves from the contested slot.
-                                    st.mesh.spiral.remove_peer(&our_pid);
-                                    // Accept remote's claim via force_add.
-                                    st.mesh.spiral.force_add_peer(
-                                        &mkey,
-                                        citadel_topology::Spiral3DIndex::new(idx),
-                                    );
-                                    // Re-claim next available slot.
-                                    let new_idx = st.mesh.spiral.claim_position(&our_pid);
-                                    info!(
-                                        old_slot = idx,
-                                        new_slot = new_idx.value(),
-                                        "SPIRAL: re-slotted after yielding"
-                                    );
-                                    // Persist new position.
-                                    let mut updated_lens = (*st.lens).clone();
-                                    updated_lens.spiral_index = Some(new_idx.value());
-                                    if let Some(ref rx) = st.mesh.vdf_state_rx {
-                                        updated_lens.vdf_total_steps = rx.borrow().total_steps;
-                                    }
-                                    super::lens::persist_identity(&st.data_dir, &updated_lens);
-                                    st.lens = std::sync::Arc::new(updated_lens);
-                                    spiral_changed = true;
-
-                                    // Re-send HELLO to all relays with our new slot.
-                                    let hello_json = serde_json::to_string(&build_hello_payload(&st))
-                                        .unwrap_or_default();
-                                    for relay in st.federation.relays.values() {
-                                        let _ = relay.outgoing_tx.send(RelayCommand::MeshHello {
-                                            json: hello_json.clone(),
-                                        });
-                                    }
-                                } else {
-                                    info!(
-                                        our_credit,
-                                        their_credit,
-                                        slot = idx,
-                                        loser = %mkey,
-                                        "SPIRAL: slot collision — we keep (higher rolling credit)"
-                                    );
-                                    // We keep our slot. Remote will discover the collision
-                                    // when they process OUR hello and yield on their side.
-                                }
-                            } else {
-                                // Collision between two remote peers — not us. The remote
-                                // will resolve it when they exchange HELLOs directly.
-                                // Force-accept the one with higher credit if we have data.
-                                if let Some(existing_key) = st.mesh.spiral.peer_at_index(idx).map(|s| s.to_string()) {
-                                    let existing_credit = st.mesh.known_peers.get(&existing_key)
-                                        .and_then(|p| p.vdf_cumulative_credit)
-                                        .unwrap_or(0.0);
-                                    let incoming_credit = vdf_cumulative_credit.unwrap_or(0.0);
-                                    if incoming_credit > existing_credit
-                                        || (incoming_credit == existing_credit && mkey > existing_key)
-                                    {
-                                        st.mesh.spiral.force_add_peer(
-                                            &mkey,
-                                            citadel_topology::Spiral3DIndex::new(idx),
-                                        );
-                                        spiral_changed = true;
-                                    }
-                                }
-                            }
-                        } else {
-                            spiral_changed = true;
-                        }
-                    }
-
-                    // Update SPIRAL neighbor set for gossip coordinators.
-                    let neighbors = st.mesh.spiral.neighbors().clone();
-                    st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
-                    st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
+                    // Always update SPIRAL neighbor set for gossip coordinators
+                    // (remote may have been added even without our position changing).
+                    update_spiral_neighbors(&mut st);
 
                     if spiral_changed {
+                        // evaluate_spiral_merge already called dial + notify + prune
+                        // when it returned true, but we still need to handle the case
+                        // where remote was registered without us re-slotting.
+                    } else if spiral_index.is_some() {
+                        // Remote registered at a slot — may be our new SPIRAL neighbor.
                         dial_missing_spiral_neighbors(&mut st, state.clone());
-                        st.notify_topology_change();
                     }
 
                     // CVDF: register peer's SPIRAL slot and evaluate their chain.
@@ -1524,6 +1448,8 @@ pub fn spawn_event_processor(
                         }
 
                         if !evicted.is_empty() {
+                            // SPIRAL convergence: dead peers freed slots.
+                            reconverge_spiral(&mut st, state.clone());
                             let neighbors = st.mesh.spiral.neighbors().clone();
                             st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
                             st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
@@ -1551,9 +1477,15 @@ pub fn spawn_event_processor(
                     // NOTE: must happen BEFORE sending MESH PEERS/TOPOLOGY/SPORE,
                     // because those sends go via st.federation.relays.
                     //
-                    // Skip if we already have a relay to this peer (keyed by peer_id).
-                    // remote_host IS the peer_id now, and the relay map is keyed by peer_id.
-                    if !st.federation.relays.contains_key(&remote_host) {
+                    // Skip if we already have a relay to this peer (keyed by peer_id)
+                    // or if there's already a relay task in-flight for this connect target.
+                    if !st.federation.relays.contains_key(&remote_host)
+                        && !st.federation.pending_dials.contains(&node_name)
+                        && !st.federation.pending_dials.contains(&server_name)
+                    {
+                        // SPIRAL gate: only reciprocate if we haven't claimed
+                        // a slot yet (still bootstrapping) or they're a SPIRAL
+                        // neighbor. 20 connections max — that's the invariant.
                         let should_connect = !st.mesh.spiral.is_claimed()
                             || st.mesh.spiral.is_neighbor(&mkey);
 
@@ -1581,6 +1513,9 @@ pub fn spawn_event_processor(
                                 server_name.clone()
                             };
 
+                            // Pre-insert before spawn — caller holds write lock.
+                            st.federation.pending_dials.insert(connect_key.clone());
+
                             let mut tc_with_peer = (*st.transport_config).clone();
                             tc_with_peer
                                 .peers
@@ -1603,15 +1538,20 @@ pub fn spawn_event_processor(
                     }
 
                     // Send PEERS to the newly connected peer.
-                    // Only include peers we're actively connected to (+ self).
-                    // Gossiping disconnected peers causes ghost amplification:
-                    // dead peers get their last_seen refreshed by gossip, preventing
-                    // staleness eviction across the mesh.
+                    // Include: self + connected peers + non-stale peers with SPIRAL slots.
+                    // Peers with spiral_index are valuable topology data — gossiping them
+                    // enables transitive topology propagation (A knows C through B, tells D).
+                    // The 300s staleness filter prevents ghost amplification of dead peers.
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
                     let peers_list: Vec<MeshPeerInfo> = st.mesh.known_peers.iter()
-                        .filter(|(mkey, _)| {
+                        .filter(|(mkey, p)| {
                             *mkey == &our_pid
                                 || st.mesh.connections.get(*mkey)
                                     .copied() == Some(MeshConnectionState::Connected)
+                                || (p.spiral_index.is_some() && p.last_seen + 300 > now_secs)
                         })
                         .map(|(_, p)| p.clone())
                         .collect();
@@ -1769,53 +1709,27 @@ pub fn spawn_event_processor(
                                 citadel_topology::Spiral3DIndex::new(idx),
                             );
                             if !added {
-                                // Slot collision via gossip — same resolution as MeshHello.
+                                // Slot collision via gossip — use cumulative_credit for resolution.
                                 let our_pid = st.lens.peer_id.clone();
                                 let our_idx = st.lens.spiral_index;
                                 if our_idx == Some(idx) {
                                     let our_credit = st.mesh.vdf_state_rx.as_ref()
                                         .and_then(|rx| rx.borrow().resonance.as_ref()
-                                            .map(|r| r.rolling_credit_3c))
+                                            .map(|r| r.cumulative_credit))
                                         .unwrap_or(0.0);
                                     let their_credit = peer.vdf_cumulative_credit.unwrap_or(0.0);
+                                    let our_vdf_h: Option<Vec<u8>> = st.mesh.vdf_state_rx.as_ref()
+                                        .map(|rx| rx.borrow().current_hash.to_vec());
+                                    let their_vdf_h: Option<Vec<u8>> = peer.vdf_hash.as_deref()
+                                        .and_then(|h| hex::decode(h).ok());
                                     let we_yield = their_credit > our_credit
-                                        || (their_credit == our_credit && mkey > our_pid);
+                                        || (their_credit == our_credit && !vdf_tiebreak_wins(
+                                            &our_pid, &mkey,
+                                            our_vdf_h.as_deref(), their_vdf_h.as_deref(),
+                                        ));
                                     if we_yield {
-                                        info!(
-                                            our_credit,
-                                            their_credit,
-                                            slot = idx,
-                                            winner = %mkey,
-                                            "SPIRAL: slot collision via gossip — we yield"
-                                        );
-                                        st.mesh.spiral.remove_peer(&our_pid);
-                                        st.mesh.spiral.force_add_peer(
-                                            &mkey,
-                                            citadel_topology::Spiral3DIndex::new(idx),
-                                        );
-                                        let new_idx = st.mesh.spiral.claim_position(&our_pid);
-                                        info!(
-                                            old_slot = idx,
-                                            new_slot = new_idx.value(),
-                                            "SPIRAL: re-slotted after gossip collision"
-                                        );
-                                        let mut updated_lens = (*st.lens).clone();
-                                        updated_lens.spiral_index = Some(new_idx.value());
-                                        if let Some(ref rx) = st.mesh.vdf_state_rx {
-                                            updated_lens.vdf_total_steps = rx.borrow().total_steps;
-                                        }
-                                        super::lens::persist_identity(&st.data_dir, &updated_lens);
-                                        st.lens = std::sync::Arc::new(updated_lens);
+                                        reslot_around_winner(&mut st, &mkey, idx, state.clone());
                                         changed = true;
-
-                                        // Re-send HELLO with new slot to all relays.
-                                        let hello_json = serde_json::to_string(&build_hello_payload(&st))
-                                            .unwrap_or_default();
-                                        for relay in st.federation.relays.values() {
-                                            let _ = relay.outgoing_tx.send(RelayCommand::MeshHello {
-                                                json: hello_json.clone(),
-                                            });
-                                        }
                                     }
                                 }
                             }
@@ -1868,10 +1782,24 @@ pub fn spawn_event_processor(
                                 existing.vdf_hash = peer.vdf_hash.clone();
                                 existing.vdf_step = peer.vdf_step;
                                 existing.vdf_cumulative_credit = peer.vdf_cumulative_credit;
-                                // SPIRAL slot: first-writer-wins.
-                                if existing.spiral_index.is_none() && peer.spiral_index.is_some() {
+                                // Propagate network addresses from gossip.
+                                // Critical for Ygg underlay peering — without these,
+                                // dial_missing_spiral_neighbors can't establish direct links.
+                                if existing.underlay_uri.is_none() && peer.underlay_uri.is_some() {
+                                    existing.underlay_uri = peer.underlay_uri.clone();
+                                }
+                                if existing.ygg_peer_uri.is_none() && peer.ygg_peer_uri.is_some() {
+                                    existing.ygg_peer_uri = peer.ygg_peer_uri.clone();
+                                }
+                                if existing.yggdrasil_addr.is_none() && peer.yggdrasil_addr.is_some() {
+                                    existing.yggdrasil_addr = peer.yggdrasil_addr.clone();
+                                }
+                                // SPIRAL slot: accept if new or changed (convergence re-slots).
+                                if peer.spiral_index.is_some() && existing.spiral_index != peer.spiral_index {
                                     existing.spiral_index = peer.spiral_index;
                                     if let Some(idx) = peer.spiral_index {
+                                        // add_peer handles freeing the old occupied coord
+                                        // if this peer moved slots (ghost-slot fix).
                                         st.mesh.spiral.add_peer(
                                             &mkey,
                                             citadel_topology::Spiral3DIndex::new(idx),
@@ -1916,66 +1844,34 @@ pub fn spawn_event_processor(
                         );
                     }
 
-                    // If we haven't claimed a SPIRAL position yet, claim one now
-                    // that we have occupancy data from the network.
-                    if !st.mesh.spiral.is_claimed() {
-                        let our_pid = st.lens.peer_id.clone();
-                        let idx = st.mesh.spiral.claim_position(&our_pid);
-                        info!(
-                            spiral_index = idx.value(),
-                            peer_id = %our_pid,
-                            "mesh: claimed SPIRAL slot"
-                        );
-
-                        // Persist to LensIdentity on disk (SPIRAL + VDF checkpoint).
-                        let mut updated_lens = (*st.lens).clone();
-                        updated_lens.spiral_index = Some(idx.value());
-                        if let Some(ref rx) = st.mesh.vdf_state_rx {
-                            updated_lens.vdf_total_steps = rx.borrow().total_steps;
-                        }
-                        super::lens::persist_identity(&st.data_dir, &updated_lens);
-                        st.lens = std::sync::Arc::new(updated_lens);
-                        changed = true;
-
-                        // Re-send MESH HELLO with our spiral_index to all
-                        // connected relays so they know our position.
-                        let hello_json = serde_json::to_string(&build_hello_payload(&st))
-                            .unwrap_or_default();
-                        for relay in st.federation.relays.values() {
-                            let _ = relay.outgoing_tx.send(RelayCommand::MeshHello {
-                                json: hello_json.clone(),
-                            });
-                        }
-
-                        // Now that SPIRAL is active, drop all non-SPIRAL relays.
-                        // Bootstrap connections served their purpose — discovery is done.
-                        prune_non_spiral_relays(&mut st);
-                    }
-
                     if changed {
+                        // SPIRAL convergence: re-evaluate our position after
+                        // learning new topology. If there's a lower slot available,
+                        // move there. This is the iterative convergence protocol
+                        // from the SPIRAL paper — nodes fill holes naturally.
+                        reconverge_spiral(&mut st, state.clone());
                         // Update SPIRAL neighbor set for latency + connection gossip.
-                        let neighbors = st.mesh.spiral.neighbors().clone();
-                        st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
-                        st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
+                        update_spiral_neighbors(&mut st);
                         // Dial any SPIRAL neighbors we don't have a relay to.
                         dial_missing_spiral_neighbors(&mut st, state.clone());
                         st.notify_topology_change();
                     }
 
-                    // Connect to newly discovered peers — SPIRAL-guided.
-                    //
-                    // If we have a SPIRAL position, only connect to peers that
-                    // are in our 20-neighbor set. If we haven't claimed yet
-                    // (fresh node), connect to all so we can receive MESH PEERS
-                    // and claim a position.
+                    // Connect to newly discovered SPIRAL neighbors only.
+                    // SPIRAL is a bounded-degree topology — 20 neighbors max.
+                    // Non-neighbors are reachable transitively via the overlay.
+                    let spiral_active = st.mesh.spiral.is_claimed();
                     if !new_peer_servers.is_empty() {
-                        let spiral_active = st.mesh.spiral.is_claimed();
                         let event_tx = st.federation_event_tx.clone();
                         let tc = st.transport_config.clone();
 
                         for (mkey, node_name, server_name, port, tls) in new_peer_servers {
-                            // Skip if we already have a relay to this peer (keyed by peer_id).
-                            if st.federation.relays.contains_key(&mkey) {
+                            // Skip if we already have a relay to this peer (keyed by peer_id)
+                            // or if there's already a relay task in-flight for this connect target.
+                            if st.federation.relays.contains_key(&mkey)
+                                || st.federation.pending_dials.contains(&node_name)
+                                || st.federation.pending_dials.contains(&server_name)
+                            {
                                 continue;
                             }
                             // Skip self.
@@ -2029,6 +1925,9 @@ pub fn spawn_event_processor(
                             } else {
                                 server_name
                             };
+
+                            // Pre-insert before spawn — caller holds write lock.
+                            st.federation.pending_dials.insert(connect_key.clone());
 
                             let mut tc_with_peer = (*tc).clone();
                             tc_with_peer.peers.entry(connect_key.clone()).or_insert(
@@ -2669,17 +2568,6 @@ pub fn spawn_event_processor(
                     }
                 }
 
-                RelayEvent::RegChallenge { remote_host, username, state: challenge_state } => {
-                    tracing::debug!(remote_host, username, "webauthn: received reg challenge from cluster");
-                    let mut st = state.write().await;
-                    st.reg_challenges.insert(username, challenge_state);
-                }
-
-                RelayEvent::AuthChallenge { remote_host, username, state: challenge_state } => {
-                    tracing::debug!(remote_host, username, "webauthn: received auth challenge from cluster");
-                    let mut st = state.write().await;
-                    st.auth_challenges.insert(username, challenge_state);
-                }
 
                 RelayEvent::CvdfMessage { remote_host, data } => {
                     use base64::Engine as _;
@@ -2833,6 +2721,9 @@ pub fn spawn_event_processor(
                 }
 
                 if !evicted.is_empty() {
+                    // SPIRAL convergence: dead peers freed slots.
+                    // If any freed slot is lower than ours, move inward.
+                    reconverge_spiral(&mut st, state.clone());
                     let neighbors = st.mesh.spiral.neighbors().clone();
                     st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
                     st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
@@ -3013,24 +2904,6 @@ pub fn broadcast_profile_have_to_cluster(
     }
 }
 
-/// Broadcast a WebAuthn challenge to all cluster peers so any node behind
-/// the same anycast IP can complete the ceremony.
-pub fn broadcast_challenge_to_cluster(
-    st: &super::server::ServerState,
-    msg: MeshMessage,
-) {
-    let our_site = &*SITE_NAME;
-    for (key, relay) in &st.federation.relays {
-        // Relay key IS peer_id — look up in known_peers directly.
-        let is_cluster = st.mesh.known_peers.get(key)
-            .map(|p| super::gossip::is_cluster_peer(our_site, &p.site_name))
-            .unwrap_or(false);
-
-        if is_cluster {
-            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(msg.clone()));
-        }
-    }
-}
 
 /// Execute latency gossip sync actions by sending MESH subcommands to relay peers.
 fn execute_latency_gossip_actions(
@@ -3290,9 +3163,12 @@ async fn relay_task_native(
     is_bootstrap: bool,
 ) {
     // Track this task in the dial count so bootstrap retry doesn't spawn duplicates.
+    // Also register in pending_dials so gossip-driven spawn_native_relay() calls
+    // don't create duplicates while we're still in the HELLO exchange window.
     {
         let mut st = state.write().await;
         st.federation.active_dial_count += 1;
+        st.federation.pending_dials.insert(connect_target.clone());
     }
 
     // One command channel for the lifetime of this task — survives reconnects.
@@ -3340,6 +3216,12 @@ async fn relay_task_native(
                 if !backoff_drain_native(&mut cmd_rx, consecutive_failures).await {
                     break;
                 }
+                // Check if we should still be trying to reach this peer.
+                if !is_bootstrap && !should_keep_retrying(&state, &current_peer_id, &connect_target).await {
+                    info!(%connect_target, peer_id = ?current_peer_id,
+                        "native relay: peer removed from mesh, stopping retries");
+                    break;
+                }
                 continue 'reconnect;
             }
         };
@@ -3377,6 +3259,12 @@ async fn relay_task_native(
                 if !backoff_drain_native(&mut cmd_rx, consecutive_failures).await {
                     break;
                 }
+                // Check if we should still be trying to reach this peer.
+                if !is_bootstrap && !should_keep_retrying(&state, &current_peer_id, &connect_target).await {
+                    info!(%connect_target, peer_id = ?current_peer_id,
+                        "native relay: peer removed from mesh, stopping retries");
+                    break;
+                }
             }
         }
     }
@@ -3392,10 +3280,11 @@ async fn relay_task_native(
         }
     }
 
-    // Decrement dial count.
+    // Decrement dial count and remove from pending_dials.
     {
         let mut st = state.write().await;
         st.federation.active_dial_count = st.federation.active_dial_count.saturating_sub(1);
+        st.federation.pending_dials.remove(&connect_target);
     }
 }
 
@@ -3425,8 +3314,8 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
 
     // Send our Hello.
     let our_hello = {
-        let st = state.read().await;
-        build_wire_hello(&st)
+        let mut st = state.write().await;
+        build_wire_hello(&mut st)
     };
     let hello_msg = MeshMessage::Hello(our_hello);
     let hello_json = match hello_msg.to_json() {
@@ -3530,8 +3419,14 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
     }
 
     // ── Insert relay handle keyed by peer_id ────────────────────────────
+    //
+    // If there's already a relay for this peer_id (duplicate task raced us),
+    // shut down the OLD relay so it doesn't become an orphan leaking threads.
     {
         let mut st = state.write().await;
+        if let Some(old_relay) = st.federation.relays.get(&remote_peer_id) {
+            let _ = old_relay.outgoing_tx.send(RelayCommand::Shutdown);
+        }
         st.federation.relays.insert(
             remote_peer_id.clone(),
             RelayHandle {
@@ -3544,6 +3439,12 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
                 last_rtt_ms: None,
             },
         );
+        // NOTE: do NOT remove from pending_dials here. The entry must persist
+        // for the entire relay_task_native lifetime. Otherwise, when the WS drops
+        // and the relay is removed from the map, gossip-driven spawns see neither
+        // relays nor pending_dials containing this peer — spawning a duplicate
+        // relay task while the original is still in its reconnect backoff loop.
+        // The entry is removed on task exit (relay_task_native cleanup).
     }
     *current_peer_id = Some(remote_peer_id.clone());
 
@@ -3641,8 +3542,8 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
                     Some(RelayCommand::MeshHello { json: _ }) => {
                         // Re-send our Hello (e.g., VDF state change).
                         let hello = {
-                            let st = state.read().await;
-                            build_wire_hello(&st)
+                            let mut st = state.write().await;
+                            build_wire_hello(&mut st)
                         };
                         let msg = MeshMessage::Hello(hello);
                         if let Ok(j) = msg.to_json() {
@@ -3709,6 +3610,38 @@ async fn backoff_drain_native(
             }
         }
     }
+}
+
+/// Check if a relay task should keep retrying or if the peer has been evicted.
+///
+/// Returns `true` if the peer is still known to the mesh (in known_peers,
+/// or its node_name is still relevant). Returns `false` if the peer has
+/// been removed — the relay task should exit.
+async fn should_keep_retrying(
+    state: &Arc<tokio::sync::RwLock<super::server::ServerState>>,
+    current_peer_id: &Option<String>,
+    connect_target: &str,
+) -> bool {
+    let st = state.read().await;
+
+    // If we know the peer_id (from a previous successful HELLO), check
+    // if it's still in known_peers or is a SPIRAL neighbor.
+    if let Some(pid) = current_peer_id {
+        if st.mesh.known_peers.contains_key(pid) {
+            return true;
+        }
+        if st.mesh.spiral.is_neighbor(pid) {
+            return true;
+        }
+        // Peer has been evicted from both known_peers and SPIRAL.
+        return false;
+    }
+
+    // No peer_id yet (never completed HELLO). Check if connect_target
+    // matches any known peer's node_name.
+    let target_known = st.mesh.known_peers.values()
+        .any(|p| p.node_name == connect_target);
+    target_known
 }
 
 /// Per-channel state within the relay task.
@@ -4133,6 +4066,7 @@ async fn relay_task(
                                             cvdf_weight: hello.cvdf_weight,
                                             cvdf_tip_hex: hello.cvdf_tip_hex,
                                             cvdf_genesis_hex: hello.cvdf_genesis_hex,
+                                            cluster_vdf_work: hello.cluster_vdf_work,
                                         });
                                     } else {
                                         warn!(remote_host, "mesh: invalid HELLO payload");
@@ -4430,12 +4364,17 @@ struct MeshHelloPayload {
     /// CVDF genesis seed (hex-encoded).
     #[serde(default)]
     pub cvdf_genesis_hex: Option<String>,
+    /// Total VDF work of this node's entire connected graph.
+    /// Sum of cumulative_credit across all known peers + self.
+    /// Used for SPIRAL merge negotiation — cluster with more work wins.
+    #[serde(default)]
+    pub cluster_vdf_work: Option<f64>,
 }
 
 /// Build a native `wire::HelloPayload` from server state (use inside read lock).
 ///
 /// Public so that the inbound mesh handler (lagoon-web) can send our Hello.
-pub fn build_wire_hello(st: &super::server::ServerState) -> HelloPayload {
+pub fn build_wire_hello(st: &mut super::server::ServerState) -> HelloPayload {
     let hp = build_hello_payload(st);
     HelloPayload {
         peer_id: hp.peer_id,
@@ -4456,21 +4395,407 @@ pub fn build_wire_hello(st: &super::server::ServerState) -> HelloPayload {
         cvdf_weight: hp.cvdf_weight,
         cvdf_tip_hex: hp.cvdf_tip_hex,
         cvdf_genesis_hex: hp.cvdf_genesis_hex,
+        cluster_vdf_work: hp.cluster_vdf_work,
     }
 }
 
-/// Build a MeshHelloPayload from server state (use inside read lock).
-fn build_hello_payload(st: &super::server::ServerState) -> MeshHelloPayload {
+/// VDF tiebreak: ungameable coin flip from VDF chain tips.
+///
+/// `b3(b3(our_vdf_hash XOR their_vdf_hash))` — both sides compute the same
+/// shared value. Bit 0 picks direction: 0 = lower peer_id wins, 1 = higher.
+/// peer_id only identifies which side is which; the randomness comes entirely
+/// from VDF hashes which are sequential computation outputs (ungameable).
+///
+/// Falls back to peer_id comparison if either VDF hash is unavailable.
+fn vdf_tiebreak_wins(
+    our_pid: &str,
+    their_pid: &str,
+    our_vdf_hash: Option<&[u8]>,
+    their_vdf_hash: Option<&[u8]>,
+) -> bool {
+    if let (Some(ours), Some(theirs)) = (our_vdf_hash, their_vdf_hash) {
+        // XOR the two VDF chain tips (pad shorter with zeros).
+        let len = ours.len().max(theirs.len());
+        let mut xored = vec![0u8; len];
+        for (i, b) in ours.iter().enumerate() {
+            xored[i] ^= b;
+        }
+        for (i, b) in theirs.iter().enumerate() {
+            xored[i] ^= b;
+        }
+        // Double-hash: b3(b3(xor))
+        let shared = blake3::hash(blake3::hash(&xored).as_bytes());
+        // Bit 0 picks direction.
+        let lower_wins = shared.as_bytes()[0] & 1 == 0;
+        let we_are_lower = our_pid < their_pid;
+        return if lower_wins { we_are_lower } else { !we_are_lower };
+    }
+    // Fallback: no VDF hashes available — raw peer_id comparison.
+    our_pid > their_pid
+}
+
+/// Evaluate SPIRAL merge protocol when a new peer is encountered.
+///
+/// When two nodes (or clusters) meet, they negotiate SPIRAL topology:
+/// - Compare total VDF work across their entire connected graph
+/// - Higher total work wins (peer_id tiebreak if equal)
+/// - Winner keeps all SPIRAL slots unchanged
+/// - Loser re-slots: remove_peer(self) → claim_position(self) (fills first hole)
+///
+/// Returns true if our SPIRAL position changed.
+fn evaluate_spiral_merge(
+    st: &mut super::server::ServerState,
+    remote_peer_id: &str,
+    remote_spiral_index: Option<u64>,
+    remote_cluster_vdf_work: Option<f64>,
+    remote_vdf_cumulative_credit: Option<f64>,
+    remote_vdf_hash: Option<&str>,
+    already_in_clump: bool,
+    shared_state: SharedState,
+) -> bool {
+    let our_pid = st.lens.peer_id.clone();
+    let our_spiral = st.lens.spiral_index;
+    let we_are_claimed = st.mesh.spiral.is_claimed();
+
+    // Extract our VDF hash for tiebreaking.
+    let our_vdf_hash_bytes: Option<Vec<u8>> = st.mesh.vdf_state_rx.as_ref()
+        .map(|rx| rx.borrow().current_hash.to_vec());
+    let their_vdf_hash_bytes: Option<Vec<u8>> = remote_vdf_hash
+        .and_then(|h| hex::decode(h).ok());
+
+    let tiebreak = |their_pid: &str| -> bool {
+        vdf_tiebreak_wins(
+            &our_pid,
+            their_pid,
+            our_vdf_hash_bytes.as_deref(),
+            their_vdf_hash_bytes.as_deref(),
+        )
+    };
+
+    // Case 1: Remote is unclaimed — nothing to merge. Register nothing.
+    if remote_spiral_index.is_none() {
+        // If WE are also unclaimed, compare VDF work. More work = claim first.
+        // Tiebreak via b3(b3(vdf_hash XOR)) when work is exactly equal.
+        if !we_are_claimed {
+            let our_credit = st.mesh.vdf_state_rx.as_ref()
+                .and_then(|rx| rx.borrow().resonance.as_ref()
+                    .map(|r| r.cumulative_credit))
+                .unwrap_or(0.0);
+            let their_credit = remote_vdf_cumulative_credit.unwrap_or(0.0);
+            let we_claim_first = our_credit > their_credit
+                || (our_credit == their_credit && tiebreak(remote_peer_id));
+            if we_claim_first {
+                return claim_and_announce(st, shared_state);
+            }
+        }
+        return false;
+    }
+
+    let remote_idx = remote_spiral_index.unwrap();
+
+    // Register the remote's SPIRAL position.
+    let added = st.mesh.spiral.add_peer(
+        remote_peer_id,
+        citadel_topology::Spiral3DIndex::new(remote_idx),
+    );
+
+    // Case 2: We are unclaimed, remote is claimed → join their cluster.
+    if !we_are_claimed {
+        if !added {
+            // Slot conflict with another peer — force-add the remote.
+            // The conflicting peer will resolve via their own merge.
+            st.mesh.spiral.force_add_peer(
+                remote_peer_id,
+                citadel_topology::Spiral3DIndex::new(remote_idx),
+            );
+        }
+        return claim_and_announce(st, shared_state);
+    }
+
+    // Both sides are claimed from here on.
+
+    // Case 3: Same slot collision — compare individual cumulative credit.
+    if our_spiral == Some(remote_idx) {
+        let our_credit = st.mesh.vdf_state_rx.as_ref()
+            .and_then(|rx| rx.borrow().resonance.as_ref()
+                .map(|r| r.cumulative_credit))
+            .unwrap_or(0.0);
+        let their_credit = remote_vdf_cumulative_credit.unwrap_or(0.0);
+        let we_yield = their_credit > our_credit
+            || (their_credit == our_credit && !tiebreak(remote_peer_id));
+
+        if we_yield {
+            info!(
+                our_credit,
+                their_credit,
+                slot = remote_idx,
+                winner = %remote_peer_id,
+                "SPIRAL merge: slot collision — we yield (lower cumulative credit)"
+            );
+            return reslot_around_winner(st, remote_peer_id, remote_idx, shared_state);
+        }
+        // We keep our slot. Remote will discover collision from our HELLO and yield.
+        if !added {
+            // Force-register us (we won the collision).
+            st.mesh.spiral.force_add_peer(
+                &our_pid,
+                citadel_topology::Spiral3DIndex::new(remote_idx),
+            );
+        }
+        return false;
+    }
+
+    // Case 4: Different slots — cluster merge.
+    // Only triggers when two SEPARATE clumps meet for the first time.
+    // If the remote was already in our known_peers, they're in our clump —
+    // no merge needed, just register their updated slot.
+    if already_in_clump {
+        return added; // topology may have changed from add_peer, that's it
+    }
+
+    // Compare total VDF work across each clump. Loser re-slots around winner.
+    if !added {
+        // Remote's slot conflicts with a THIRD peer. Force-add the remote
+        // if it has more VDF credit (active claim beats stale gossip).
+        if let Some(existing_key) = st.mesh.spiral.peer_at_index(remote_idx).map(|s| s.to_string()) {
+            let existing_credit = st.mesh.known_peers.get(&existing_key)
+                .and_then(|p| p.vdf_cumulative_credit)
+                .unwrap_or(0.0);
+            let incoming_credit = remote_vdf_cumulative_credit.unwrap_or(0.0);
+            let existing_vdf_hash: Option<Vec<u8>> = st.mesh.known_peers.get(&existing_key)
+                .and_then(|p| p.vdf_hash.as_deref())
+                .and_then(|h| hex::decode(h).ok());
+            let incoming_wins = incoming_credit > existing_credit
+                || (incoming_credit == existing_credit && vdf_tiebreak_wins(
+                    remote_peer_id,
+                    &existing_key,
+                    their_vdf_hash_bytes.as_deref(),
+                    existing_vdf_hash.as_deref(),
+                ));
+            if incoming_wins {
+                st.mesh.spiral.force_add_peer(
+                    remote_peer_id,
+                    citadel_topology::Spiral3DIndex::new(remote_idx),
+                );
+            }
+        }
+    }
+
+    // Compare cluster VDF work to determine merge winner.
+    // Use our CACHED cluster_vdf_work (computed when we built our HELLO) —
+    // NOT recomputed, because by now known_peers includes the remote's credit.
+    // Two independently-computed values: ours (cached) vs theirs (from HELLO).
+    let our_cluster_work = st.mesh.our_cluster_vdf_work;
+    let their_cluster_work = remote_cluster_vdf_work
+        .or(remote_vdf_cumulative_credit)
+        .unwrap_or(0.0);
+
+    let we_lose = their_cluster_work > our_cluster_work
+        || (their_cluster_work == our_cluster_work && !tiebreak(remote_peer_id));
+
+    if we_lose {
+        info!(
+            our_work = our_cluster_work,
+            their_work = their_cluster_work,
+            our_slot = ?our_spiral,
+            their_slot = remote_idx,
+            winner = %remote_peer_id,
+            "SPIRAL merge: cluster merge — we re-slot (lower total VDF work)"
+        );
+        return reslot_around_winner(st, remote_peer_id, remote_idx, shared_state);
+    }
+
+    // We win. Remote processes OUR HELLO (which carries our cluster_vdf_work),
+    // compares against their own cached value, sees they lose, and re-slots.
+    false
+}
+
+/// Evict stale peers from SPIRAL topology before claiming.
+/// Keeps peers that have active relay connections OR are in known_peers
+/// with recent VDF activity (last 5 minutes). This prevents slot inflation
+/// from truly dead peers while preserving topology learned from gossip.
+fn evict_stale_spiral_peers(st: &mut super::server::ServerState) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    const VDF_FRESHNESS_SECS: u64 = 300; // 5 minutes
+
+    let mut live_keys: std::collections::HashSet<String> = st
+        .federation
+        .relays
+        .iter()
+        .filter(|(_, r)| r.mesh_connected)
+        .map(|(key, _)| key.clone())
+        .collect();
+
+    // Also keep peers from known_peers with recent VDF activity.
+    // These are peers we learned about via PEERS gossip — they're real
+    // nodes even if we don't have a direct relay connection to them yet.
+    for (key, info) in &st.mesh.known_peers {
+        if info.spiral_index.is_some()
+            && info.last_vdf_advance > 0
+            && now.saturating_sub(info.last_vdf_advance) < VDF_FRESHNESS_SECS
+        {
+            live_keys.insert(key.clone());
+        }
+    }
+
+    let before = st.mesh.spiral.occupied_count();
+    st.mesh.spiral.retain_peers(&live_keys);
+    let after = st.mesh.spiral.occupied_count();
+    if before != after {
+        info!(
+            before,
+            after,
+            live_keys = live_keys.len(),
+            "SPIRAL: evicted stale peers before claiming"
+        );
+    }
+}
+
+/// Claim the first available SPIRAL slot, persist, announce, update neighbors, prune.
+/// Returns true (always changes topology).
+fn claim_and_announce(
+    st: &mut super::server::ServerState,
+    shared_state: SharedState,
+) -> bool {
+    let our_pid = st.lens.peer_id.clone();
+    evict_stale_spiral_peers(st);
+    let idx = st.mesh.spiral.claim_position(&our_pid);
+    info!(
+        spiral_index = idx.value(),
+        peer_id = %our_pid,
+        known_peers = st.mesh.known_peers.len(),
+        "SPIRAL merge: claimed slot"
+    );
+    persist_spiral_position(st, idx.value());
+    announce_hello_to_all_relays(st);
+    update_spiral_neighbors(st);
+    dial_missing_spiral_neighbors(st, shared_state);
+    st.notify_topology_change();
+    prune_non_spiral_relays(st);
+    true
+}
+
+/// Remove ourselves from our current slot, register the winner, claim first available hole.
+/// Returns true (always changes topology).
+fn reslot_around_winner(
+    st: &mut super::server::ServerState,
+    winner_peer_id: &str,
+    winner_slot: u64,
+    shared_state: SharedState,
+) -> bool {
+    let our_pid = st.lens.peer_id.clone();
+    // Remove ourselves from the contested slot.
+    st.mesh.spiral.remove_peer(&our_pid);
+    // Evict stale peers so we don't skip over dead slots.
+    evict_stale_spiral_peers(st);
+    // Accept the winner's claim.
+    st.mesh.spiral.force_add_peer(
+        winner_peer_id,
+        citadel_topology::Spiral3DIndex::new(winner_slot),
+    );
+    // Claim first available hole.
+    let new_idx = st.mesh.spiral.claim_position(&our_pid);
+    info!(
+        old_slot = ?st.lens.spiral_index,
+        new_slot = new_idx.value(),
+        winner = %winner_peer_id,
+        "SPIRAL merge: re-slotted around winner"
+    );
+    persist_spiral_position(st, new_idx.value());
+    announce_hello_to_all_relays(st);
+    update_spiral_neighbors(st);
+    dial_missing_spiral_neighbors(st, shared_state);
+    st.notify_topology_change();
+    true
+}
+
+/// SPIRAL convergence: check if we should move to a lower slot.
+///
+/// After topology changes (gossip, eviction), a node may discover that
+/// there are unoccupied slots closer to the origin than its current position.
+/// SPIRAL's convergence protocol says: move there. This fills holes naturally
+/// and guarantees O(log n) convergence to a packed topology.
+///
+/// Called after PEERS gossip processing and stale peer eviction.
+/// Returns true if our position changed.
+fn reconverge_spiral(
+    st: &mut super::server::ServerState,
+    shared_state: SharedState,
+) -> bool {
+    // Only converge if we have a position.
+    if !st.mesh.spiral.is_claimed() {
+        return false;
+    }
+    // Evict stale peers first — frees slots held by dead nodes.
+    evict_stale_spiral_peers(st);
+    // Check if a better slot exists.
+    let better = st.mesh.spiral.evaluate_position();
+    let Some(target) = better else {
+        return false;
+    };
+    let our_pid = st.lens.peer_id.clone();
+    let old_slot = st.lens.spiral_index;
+    // Vacate current position.
+    st.mesh.spiral.remove_peer(&our_pid);
+    // Claim first available hole (should be `target` or even lower).
+    let new_idx = st.mesh.spiral.claim_position(&our_pid);
+    info!(
+        old_slot = ?old_slot,
+        target_slot = target.value(),
+        new_slot = new_idx.value(),
+        "SPIRAL convergence: moved to lower slot"
+    );
+    persist_spiral_position(st, new_idx.value());
+    announce_hello_to_all_relays(st);
+    update_spiral_neighbors(st);
+    dial_missing_spiral_neighbors(st, shared_state);
+    st.notify_topology_change();
+    prune_non_spiral_relays(st);
+    true
+}
+
+/// Persist SPIRAL position to LensIdentity on disk.
+fn persist_spiral_position(st: &mut super::server::ServerState, slot: u64) {
+    let mut updated_lens = (*st.lens).clone();
+    updated_lens.spiral_index = Some(slot);
+    if let Some(ref rx) = st.mesh.vdf_state_rx {
+        updated_lens.vdf_total_steps = rx.borrow().total_steps;
+    }
+    super::lens::persist_identity(&st.data_dir, &updated_lens);
+    st.lens = std::sync::Arc::new(updated_lens);
+}
+
+/// Re-send MESH HELLO to all connected relays (after position change).
+fn announce_hello_to_all_relays(st: &mut super::server::ServerState) {
+    let hello_json = serde_json::to_string(&build_hello_payload(st)).unwrap_or_default();
+    for relay in st.federation.relays.values() {
+        let _ = relay.outgoing_tx.send(RelayCommand::MeshHello {
+            json: hello_json.clone(),
+        });
+    }
+}
+
+/// Update SPIRAL neighbor set for latency + connection gossip coordinators.
+fn update_spiral_neighbors(st: &mut super::server::ServerState) {
+    let neighbors = st.mesh.spiral.neighbors().clone();
+    st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
+    st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
+}
+
+fn build_hello_payload(st: &mut super::server::ServerState) -> MeshHelloPayload {
     let (vdf_genesis, vdf_hash, vdf_step, vdf_resonance_credit, vdf_actual_rate_hz, vdf_cumulative_credit) = st
         .mesh
         .vdf_state_rx
         .as_ref()
         .map(|rx| {
             let vdf = rx.borrow();
-            let (credit, rate, rolling) = vdf
+            let (credit, rate, cumulative) = vdf
                 .resonance
                 .as_ref()
-                .map(|r| (Some(r.credit), Some(r.actual_rate_hz), Some(r.rolling_credit_3c)))
+                .map(|r| (Some(r.credit), Some(r.actual_rate_hz), Some(r.cumulative_credit)))
                 .unwrap_or((None, None, None));
             (
                 Some(hex::encode(vdf.genesis)),
@@ -4478,10 +4803,27 @@ fn build_hello_payload(st: &super::server::ServerState) -> MeshHelloPayload {
                 Some(vdf.total_steps),
                 credit,
                 rate,
-                rolling,
+                cumulative,
             )
         })
         .unwrap_or((None, None, None, None, None, None));
+
+    // Cluster VDF work = our cumulative + all known peers' cumulative.
+    // This is the value we SEND in our HELLO — represents our clump's
+    // independent weight. Cached in MeshState so merge evaluation can
+    // compare two independently-computed values (ours vs theirs).
+    let cluster_vdf_work = {
+        let our_cumulative = st.mesh.vdf_state_rx.as_ref()
+            .and_then(|rx| rx.borrow().resonance.as_ref()
+                .map(|r| r.cumulative_credit))
+            .unwrap_or(0.0);
+        let peers_cumulative: f64 = st.mesh.known_peers.values()
+            .filter_map(|p| p.vdf_cumulative_credit)
+            .sum();
+        let total = our_cumulative + peers_cumulative;
+        st.mesh.our_cluster_vdf_work = total;
+        Some(total)
+    };
 
     // Ygg overlay address (for identity/routing, NOT for peering).
     let yggdrasil_addr = st
@@ -4523,6 +4865,7 @@ fn build_hello_payload(st: &super::server::ServerState) -> MeshHelloPayload {
         cvdf_weight,
         cvdf_tip_hex,
         cvdf_genesis_hex,
+        cluster_vdf_work,
     }
 }
 
@@ -4621,12 +4964,6 @@ fn mesh_message_to_irc(msg: &MeshMessage) -> Message {
         MeshMessage::ProfileDelta { data } => ("PROFILE_DELTA".into(), data.clone()),
         MeshMessage::ConnectionHave { data } => ("CONNECTION_HAVE".into(), data.clone()),
         MeshMessage::ConnectionDelta { data } => ("CONNECTION_DELTA".into(), data.clone()),
-        MeshMessage::RegChallenge { username, state } => {
-            ("REG_CHALLENGE".into(), serde_json::json!({ "username": username, "state": state }).to_string())
-        }
-        MeshMessage::AuthChallenge { username, state } => {
-            ("AUTH_CHALLENGE".into(), serde_json::json!({ "username": username, "state": state }).to_string())
-        }
         MeshMessage::SocketMigrate { migration, client_peer_id } => {
             ("SOCKET_MIGRATE".into(), serde_json::json!({ "migration": migration, "client_peer_id": client_peer_id }).to_string())
         }

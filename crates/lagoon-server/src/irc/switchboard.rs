@@ -592,8 +592,8 @@ async fn upgrade_to_mesh(
 
     // Send our Hello.
     let our_hello = {
-        let st = state.read().await;
-        build_wire_hello(&st)
+        let mut st = state.write().await;
+        build_wire_hello(&mut st)
     };
     let hello_json = MeshMessage::Hello(our_hello).to_json()?;
     ws_tx.send(Message::Text(hello_json.into())).await
@@ -689,8 +689,8 @@ async fn upgrade_to_mesh(
                     }
                     Some(RelayCommand::MeshHello { json: _ }) => {
                         let hello = {
-                            let st = state.read().await;
-                            build_wire_hello(&st)
+                            let mut st = state.write().await;
+                            build_wire_hello(&mut st)
                         };
                         let msg = MeshMessage::Hello(hello);
                         if let Ok(json) = msg.to_json() {

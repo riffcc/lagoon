@@ -54,6 +54,11 @@ pub struct HelloPayload {
     /// CVDF genesis seed (hex-encoded) — chains with different genesis are incompatible.
     #[serde(default)]
     pub cvdf_genesis_hex: Option<String>,
+    /// Total VDF work of this node's entire connected graph.
+    /// Sum of cumulative_credit across all known peers + self.
+    /// Used for SPIRAL merge negotiation — cluster with more work wins.
+    #[serde(default)]
+    pub cluster_vdf_work: Option<f64>,
 }
 
 /// Native mesh protocol message — the sole on-the-wire type.
@@ -130,14 +135,6 @@ pub enum MeshMessage {
     #[serde(rename = "connection_delta")]
     ConnectionDelta { data: String },
 
-    /// WebAuthn registration challenge — broadcast to cluster so any node
-    /// behind the same anycast IP can complete the ceremony.
-    #[serde(rename = "reg_challenge")]
-    RegChallenge { username: String, state: String },
-
-    /// WebAuthn authentication challenge — same cluster broadcast.
-    #[serde(rename = "auth_challenge")]
-    AuthChallenge { username: String, state: String },
 
     /// Socket migration — TCP_REPAIR state delivered via existing mesh relay.
     /// The target node calls `anymesh::restore()` to reconstruct the socket.
@@ -264,6 +261,7 @@ mod tests {
             cvdf_weight: Some(100),
             cvdf_tip_hex: Some("aabbccdd".into()),
             cvdf_genesis_hex: Some("11223344".into()),
+            cluster_vdf_work: Some(1000.5),
         });
 
         let json = msg.to_json().unwrap();
@@ -282,6 +280,7 @@ mod tests {
                 assert_eq!(h.cvdf_weight, Some(100));
                 assert_eq!(h.cvdf_tip_hex.as_deref(), Some("aabbccdd"));
                 assert_eq!(h.cvdf_genesis_hex.as_deref(), Some("11223344"));
+                assert_eq!(h.cluster_vdf_work, Some(1000.5));
             }
             other => panic!("expected Hello, got {other:?}"),
         }
@@ -298,6 +297,7 @@ mod tests {
                 assert_eq!(h.spiral_index, None);
                 assert_eq!(h.site_name, "");
                 assert_eq!(h.node_name, "");
+                assert_eq!(h.cluster_vdf_work, None);
             }
             other => panic!("expected Hello, got {other:?}"),
         }
