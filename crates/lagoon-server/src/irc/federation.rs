@@ -93,6 +93,10 @@ pub fn dispatch_mesh_message(
                 vdf_actual_rate_hz: hello.vdf_actual_rate_hz,
                 ygg_peer_uri: hello.ygg_peer_uri.clone(),
                 relay_peer_addr,
+                cvdf_height: hello.cvdf_height,
+                cvdf_weight: hello.cvdf_weight,
+                cvdf_tip_hex: hello.cvdf_tip_hex.clone(),
+                cvdf_genesis_hex: hello.cvdf_genesis_hex.clone(),
             });
             Some(hello)
         }
@@ -222,6 +226,13 @@ pub fn dispatch_mesh_message(
                 remote_host: remote_host.to_string(),
                 migration,
                 client_peer_id,
+            });
+            None
+        }
+        MeshMessage::Cvdf { data } => {
+            let _ = event_tx.send(RelayEvent::CvdfMessage {
+                remote_host: remote_host.to_string(),
+                data,
             });
             None
         }
@@ -477,6 +488,14 @@ pub enum RelayEvent {
         /// an underlay Ygg peer URI (`tcp://[ip]:9443`). This is a known-good
         /// address to a confirmed-different node (peer_id verified).
         relay_peer_addr: Option<SocketAddr>,
+        /// CVDF cooperative chain height.
+        cvdf_height: Option<u64>,
+        /// CVDF cooperative chain weight.
+        cvdf_weight: Option<u64>,
+        /// CVDF chain tip hash (hex).
+        cvdf_tip_hex: Option<String>,
+        /// CVDF genesis seed (hex).
+        cvdf_genesis_hex: Option<String>,
     },
     /// Received MESH PEERS from a remote peer.
     MeshPeers {
@@ -591,6 +610,12 @@ pub enum RelayEvent {
         /// The peer_id of the original client.
         client_peer_id: String,
     },
+    /// Received CVDF cooperative VDF message from a peer.
+    CvdfMessage {
+        remote_host: String,
+        /// Base64-encoded bincode `CvdfServiceMessage`.
+        data: String,
+    },
 }
 
 /// Manages all federated channel relay connections.
@@ -665,6 +690,31 @@ pub fn spawn_event_processor(
             let st = state.read().await;
             st.transport_config.ygg_node.clone()
         };
+
+        // Initialize CVDF cooperative VDF service.
+        // The transport buffers outbound messages; we drain them below.
+        let (cvdf_transport, mut cvdf_outbound_rx) =
+            super::cvdf_transport::LagoonCvdfTransport::new();
+        {
+            let mut st = state.write().await;
+            let signing_key =
+                ed25519_dalek::SigningKey::from_bytes(&st.lens.secret_seed);
+            // Genesis seed = BLAKE3 of server_name — deterministic per network.
+            let genesis_seed = blake3::hash(st.lens.server_name.as_bytes());
+            let mut svc = citadel_lens::service::CvdfService::new_genesis(
+                *genesis_seed.as_bytes(),
+                signing_key,
+                cvdf_transport,
+            );
+            // Register our SPIRAL slot if we have one.
+            if let Some(idx) = st.lens.spiral_index {
+                let pubkey = super::lens::pubkey_bytes(&st.lens)
+                    .expect("valid lens identity");
+                svc.set_our_slot(idx);
+                svc.register_peer_slot(idx, pubkey);
+            }
+            st.mesh.cvdf_service = Some(svc);
+        }
 
         // VDF liveness: challenge SPIRAL neighbors every 5 seconds.
         // Responses update last_vdf_advance; peers that stop responding
@@ -939,6 +989,10 @@ pub fn spawn_event_processor(
                     vdf_actual_rate_hz,
                     ygg_peer_uri,
                     relay_peer_addr,
+                    cvdf_height,
+                    cvdf_weight,
+                    cvdf_tip_hex,
+                    cvdf_genesis_hex,
                 } => {
                     // Backfill node_name/site_name for old peers that don't send them.
                     let node_name = if node_name.is_empty() {
@@ -1110,6 +1164,39 @@ pub fn spawn_event_processor(
                     let neighbors = st.mesh.spiral.neighbors().clone();
                     st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
                     st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
+
+                    // CVDF: register peer's SPIRAL slot and evaluate their chain.
+                    // Extract pubkey from known_peers first to avoid borrow conflict
+                    // with cvdf_service (both fields of st.mesh).
+                    let cvdf_peer_info: Option<([u8; 32], Option<u64>)> =
+                        st.mesh.known_peers.get(&mkey).and_then(|peer| {
+                            let bytes = hex::decode(&peer.public_key_hex).ok()?;
+                            if bytes.len() != 32 { return None; }
+                            let mut pk = [0u8; 32];
+                            pk.copy_from_slice(&bytes);
+                            Some((pk, peer.spiral_index))
+                        });
+                    if let (Some(svc), Some((pk, slot))) =
+                        (st.mesh.cvdf_service.as_mut(), cvdf_peer_info)
+                    {
+                        if let Some(idx) = slot {
+                            svc.register_peer_slot(idx, pk);
+                        }
+                        // Evaluate their cooperative chain — sync if heavier.
+                        if let (Some(height), Some(weight), Some(tip), Some(genesis)) =
+                            (cvdf_height, cvdf_weight, cvdf_tip_hex, cvdf_genesis_hex)
+                        {
+                            let peer_status = citadel_lens::service::CvdfStatus {
+                                height,
+                                weight,
+                                tip_hex: tip,
+                                genesis_hex: genesis,
+                                active_slots: 0,
+                            };
+                            let action = svc.evaluate_hello(&pk, &peer_status);
+                            svc.execute_action(&action);
+                        }
+                    }
 
                     // Prune relay connections to non-SPIRAL peers now that the
                     // neighbor set may have changed.
@@ -2392,6 +2479,38 @@ pub fn spawn_event_processor(
                     st.auth_challenges.insert(username, challenge_state);
                 }
 
+                RelayEvent::CvdfMessage { remote_host, data } => {
+                    use base64::Engine as _;
+                    // Decode: base64 → bincode → CvdfServiceMessage
+                    let decoded = base64::engine::general_purpose::STANDARD
+                        .decode(&data)
+                        .ok()
+                        .and_then(|bytes| bincode::deserialize::<
+                            citadel_lens::service::CvdfServiceMessage,
+                        >(&bytes).ok());
+                    let Some(payload) = decoded else {
+                        warn!(remote_host, "cvdf: failed to decode message");
+                        continue;
+                    };
+                    // Look up the sender's pubkey from known_peers.
+                    let mut st = state.write().await;
+                    let sender_pubkey = st.mesh.known_peers.values()
+                        .find(|p| p.node_name == remote_host || p.peer_id == remote_host)
+                        .and_then(|p| hex::decode(&p.public_key_hex).ok())
+                        .and_then(|b| if b.len() == 32 {
+                            let mut arr = [0u8; 32];
+                            arr.copy_from_slice(&b);
+                            Some(arr)
+                        } else {
+                            None
+                        });
+                    if let (Some(svc), Some(pubkey)) =
+                        (st.mesh.cvdf_service.as_mut(), sender_pubkey)
+                    {
+                        svc.receive(&pubkey, payload);
+                    }
+                }
+
                 RelayEvent::SocketMigrate { remote_host, migration, client_peer_id } => {
                     tracing::info!(
                         remote_host,
@@ -2518,6 +2637,43 @@ pub fn spawn_event_processor(
                     st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
                     publish_connection_snapshot(&mut st);
                     st.notify_topology_change();
+                }
+
+                // CVDF cooperative tick — attest + produce (if our duty).
+                if let Some(ref mut svc) = st.mesh.cvdf_service {
+                    svc.tick();
+                }
+            }
+
+            // Drain CVDF outbound messages and dispatch to mesh relays.
+            Some((target, msg)) = cvdf_outbound_rx.recv() => {
+                let data = super::cvdf_transport::encode_cvdf_message(&msg);
+                let mesh_msg = MeshMessage::Cvdf { data };
+                let st = state.read().await;
+                match target {
+                    None => {
+                        // Broadcast to all connected relays.
+                        for relay in st.federation.relays.values() {
+                            let _ = relay.outgoing_tx.send(
+                                RelayCommand::SendMesh(mesh_msg.clone()),
+                            );
+                        }
+                    }
+                    Some(pubkey) => {
+                        // Send to specific peer by pubkey.
+                        let target_hex = hex::encode(pubkey);
+                        if let Some(peer) = st.mesh.known_peers.values()
+                            .find(|p| p.public_key_hex == target_hex)
+                        {
+                            if let Some(relay) = st.federation.relays
+                                .get(&peer.node_name)
+                            {
+                                let _ = relay.outgoing_tx.send(
+                                    RelayCommand::SendMesh(mesh_msg),
+                                );
+                            }
+                        }
+                    }
                 }
             }
 
@@ -3529,6 +3685,10 @@ async fn relay_task(
                                             vdf_actual_rate_hz: hello.vdf_actual_rate_hz,
                                             ygg_peer_uri: hello.ygg_peer_uri,
                                             relay_peer_addr,
+                                            cvdf_height: hello.cvdf_height,
+                                            cvdf_weight: hello.cvdf_weight,
+                                            cvdf_tip_hex: hello.cvdf_tip_hex,
+                                            cvdf_genesis_hex: hello.cvdf_genesis_hex,
                                         });
                                     } else {
                                         warn!(remote_host, "mesh: invalid HELLO payload");
@@ -3810,6 +3970,18 @@ struct MeshHelloPayload {
     /// Yggdrasil peer URI for overlay peering (e.g. `tcp://[200:xxxx::]:9443`).
     #[serde(default)]
     pub ygg_peer_uri: Option<String>,
+    /// CVDF cooperative chain height.
+    #[serde(default)]
+    pub cvdf_height: Option<u64>,
+    /// CVDF cooperative chain weight.
+    #[serde(default)]
+    pub cvdf_weight: Option<u64>,
+    /// CVDF chain tip hash (hex-encoded).
+    #[serde(default)]
+    pub cvdf_tip_hex: Option<String>,
+    /// CVDF genesis seed (hex-encoded).
+    #[serde(default)]
+    pub cvdf_genesis_hex: Option<String>,
 }
 
 /// Build a native `wire::HelloPayload` from server state (use inside read lock).
@@ -3831,6 +4003,10 @@ pub fn build_wire_hello(st: &super::server::ServerState) -> HelloPayload {
         vdf_resonance_credit: hp.vdf_resonance_credit,
         vdf_actual_rate_hz: hp.vdf_actual_rate_hz,
         ygg_peer_uri: hp.ygg_peer_uri,
+        cvdf_height: hp.cvdf_height,
+        cvdf_weight: hp.cvdf_weight,
+        cvdf_tip_hex: hp.cvdf_tip_hex,
+        cvdf_genesis_hex: hp.cvdf_genesis_hex,
     }
 }
 
@@ -3871,6 +4047,13 @@ fn build_hello_payload(st: &super::server::ServerState) -> MeshHelloPayload {
         std::net::IpAddr::V4(v4) => format!("tcp://{v4}:9443"),
     });
 
+    // CVDF cooperative chain status (if service is running).
+    let (cvdf_height, cvdf_weight, cvdf_tip_hex, cvdf_genesis_hex) =
+        st.mesh.cvdf_service.as_ref().map(|svc| {
+            let status = svc.status();
+            (Some(status.height), Some(status.weight), Some(status.tip_hex), Some(status.genesis_hex))
+        }).unwrap_or((None, None, None, None));
+
     MeshHelloPayload {
         peer_id: st.lens.peer_id.clone(),
         server_name: st.lens.server_name.clone(),
@@ -3885,6 +4068,10 @@ fn build_hello_payload(st: &super::server::ServerState) -> MeshHelloPayload {
         vdf_resonance_credit,
         vdf_actual_rate_hz,
         ygg_peer_uri,
+        cvdf_height,
+        cvdf_weight,
+        cvdf_tip_hex,
+        cvdf_genesis_hex,
     }
 }
 
@@ -4028,6 +4215,7 @@ fn mesh_message_to_irc(msg: &MeshMessage) -> Message {
         MeshMessage::SocketMigrate { migration, client_peer_id } => {
             ("SOCKET_MIGRATE".into(), serde_json::json!({ "migration": migration, "client_peer_id": client_peer_id }).to_string())
         }
+        MeshMessage::Cvdf { data } => ("CVDF".into(), data.clone()),
     };
     let mut params = vec![sub];
     if !payload.is_empty() {

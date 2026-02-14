@@ -295,6 +295,9 @@ pub struct MeshState {
     pub connection_store: super::connection_store::ConnectionStore,
     /// SPIRAL-scoped connection snapshot gossip coordinator.
     pub connection_gossip: super::connection_gossip::ConnectionGossip,
+    /// CVDF cooperative VDF service — Citadel's cooperative chain as a framework service.
+    /// None until the node has peers and initializes the chain.
+    pub cvdf_service: Option<citadel_lens::service::CvdfService<super::cvdf_transport::LagoonCvdfTransport>>,
 }
 
 impl MeshState {
@@ -317,6 +320,7 @@ impl MeshState {
             ),
             connection_store: super::connection_store::ConnectionStore::new(120_000), // 120s TTL
             connection_gossip: super::connection_gossip::ConnectionGossip::new(10_000), // 10s sync interval
+            cvdf_service: None,
         }
     }
 }
@@ -3250,6 +3254,14 @@ async fn handle_command(
                             vdf_actual_rate_hz: Option<f64>,
                             #[serde(default)]
                             ygg_peer_uri: Option<String>,
+                            #[serde(default)]
+                            cvdf_height: Option<u64>,
+                            #[serde(default)]
+                            cvdf_weight: Option<u64>,
+                            #[serde(default)]
+                            cvdf_tip_hex: Option<String>,
+                            #[serde(default)]
+                            cvdf_genesis_hex: Option<String>,
                         }
                         if let Ok(hello) = serde_json::from_str::<HelloPayload>(json) {
                             // Use node_name from HELLO if present, else derive from server_name.
@@ -3283,6 +3295,10 @@ async fn handle_command(
                                     // have a meaningful TCP peer addr for APE
                                     // underlay derivation (they initiated).
                                     relay_peer_addr: None,
+                                    cvdf_height: hello.cvdf_height,
+                                    cvdf_weight: hello.cvdf_weight,
+                                    cvdf_tip_hex: hello.cvdf_tip_hex,
+                                    cvdf_genesis_hex: hello.cvdf_genesis_hex,
                                 },
                             );
 

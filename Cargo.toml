@@ -71,6 +71,7 @@ citadel-topology = { path = "/mnt/riffcastle/lagun-project/citadel/crates/citade
 citadel-gossip = { path = "/mnt/riffcastle/lagun-project/citadel/crates/citadel-gossip" }
 citadel-spore = { path = "/mnt/riffcastle/lagun-project/citadel/crates/citadel-spore" }
 citadel-crdt = { path = "/mnt/riffcastle/lagun-project/citadel/crates/citadel-crdt" }
+citadel-lens = { path = "/mnt/riffcastle/lagun-project/citadel/crates/citadel-lens", default-features = false }
 bincode = "1.3"
 serde_bytes = "0.11"
 

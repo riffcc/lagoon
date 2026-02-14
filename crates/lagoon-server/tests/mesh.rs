@@ -877,6 +877,10 @@ fn make_hello() -> HelloPayload {
         vdf_resonance_credit: Some(0.999),
         vdf_actual_rate_hz: Some(10.0),
         ygg_peer_uri: Some("tcp://[200:1234::1]:9443".into()),
+        cvdf_height: None,
+        cvdf_weight: None,
+        cvdf_tip_hex: None,
+        cvdf_genesis_hex: None,
     }
 }
 
@@ -917,6 +921,7 @@ fn dispatch_hello_sends_mesh_hello_event() {
             vdf_actual_rate_hz,
             ygg_peer_uri,
             relay_peer_addr,
+            ..
         } => {
             assert_eq!(remote_host, "lon.lagun.co");
             assert_eq!(peer_id, "b3b3/deadbeef");

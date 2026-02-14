@@ -336,6 +336,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "citadel-lens"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "citadel-spore",
+ "citadel-topology",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "hex",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "citadel-spore"
 version = "0.1.0"
 dependencies = [
@@ -1053,6 +1072,7 @@ dependencies = [
  "chrono",
  "citadel-crdt",
  "citadel-gossip",
+ "citadel-lens",
  "citadel-spore",
  "citadel-topology",
  "ed25519-dalek",

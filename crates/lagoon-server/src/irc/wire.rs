@@ -38,6 +38,18 @@ pub struct HelloPayload {
     pub vdf_actual_rate_hz: Option<f64>,
     #[serde(default)]
     pub ygg_peer_uri: Option<String>,
+    /// CVDF cooperative chain height (round number).
+    #[serde(default)]
+    pub cvdf_height: Option<u64>,
+    /// CVDF cooperative chain weight (attestation-weighted sum).
+    #[serde(default)]
+    pub cvdf_weight: Option<u64>,
+    /// CVDF chain tip hash (hex-encoded).
+    #[serde(default)]
+    pub cvdf_tip_hex: Option<String>,
+    /// CVDF genesis seed (hex-encoded) — chains with different genesis are incompatible.
+    #[serde(default)]
+    pub cvdf_genesis_hex: Option<String>,
 }
 
 /// Native mesh protocol message — the sole on-the-wire type.
@@ -132,6 +144,11 @@ pub enum MeshMessage {
         /// The peer_id of the original client (so target knows who to expect).
         client_peer_id: String,
     },
+
+    /// CVDF cooperative VDF message — attestations, rounds, sync.
+    /// Payload is base64-encoded bincode (same pattern as SPORE payloads).
+    #[serde(rename = "cvdf")]
+    Cvdf { data: String },
 }
 
 impl MeshMessage {
@@ -231,6 +248,10 @@ mod tests {
             vdf_resonance_credit: Some(0.999),
             vdf_actual_rate_hz: Some(10.0),
             ygg_peer_uri: Some("tcp://[200:1234::1]:9443".into()),
+            cvdf_height: Some(42),
+            cvdf_weight: Some(100),
+            cvdf_tip_hex: Some("aabbccdd".into()),
+            cvdf_genesis_hex: Some("11223344".into()),
         });
 
         let json = msg.to_json().unwrap();
@@ -245,6 +266,10 @@ mod tests {
                 assert_eq!(h.spiral_index, Some(7));
                 assert_eq!(h.vdf_step, Some(12345));
                 assert_eq!(h.node_name, "lon");
+                assert_eq!(h.cvdf_height, Some(42));
+                assert_eq!(h.cvdf_weight, Some(100));
+                assert_eq!(h.cvdf_tip_hex.as_deref(), Some("aabbccdd"));
+                assert_eq!(h.cvdf_genesis_hex.as_deref(), Some("11223344"));
             }
             other => panic!("expected Hello, got {other:?}"),
         }
@@ -673,6 +698,36 @@ mod tests {
         match decoded {
             SwitchboardMessage::PeerRedirect { method, .. } => assert_eq!(method, "repair"),
             other => panic!("expected PeerRedirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cvdf_round_trip() {
+        use base64::Engine as _;
+        use citadel_lens::service::CvdfServiceMessage;
+
+        // Encode: bincode → base64
+        let cvdf_msg = CvdfServiceMessage::SyncReq { from_height: 42 };
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(bincode::serialize(&cvdf_msg).unwrap());
+
+        let msg = MeshMessage::Cvdf { data: encoded };
+        let json = msg.to_json().unwrap();
+        assert!(json.contains(r#""type":"cvdf""#));
+
+        // Decode: JSON → base64 → bincode
+        let decoded = MeshMessage::from_json(&json).unwrap();
+        match decoded {
+            MeshMessage::Cvdf { data } => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&data).unwrap();
+                let payload: CvdfServiceMessage = bincode::deserialize(&bytes).unwrap();
+                match payload {
+                    CvdfServiceMessage::SyncReq { from_height } => assert_eq!(from_height, 42),
+                    other => panic!("expected SyncReq, got {other:?}"),
+                }
+            }
+            other => panic!("expected Cvdf, got {other:?}"),
         }
     }
 
