@@ -2537,17 +2537,20 @@ pub fn spawn_event_processor(
             } // match event
             } // Some(event) => {
 
-            // VDF liveness: challenge SPIRAL neighbors (up to 2 hops)
-            // and sweep for dead peers whose VDF stopped advancing.
+            // VDF liveness: challenge direct SPIRAL neighbors and sweep
+            // for dead peers whose VDF stopped advancing.
+            //
+            // VDF proof is a handshake with your direct neighbors and
+            // nodes you contact. Only your direct SPIRAL neighbors can
+            // disconnect you, so only they need your proof. Proofs are
+            // NOT gossiped — they stop at the recipient. Each node
+            // proves liveness to ≤20 neighbors. O(1) per node.
             _ = vdf_challenge_interval.tick() => {
                 let st = state.read().await;
-                // Challenge SPIRAL neighbors: send VdfProofReq to all
-                // connected neighbors.  SPIRAL neighbors police each other —
-                // each node challenges nodes up to 2 hops away.
+                // Challenge direct SPIRAL neighbors only.
                 let neighbor_keys: Vec<String> = st.mesh.spiral.neighbors()
                     .iter().cloned().collect();
                 for nkey in &neighbor_keys {
-                    // Find which relay serves this neighbor.
                     if let Some(peer) = st.mesh.known_peers.get(nkey) {
                         if let Some(relay) = st.federation.relays.get(&peer.node_name) {
                             let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
@@ -2556,13 +2559,6 @@ pub fn spawn_event_processor(
                         }
                     }
                 }
-
-                // Also challenge 2-hop neighbors: peers that are neighbors
-                // of our neighbors but not directly connected to us.
-                // We can reach them via gossip relay — ask our connected
-                // neighbors about THEIR neighbors' liveness.
-                // (For now, direct neighbors suffice — transitive policing
-                // emerges because every node challenges its own neighbors.)
 
                 drop(st);
 
@@ -2645,18 +2641,32 @@ pub fn spawn_event_processor(
                 }
             }
 
-            // Drain CVDF outbound messages and dispatch to mesh relays.
+            // Drain CVDF outbound messages — SPIRAL-neighbor-scoped.
+            //
+            // VDF proofs are a handshake with your direct SPIRAL neighbors
+            // and nodes you contact. They are NOT gossiped further.
+            // Only your direct neighbors can disconnect you, so only they
+            // need your proof. A node three hops away can't act on it.
+            // O(1) per node (≤20 neighbors), not O(N) flooding.
             Some((target, msg)) = cvdf_outbound_rx.recv() => {
                 let data = super::cvdf_transport::encode_cvdf_message(&msg);
                 let mesh_msg = MeshMessage::Cvdf { data };
                 let st = state.read().await;
                 match target {
                     None => {
-                        // Broadcast to all connected relays.
-                        for relay in st.federation.relays.values() {
-                            let _ = relay.outgoing_tx.send(
-                                RelayCommand::SendMesh(mesh_msg.clone()),
-                            );
+                        // Send to direct SPIRAL neighbors only.
+                        let neighbor_keys: Vec<String> = st.mesh.spiral
+                            .neighbors().iter().cloned().collect();
+                        for nkey in &neighbor_keys {
+                            if let Some(peer) = st.mesh.known_peers.get(nkey) {
+                                if let Some(relay) = st.federation.relays
+                                    .get(&peer.node_name)
+                                {
+                                    let _ = relay.outgoing_tx.send(
+                                        RelayCommand::SendMesh(mesh_msg.clone()),
+                                    );
+                                }
+                            }
                         }
                     }
                     Some(pubkey) => {
