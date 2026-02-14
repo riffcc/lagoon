@@ -24,26 +24,25 @@ pub enum SyncMessage {
 pub enum SyncAction {
     /// Send a HaveList to this neighbor to initiate reconciliation.
     SendHaveList {
-        neighbor_node_name: String,
+        neighbor_peer_id: String,
         message: SyncMessage,
     },
     /// Send proof deltas to this neighbor.
     SendProofDelta {
-        neighbor_node_name: String,
+        neighbor_peer_id: String,
         message: SyncMessage,
     },
 }
 
 /// SPIRAL-scoped gossip coordinator.
 ///
-/// Tracks which SPIRAL neighbors exist, maps peer IDs to node names for
-/// routing, and enforces a minimum sync interval so we don't flood the
-/// mesh with redundant reconciliation rounds.
+/// Tracks which SPIRAL neighbors exist and enforces a minimum sync interval
+/// so we don't flood the mesh with redundant reconciliation rounds.
+/// Routing (relay lookup by peer_id) is handled by the federation layer.
 #[derive(Debug)]
 pub struct LatencyGossip {
     our_peer_id: String,
     spiral_neighbors: HashSet<String>,
-    peer_to_node: HashMap<String, String>,
     last_sync: HashMap<String, i64>,
     sync_interval_ms: i64,
 }
@@ -58,7 +57,6 @@ impl LatencyGossip {
         Self {
             our_peer_id,
             spiral_neighbors: HashSet::new(),
-            peer_to_node: HashMap::new(),
             last_sync: HashMap::new(),
             sync_interval_ms,
         }
@@ -73,21 +71,14 @@ impl LatencyGossip {
         self.spiral_neighbors = neighbors;
     }
 
-    /// Register a peer_id -> node_name mapping (for routing messages via relays).
-    pub fn register_peer(&mut self, peer_id: String, node_name: String) {
-        self.peer_to_node.insert(peer_id, node_name);
-    }
-
-    /// Remove a peer mapping on disconnect.
-    pub fn remove_peer(&mut self, peer_id: &str) {
-        self.peer_to_node.remove(peer_id);
-    }
-
     /// Called when a new proof arrives (locally measured or received).
     ///
     /// Returns [`SyncAction`]s for SPIRAL neighbors that are due for sync.
     /// Each action is a `SendHaveList` to initiate SPORE reconciliation.
     /// `our_spore_bytes` is the bincode-serialized SPORE from the proof store.
+    ///
+    /// Actions are emitted for all due neighbors. The federation layer
+    /// filters by relay availability (can't route → skip).
     pub fn on_proof_updated(
         &mut self,
         now_ms: i64,
@@ -97,17 +88,13 @@ impl LatencyGossip {
         let mut actions = Vec::with_capacity(due.len());
 
         for peer_id in due {
-            if let Some(node_name) = self.peer_to_node.get(&peer_id) {
-                actions.push(SyncAction::SendHaveList {
-                    neighbor_node_name: node_name.clone(),
-                    message: SyncMessage::HaveList {
-                        spore_bytes: our_spore_bytes.to_vec(),
-                    },
-                });
-                self.mark_synced(&peer_id, now_ms);
-            }
-            // Neighbors without a node mapping are silently skipped — we
-            // can't route to them yet.
+            actions.push(SyncAction::SendHaveList {
+                neighbor_peer_id: peer_id.clone(),
+                message: SyncMessage::HaveList {
+                    spore_bytes: our_spore_bytes.to_vec(),
+                },
+            });
+            self.mark_synced(&peer_id, now_ms);
         }
 
         actions
@@ -118,7 +105,7 @@ impl LatencyGossip {
     /// Computes which of our proofs they're missing and returns a
     /// `SendProofDelta` action, or `None` if they already have everything.
     ///
-    /// * `from_peer_id` — the SPIRAL peer that sent the HaveList.
+    /// * `from_peer_id` — the SPIRAL peer that sent the HaveList (also relay key).
     /// * `their_spore_bytes` — bincode-serialized SPORE from the wire message.
     /// * `our_spore` — our current proof SPORE (caller owns the proof store).
     /// * `our_proof_data` — `(serialized_entry, content_id)` pairs from the store.
@@ -153,10 +140,8 @@ impl LatencyGossip {
             return None;
         }
 
-        let node_name = self.peer_to_node.get(from_peer_id)?;
-
         Some(SyncAction::SendProofDelta {
-            neighbor_node_name: node_name.clone(),
+            neighbor_peer_id: from_peer_id.to_owned(),
             message: SyncMessage::ProofDelta { entries },
         })
     }
@@ -225,7 +210,6 @@ mod tests {
         let g = make_gossip();
         assert_eq!(g.neighbor_count(), 0);
         assert!(g.spiral_neighbors.is_empty());
-        assert!(g.peer_to_node.is_empty());
         assert!(g.last_sync.is_empty());
     }
 
@@ -246,18 +230,7 @@ mod tests {
         assert!(g.is_spiral_neighbor("x"));
     }
 
-    // 3. register / remove peer
-    #[test]
-    fn test_register_remove_peer() {
-        let mut g = make_gossip();
-        g.register_peer("p1".into(), "node-alpha".into());
-        assert_eq!(g.peer_to_node.get("p1").unwrap(), "node-alpha");
-
-        g.remove_peer("p1");
-        assert!(g.peer_to_node.get("p1").is_none());
-    }
-
-    // 4. is_spiral_neighbor
+    // 3. is_spiral_neighbor
     #[test]
     fn test_is_spiral_neighbor() {
         let mut g = make_gossip();
@@ -280,24 +253,22 @@ mod tests {
     fn test_on_proof_updated_sends_to_all_due() {
         let mut g = make_gossip();
         g.set_spiral_neighbors(neighbors_set(&["a", "b"]));
-        g.register_peer("a".into(), "node-a".into());
-        g.register_peer("b".into(), "node-b".into());
 
         let spore_bytes = b"fake-spore";
         let actions = g.on_proof_updated(10_000, spore_bytes);
 
         assert_eq!(actions.len(), 2);
-        let mut names: Vec<&str> = actions
+        let mut peer_ids: Vec<&str> = actions
             .iter()
             .map(|a| match a {
                 SyncAction::SendHaveList {
-                    neighbor_node_name, ..
-                } => neighbor_node_name.as_str(),
+                    neighbor_peer_id, ..
+                } => neighbor_peer_id.as_str(),
                 _ => panic!("expected SendHaveList"),
             })
             .collect();
-        names.sort();
-        assert_eq!(names, vec!["node-a", "node-b"]);
+        peer_ids.sort();
+        assert_eq!(peer_ids, vec!["a", "b"]);
     }
 
     // 7. on_proof_updated skips recently-synced neighbors
@@ -305,8 +276,6 @@ mod tests {
     fn test_on_proof_updated_skips_recent() {
         let mut g = make_gossip();
         g.set_spiral_neighbors(neighbors_set(&["a", "b"]));
-        g.register_peer("a".into(), "node-a".into());
-        g.register_peer("b".into(), "node-b".into());
 
         // First round syncs both at t=0
         let _ = g.on_proof_updated(0, b"s");
@@ -328,25 +297,7 @@ mod tests {
         assert!(actions.is_empty());
     }
 
-    // 9. on_proof_updated skips neighbors without node mapping
-    #[test]
-    fn test_on_proof_updated_no_node_mapping() {
-        let mut g = make_gossip();
-        g.set_spiral_neighbors(neighbors_set(&["a", "b"]));
-        // Only register "a"
-        g.register_peer("a".into(), "node-a".into());
-
-        let actions = g.on_proof_updated(0, b"s");
-        assert_eq!(actions.len(), 1);
-        match &actions[0] {
-            SyncAction::SendHaveList {
-                neighbor_node_name, ..
-            } => assert_eq!(neighbor_node_name, "node-a"),
-            _ => panic!("expected SendHaveList"),
-        }
-    }
-
-    // 10. neighbors_needing_sync — all returned if never synced
+    // 9. neighbors_needing_sync — all returned if never synced
     #[test]
     fn test_neighbors_needing_sync_all() {
         let mut g = make_gossip();
@@ -410,9 +361,7 @@ mod tests {
     // 15. on_have_list_received returns ProofDelta with missing proofs
     #[test]
     fn test_on_have_list_with_diff() {
-        let mut g = make_gossip();
-        g.set_spiral_neighbors(neighbors_set(&["peer_x"]));
-        g.register_peer("peer_x".into(), "node-x".into());
+        let g = make_gossip();
 
         // Build a SPORE covering a specific content_id
         let content_id: [u8; 32] = blake3::hash(b"test proof data").into();
@@ -437,10 +386,10 @@ mod tests {
 
         match action {
             SyncAction::SendProofDelta {
-                neighbor_node_name,
+                neighbor_peer_id,
                 message,
             } => {
-                assert_eq!(neighbor_node_name, "node-x");
+                assert_eq!(neighbor_peer_id, "peer_x");
                 match message {
                     SyncMessage::ProofDelta { entries } => {
                         assert_eq!(entries.len(), 1);
@@ -456,9 +405,7 @@ mod tests {
     // 16. on_have_list_received returns None when peer already has everything
     #[test]
     fn test_on_have_list_synced() {
-        let mut g = make_gossip();
-        g.set_spiral_neighbors(neighbors_set(&["peer_x"]));
-        g.register_peer("peer_x".into(), "node-x".into());
+        let g = make_gossip();
 
         let content_id: [u8; 32] = blake3::hash(b"another proof").into();
         let u = U256::from_be_bytes(&content_id);

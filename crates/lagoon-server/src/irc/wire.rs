@@ -36,6 +36,10 @@ pub struct HelloPayload {
     pub vdf_resonance_credit: Option<f64>,
     #[serde(default)]
     pub vdf_actual_rate_hz: Option<f64>,
+    /// Cumulative resonance credit — total precision-weighted VDF work over time.
+    /// Used for SPIRAL slot collision resolution (higher credit wins).
+    #[serde(default)]
+    pub vdf_cumulative_credit: Option<f64>,
     #[serde(default)]
     pub ygg_peer_uri: Option<String>,
     /// CVDF cooperative chain height (round number).
@@ -254,6 +258,7 @@ mod tests {
             node_name: "lon".into(),
             vdf_resonance_credit: Some(0.999),
             vdf_actual_rate_hz: Some(10.0),
+            vdf_cumulative_credit: Some(42.5),
             ygg_peer_uri: Some("tcp://[200:1234::1]:9443".into()),
             cvdf_height: Some(42),
             cvdf_weight: Some(100),

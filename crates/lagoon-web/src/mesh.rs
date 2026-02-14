@@ -89,6 +89,39 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
         "mesh ws: received Hello"
     );
 
+    // Self-connection check — if remote peer_id matches ours, send Hello +
+    // Redirect (known peers) so the outbound side can detect self-connection
+    // and activate the flashlight protocol.
+    {
+        let st = irc_state.read().await;
+        if st.lens.peer_id == remote_peer_id {
+            info!("mesh ws: self-connection detected — sending Hello + Redirect before closing");
+
+            // Send our Hello so the outbound relay can detect self-connection
+            // (peer_id match) and set the flashlight flag.
+            let our_hello = build_wire_hello(&st);
+            let our_hello_msg = MeshMessage::Hello(our_hello);
+            if let Ok(json) = our_hello_msg.to_json() {
+                let _ = ws_tx.send(Message::Text(json.into())).await;
+            }
+
+            // Send Redirect with known peers — even on self-connection, the
+            // stuck node can discover who else is in the mesh.
+            let peers: Vec<lagoon_server::irc::server::MeshPeerInfo> =
+                st.mesh.known_peers.values().cloned().collect();
+            if !peers.is_empty() {
+                let redirect = MeshMessage::Redirect { peers };
+                if let Ok(json) = redirect.to_json() {
+                    let _ = ws_tx.send(Message::Text(json.into())).await;
+                }
+            }
+
+            drop(st);
+            let _ = ws_tx.send(Message::Close(None)).await;
+            return;
+        }
+    }
+
     // Send our Hello.
     let our_hello = {
         let st = irc_state.read().await;
@@ -101,17 +134,13 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
         }
     }
 
-    // ── Phase 1.5: Redirect if we already have a relay to this node ──────
+    // ── Phase 1.5: Redirect if we already have a relay to this peer ──────
     //
-    // If we're already connected, this is a duplicate dial (e.g., remote
-    // hit anycast and reached us again). Send them our known peers so they
-    // can find their SPIRAL neighbors, then close. The Redirect message
-    // tells the remote not to reconnect to us.
+    // If we're already connected (keyed by peer_id), this is a duplicate
+    // dial. Send them our known peers and close.
     {
         let st = irc_state.read().await;
-        let already_connected = st.federation.relays.values().any(|r|
-            r.remote_node_name.as_deref() == Some(remote_node_name.as_str()));
-        if already_connected {
+        if st.federation.relays.contains_key(&remote_peer_id) {
             let our_pid = st.lens.peer_id.clone();
             let redirect_peers: Vec<lagoon_server::irc::server::MeshPeerInfo> =
                 st.mesh.known_peers.iter()
@@ -125,7 +154,7 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
             drop(st);
 
             info!(
-                node = %remote_node_name,
+                peer_id = %remote_peer_id,
                 redirect_peers = redirect_peers.len(),
                 "mesh ws: duplicate connection — redirecting to known peers"
             );
@@ -150,31 +179,27 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<RelayCommand>();
 
-    // Dummy task handle — the real work happens in this function.
-    let task_handle = tokio::spawn(std::future::pending::<()>());
-
     {
         let mut st = irc_state.write().await;
         st.federation.relays.insert(
-            remote_node_name.clone(),
+            remote_peer_id.clone(),
             RelayHandle {
                 outgoing_tx: cmd_tx,
-                remote_host: remote_node_name.clone(),
+                node_name: remote_node_name.clone(),
+                connect_target: String::new(), // inbound — no connect target
                 channels: HashMap::new(),
-                task_handle,
                 mesh_connected: true,
                 is_bootstrap: false,
                 last_rtt_ms: None,
-                remote_node_name: Some(remote_node_name.clone()),
             },
         );
     }
 
     // Now dispatch the Hello — event processor will send Peers/LatencyHave/
-    // GossipSpore via our cmd_rx.
+    // GossipSpore via our cmd_rx. remote_host = peer_id (relay key).
     dispatch_mesh_message(
         MeshMessage::Hello(remote_hello),
-        &remote_node_name,
+        &remote_peer_id,
         None, // TODO: extract peer addr from WS connection
         &None,
         &event_tx,
@@ -182,7 +207,7 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
 
     // ── Phase 3: Bidirectional message loop ───────────────────────────────
 
-    let mut remote_mesh_key: Option<String> = Some(remote_peer_id.clone());
+    let remote_mesh_key: Option<String> = Some(remote_peer_id.clone());
     let mut last_ping = Instant::now();
     let ping_interval = Duration::from_secs(30);
 
@@ -197,19 +222,18 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
                     Some(Ok(Message::Text(text))) => {
                         match MeshMessage::from_json(&text) {
                             Ok(msg) => {
-                                if let Some(hello) = dispatch_mesh_message(
+                                // remote_host = peer_id for relay lookup.
+                                let _ = dispatch_mesh_message(
                                     msg,
-                                    &remote_node_name,
+                                    &remote_peer_id,
                                     None,
                                     &remote_mesh_key,
                                     &event_tx,
-                                ) {
-                                    remote_mesh_key = Some(hello.peer_id);
-                                }
+                                );
                             }
                             Err(e) => {
                                 warn!(
-                                    node = %remote_node_name,
+                                    peer_id = %remote_peer_id,
                                     error = %e,
                                     "mesh ws: failed to parse message"
                                 );
@@ -220,11 +244,11 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
                         // RTT measurement opportunity.
                     }
                     Some(Ok(Message::Close(_))) | None => {
-                        info!(node = %remote_node_name, "mesh ws: connection closed");
+                        info!(peer_id = %remote_peer_id, "mesh ws: connection closed");
                         break;
                     }
                     Some(Err(e)) => {
-                        warn!(node = %remote_node_name, error = %e, "mesh ws: read error");
+                        warn!(peer_id = %remote_peer_id, error = %e, "mesh ws: read error");
                         break;
                     }
                     _ => {} // Binary frames, Ping (auto-responded by axum)
@@ -255,12 +279,12 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
                         }
                     }
                     Some(RelayCommand::Shutdown) => {
-                        info!(node = %remote_node_name, "mesh ws: shutdown requested");
+                        info!(peer_id = %remote_peer_id, "mesh ws: shutdown requested");
                         let _ = ws_tx.send(Message::Close(None)).await;
                         break;
                     }
                     Some(RelayCommand::Reconnect) => {
-                        info!(node = %remote_node_name, "mesh ws: reconnect (closing inbound)");
+                        info!(peer_id = %remote_peer_id, "mesh ws: reconnect (closing inbound)");
                         let _ = ws_tx.send(Message::Close(None)).await;
                         break;
                     }
@@ -294,15 +318,15 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
     // ── Cleanup ───────────────────────────────────────────────────────────
 
     let _ = event_tx.send(RelayEvent::Disconnected {
-        remote_host: remote_node_name.clone(),
+        remote_host: remote_peer_id.clone(),
     });
 
     {
         let mut st = irc_state.write().await;
-        st.federation.relays.remove(&remote_node_name);
+        st.federation.relays.remove(&remote_peer_id);
     }
 
-    info!(node = %remote_node_name, "mesh ws: handler complete");
+    info!(peer_id = %remote_peer_id, "mesh ws: handler complete");
 }
 
 /// Translate legacy IRC `MESH {subcommand} {payload}` params to native `MeshMessage`.

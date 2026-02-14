@@ -47,12 +47,12 @@ pub struct NodeIdentity {
 /// A single federation relay connection.
 #[derive(Serialize)]
 pub struct RelayReport {
-    /// The relay map key (typically the remote host or node_name).
+    /// The relay map key (peer_id).
     pub relay_key: String,
-    /// The remote hostname this relay connects to.
-    pub remote_host: String,
-    /// The remote node's node_name (set after MESH HELLO exchange).
-    pub remote_node_name: Option<String>,
+    /// Human-readable node name.
+    pub node_name: String,
+    /// The host:port used to reach this peer.
+    pub connect_target: String,
     /// Whether this relay was created by the mesh connector.
     pub mesh_connected: bool,
     /// Whether this relay was created from LAGOON_PEERS (bootstrap).
@@ -93,6 +93,8 @@ pub struct PeerReport {
     pub vdf_resonance_credit: Option<f64>,
     /// Peer's actual VDF tick rate in Hz (from last MESH HELLO).
     pub vdf_actual_rate_hz: Option<f64>,
+    /// Rolling resonance credit (last 3 cycles) — used for SPIRAL collision resolution.
+    pub vdf_cumulative_credit: Option<f64>,
     /// Peer's Yggdrasil peer URI for APE overlay peering.
     pub ygg_peer_uri: Option<String>,
 }
@@ -225,8 +227,8 @@ pub async fn get_debug_mesh(
                 .collect();
             RelayReport {
                 relay_key: key.clone(),
-                remote_host: handle.remote_host.clone(),
-                remote_node_name: handle.remote_node_name.clone(),
+                node_name: handle.node_name.clone(),
+                connect_target: handle.connect_target.clone(),
                 mesh_connected: handle.mesh_connected,
                 is_bootstrap: handle.is_bootstrap,
                 last_rtt_ms: handle.last_rtt_ms,
@@ -253,14 +255,12 @@ pub async fn get_debug_mesh(
             }
             .to_string();
 
-            // Find if any relay maps to this peer (by node_name match).
-            let relay_key = st.federation.relays.iter().find_map(|(key, handle)| {
-                if handle.remote_node_name.as_deref() == Some(&info.node_name) {
-                    Some(key.clone())
-                } else {
-                    None
-                }
-            });
+            // Relay key IS peer_id — direct lookup.
+            let relay_key = if st.federation.relays.contains_key(mkey) {
+                Some(mkey.clone())
+            } else {
+                None
+            };
 
             PeerReport {
                 mesh_key: mkey.clone(),
@@ -277,6 +277,7 @@ pub async fn get_debug_mesh(
                 relay_key,
                 vdf_resonance_credit: info.vdf_resonance_credit,
                 vdf_actual_rate_hz: info.vdf_actual_rate_hz,
+                vdf_cumulative_credit: info.vdf_cumulative_credit,
                 ygg_peer_uri: info.ygg_peer_uri.clone(),
             }
         })

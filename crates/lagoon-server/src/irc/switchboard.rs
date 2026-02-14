@@ -464,19 +464,13 @@ async fn redirect_repair(
     // Find the target's relay and send the migration message.
     let sent = {
         let st = state.read().await;
-        // Look up relay by peer_id — relays are keyed by node_name, so we need to
-        // find which relay has this peer_id.
-        let mut found = false;
-        for (_key, relay) in &st.federation.relays {
-            // Check if this relay's remote_node_name matches or if the relay
-            // connects to the target peer.
-            if relay.remote_node_name.as_deref() == Some(target_peer_id) ||
-               relay.remote_host == target_peer_id {
-                let _ = relay.outgoing_tx.send(super::federation::RelayCommand::SendMesh(msg.clone()));
-                found = true;
-                break;
-            }
-        }
+        // Relays are keyed by peer_id — direct lookup.
+        let found = if let Some(relay) = st.federation.relays.get(target_peer_id) {
+            let _ = relay.outgoing_tx.send(super::federation::RelayCommand::SendMesh(msg.clone()));
+            true
+        } else {
+            false
+        };
         found
     };
 
@@ -613,29 +607,27 @@ async fn upgrade_to_mesh(
     };
 
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<RelayCommand>();
-    let task_handle = tokio::spawn(std::future::pending::<()>());
 
     {
         let mut st = state.write().await;
         st.federation.relays.insert(
-            remote_node_name.clone(),
+            remote_peer_id.clone(),
             RelayHandle {
                 outgoing_tx: cmd_tx,
-                remote_host: remote_node_name.clone(),
+                node_name: remote_node_name.clone(),
+                connect_target: String::new(), // inbound via switchboard
                 channels: HashMap::new(),
-                task_handle,
                 mesh_connected: true,
                 is_bootstrap: false,
                 last_rtt_ms: None,
-                remote_node_name: Some(remote_node_name.clone()),
             },
         );
     }
 
-    // Dispatch the Hello.
+    // Dispatch the Hello — relay key = peer_id.
     dispatch_mesh_message(
         MeshMessage::Hello(remote_hello),
-        &remote_node_name,
+        &remote_peer_id,
         None,
         &None,
         &event_tx,
@@ -643,7 +635,7 @@ async fn upgrade_to_mesh(
 
     // ── Phase 3: Bidirectional message loop ─────────────────────────────
 
-    let mut remote_mesh_key: Option<String> = Some(remote_peer_id.clone());
+    let remote_mesh_key: Option<String> = Some(remote_peer_id.clone());
     let mut last_ping = Instant::now();
     let ping_interval = Duration::from_secs(30);
 
@@ -657,15 +649,13 @@ async fn upgrade_to_mesh(
                     Some(Ok(Message::Text(text))) => {
                         match MeshMessage::from_json(&text) {
                             Ok(msg) => {
-                                if let Some(hello) = dispatch_mesh_message(
+                                let _ = dispatch_mesh_message(
                                     msg,
-                                    &remote_node_name,
+                                    &remote_peer_id,
                                     None,
                                     &remote_mesh_key,
                                     &event_tx,
-                                ) {
-                                    remote_mesh_key = Some(hello.peer_id);
-                                }
+                                );
                             }
                             Err(e) => {
                                 warn!(
@@ -727,13 +717,13 @@ async fn upgrade_to_mesh(
         }
     }
 
-    // Cleanup.
+    // Cleanup — relay keyed by peer_id.
     let _ = event_tx.send(RelayEvent::Disconnected {
-        remote_host: remote_node_name.clone(),
+        remote_host: remote_peer_id.clone(),
     });
     {
         let mut st = state.write().await;
-        st.federation.relays.remove(&remote_node_name);
+        st.federation.relays.remove(&remote_peer_id);
     }
 
     info!(node = %remote_node_name, "switchboard: handler complete");

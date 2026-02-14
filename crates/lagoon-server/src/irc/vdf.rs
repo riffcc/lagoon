@@ -14,6 +14,7 @@
 //! symmetrically in both directions.  Over many nodes the independent timing
 //! errors average out, giving ensemble-clock precision that scales as 1/√N.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -52,6 +53,9 @@ pub struct ResonanceMetrics {
     pub deviation_hz: f64,
     /// Cumulative resonance credit (sum of per-tick credits).
     pub cumulative_credit: f64,
+    /// Rolling credit over last 3 cycles (30s at 10Hz). Used for SPIRAL
+    /// slot collision resolution — measures *current* precision, not lifetime.
+    pub rolling_credit_3c: f64,
     /// Number of ticks measured (excludes first tick which has no interval).
     pub measured_ticks: u64,
 }
@@ -119,9 +123,15 @@ pub async fn run_vdf_engine(
     // EMA smoothing factor.  α = 0.05 → ~20-tick window.
     const EMA_ALPHA: f64 = 0.05;
 
+    // Rolling window: 3 cycles × 10 seconds × tick_rate ticks per second.
+    let cycle_secs: u64 = 10;
+    let window_ticks = (3 * cycle_secs * tick_rate) as usize;
+
     let mut last_tick: Option<Instant> = None;
     let mut ema_rate: f64 = target_rate; // start at target (no bias)
     let mut cumulative_credit: f64 = 0.0;
+    let mut rolling_window: VecDeque<f64> = VecDeque::with_capacity(window_ticks);
+    let mut rolling_sum: f64 = 0.0;
     let mut measured_ticks: u64 = 0;
 
     info!(
@@ -160,6 +170,13 @@ pub async fn run_vdf_engine(
                     cumulative_credit += credit;
                     measured_ticks += 1;
 
+                    // Maintain rolling window of last 3 cycles.
+                    rolling_sum += credit;
+                    rolling_window.push_back(credit);
+                    if rolling_window.len() > window_ticks {
+                        rolling_sum -= rolling_window.pop_front().unwrap_or(0.0);
+                    }
+
                     Some(ResonanceMetrics {
                         target_rate_hz: target_rate,
                         actual_rate_hz: ema_rate,
@@ -168,6 +185,7 @@ pub async fn run_vdf_engine(
                         last_interval_secs: interval_secs,
                         deviation_hz: ema_rate - target_rate,
                         cumulative_credit,
+                        rolling_credit_3c: rolling_sum,
                         measured_ticks,
                     })
                 } else {

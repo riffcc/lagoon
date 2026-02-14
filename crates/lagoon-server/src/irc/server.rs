@@ -214,6 +214,10 @@ pub struct MeshPeerInfo {
     /// Actual measured VDF tick rate (Hz, exponential moving average).
     #[serde(default)]
     pub vdf_actual_rate_hz: Option<f64>,
+    /// Cumulative resonance credit — total precision-weighted VDF work.
+    /// Flows through gossip (NOT serde(skip)) for SPIRAL slot collision resolution.
+    #[serde(default)]
+    pub vdf_cumulative_credit: Option<f64>,
     /// Yggdrasil peer URI for overlay peering (e.g. `tcp://[200:xxxx::]:9443`).
     #[serde(default)]
     pub ygg_peer_uri: Option<String>,
@@ -254,6 +258,7 @@ impl Default for MeshPeerInfo {
             node_name: String::new(),
             vdf_resonance_credit: None,
             vdf_actual_rate_hz: None,
+            vdf_cumulative_credit: None,
             ygg_peer_uri: None,
             underlay_uri: None,
             prev_vdf_step: None,
@@ -663,7 +668,7 @@ impl ServerState {
                 let proof_rtt = self.mesh.proof_store
                     .get(&our_pid, mkey)
                     .map(|e| e.rtt_ms);
-                let relay_rtt = self.federation.relays.get(&peer_info.node_name)
+                let relay_rtt = self.federation.relays.get(mkey)
                     .and_then(|r| r.last_rtt_ms);
 
                 // Yggdrasil metrics (bandwidth + latency fallback).
@@ -1703,7 +1708,7 @@ async fn handle_command(
                         } else {
                             // New relay connection to this host.
                             let event_tx = st.federation_event_tx.clone();
-                            let (cmd_tx, task_handle) = federation::spawn_relay(
+                            let (cmd_tx, _task_handle) = federation::spawn_relay(
                                 relay_key.clone(),
                                 remote_host.to_owned(),
                                 event_tx,
@@ -1734,13 +1739,12 @@ async fn handle_command(
                                 relay_key.clone(),
                                 federation::RelayHandle {
                                     outgoing_tx: cmd_tx,
-                                    remote_host: relay_key.clone(),
+                                    node_name: relay_key.clone(),
+                                    connect_target: remote_host.to_owned(),
                                     channels,
-                                    task_handle,
                                     mesh_connected: false,
                                     is_bootstrap: false,
                                     last_rtt_ms: None,
-                                    remote_node_name: None,
                                 },
                             );
                         }
@@ -1756,7 +1760,7 @@ async fn handle_command(
                                     if rn.contains('@') {
                                         parts.push(rn.clone());
                                     } else {
-                                        parts.push(format!("{rn}@{}", relay.remote_host));
+                                        parts.push(format!("{rn}@{}", relay.connect_target));
                                     }
                                 }
                                 parts.join(" ")
@@ -2052,7 +2056,7 @@ async fn handle_command(
                         if let Some(relay) =
                             st.federation.relays.remove(&relay_key)
                         {
-                            relay.task_handle.abort();
+                            let _ = relay.outgoing_tx.send(federation::RelayCommand::Shutdown);
                         }
                     }
                 } else {
@@ -2561,7 +2565,7 @@ async fn handle_command(
                                 let display_nick = if rn.contains('@') {
                                     rn.clone()
                                 } else {
-                                    format!("{rn}@{}", relay.remote_host)
+                                    format!("{rn}@{}", relay.connect_target)
                                 };
                                 let reply = Message {
                                     prefix: Some(SERVER_NAME.clone()),
@@ -2570,8 +2574,8 @@ async fn handle_command(
                                         nick.into(),
                                         target.clone(),
                                         display_nick.clone(),
-                                        relay.remote_host.clone(),
-                                        relay.remote_host.clone(),
+                                        relay.connect_target.clone(),
+                                        relay.connect_target.clone(),
                                         display_nick.clone(),
                                         "H".into(),
                                         format!("1 {display_nick}"),
@@ -2658,7 +2662,7 @@ async fn handle_command(
                                 if rn.contains('@') {
                                     parts.push(rn.clone());
                                 } else {
-                                    parts.push(format!("{rn}@{}", relay.remote_host));
+                                    parts.push(format!("{rn}@{}", relay.connect_target));
                                 }
                             }
                             parts.join(" ")
@@ -3276,6 +3280,8 @@ async fn handle_command(
                             #[serde(default)]
                             vdf_actual_rate_hz: Option<f64>,
                             #[serde(default)]
+                            vdf_cumulative_credit: Option<f64>,
+                            #[serde(default)]
                             ygg_peer_uri: Option<String>,
                             #[serde(default)]
                             cvdf_height: Option<u64>,
@@ -3313,6 +3319,7 @@ async fn handle_command(
                                     node_name,
                                     vdf_resonance_credit: hello.vdf_resonance_credit,
                                     vdf_actual_rate_hz: hello.vdf_actual_rate_hz,
+                                    vdf_cumulative_credit: hello.vdf_cumulative_credit,
                                     ygg_peer_uri: hello.ygg_peer_uri,
                                     // Inbound: they connected to us, so we don't
                                     // have a meaningful TCP peer addr for APE
@@ -3326,26 +3333,27 @@ async fn handle_command(
                             );
 
                             // Respond with our own HELLO (include SPIRAL + VDF + resonance + APE).
-                            let (our_vdf_genesis, our_vdf_hash, our_vdf_step, our_vdf_credit, our_vdf_rate) = st
+                            let (our_vdf_genesis, our_vdf_hash, our_vdf_step, our_vdf_credit, our_vdf_rate, our_vdf_rolling) = st
                                 .mesh
                                 .vdf_state_rx
                                 .as_ref()
                                 .map(|rx| {
                                     let vdf = rx.borrow();
-                                    let (credit, rate) = vdf
+                                    let (credit, rate, rolling) = vdf
                                         .resonance
                                         .as_ref()
-                                        .map(|r| (Some(r.credit), Some(r.actual_rate_hz)))
-                                        .unwrap_or((None, None));
+                                        .map(|r| (Some(r.credit), Some(r.actual_rate_hz), Some(r.rolling_credit_3c)))
+                                        .unwrap_or((None, None, None));
                                     (
                                         Some(hex::encode(vdf.genesis)),
                                         Some(hex::encode(vdf.current_hash)),
                                         Some(vdf.total_steps),
                                         credit,
                                         rate,
+                                        rolling,
                                     )
                                 })
-                                .unwrap_or((None, None, None, None, None));
+                                .unwrap_or((None, None, None, None, None, None));
 
                             // Ygg overlay address (identity/routing).
                             let our_ygg_addr = st.transport_config.ygg_node
@@ -3367,6 +3375,7 @@ async fn handle_command(
                                 "vdf_step": our_vdf_step,
                                 "vdf_resonance_credit": our_vdf_credit,
                                 "vdf_actual_rate_hz": our_vdf_rate,
+                                "vdf_cumulative_credit": our_vdf_rolling,
                                 "yggdrasil_addr": our_ygg_addr,
                                 "ygg_peer_uri": our_ygg_peer_uri,
                                 "site_name": st.lens.site_name,
@@ -3943,23 +3952,22 @@ async fn handle_command(
                     }
                 }
                 // Also check by mesh_key in known_peers.
+                // Relays are keyed by peer_id (mkey), not node_name.
                 let mut connection_ids_to_remove = Vec::new();
                 for (mkey, peer_info) in &st.mesh.known_peers {
                     if mkey == target || peer_info.server_name == *target
                         || peer_info.node_name == *target
                         || peer_info.peer_id == *target
                     {
-                        if let Some(relay) = st.federation.relays.get(&peer_info.node_name) {
+                        if let Some(relay) = st.federation.relays.get(mkey) {
                             let _ = relay.outgoing_tx.send(federation::RelayCommand::Shutdown);
-                            to_remove.push(peer_info.node_name.clone());
+                            to_remove.push(mkey.clone());
                         }
                         connection_ids_to_remove.push(mkey.clone());
                     }
                 }
-                for host in &to_remove {
-                    if let Some(relay) = st.federation.relays.remove(host) {
-                        relay.task_handle.abort();
-                    }
+                for key in &to_remove {
+                    st.federation.relays.remove(key);
                 }
                 for id in &connection_ids_to_remove {
                     st.mesh.connections.remove(id);
@@ -4259,9 +4267,8 @@ async fn cleanup_client(nick: &str, reason: &str, state: &SharedState) {
         }
     }
     for host in empty_relays {
-        if let Some(relay) = st.federation.relays.remove(&host) {
-            relay.task_handle.abort();
-        }
+        // Shutdown already sent above; removing drops the channel → task exits.
+        st.federation.relays.remove(&host);
     }
 
     // Record WHOWAS entry before removing.

@@ -24,21 +24,23 @@ pub enum SyncMessage {
 pub enum SyncAction {
     /// Send a HaveList to this neighbor to initiate reconciliation.
     SendHaveList {
-        neighbor_node_name: String,
+        neighbor_peer_id: String,
         message: SyncMessage,
     },
     /// Send snapshot deltas to this neighbor.
     SendSnapshotDelta {
-        neighbor_node_name: String,
+        neighbor_peer_id: String,
         message: SyncMessage,
     },
 }
 
 /// SPIRAL-scoped connection gossip coordinator.
+///
+/// Tracks which SPIRAL neighbors exist and enforces a minimum sync interval.
+/// Routing (relay lookup by peer_id) is handled by the federation layer.
 #[derive(Debug)]
 pub struct ConnectionGossip {
     spiral_neighbors: HashSet<String>,
-    peer_to_node: HashMap<String, String>,
     last_sync: HashMap<String, i64>,
     sync_interval_ms: i64,
 }
@@ -48,7 +50,6 @@ impl ConnectionGossip {
     pub fn new(sync_interval_ms: i64) -> Self {
         Self {
             spiral_neighbors: HashSet::new(),
-            peer_to_node: HashMap::new(),
             last_sync: HashMap::new(),
             sync_interval_ms,
         }
@@ -60,19 +61,11 @@ impl ConnectionGossip {
         self.spiral_neighbors = neighbors;
     }
 
-    /// Register a peer_id -> node_name mapping.
-    pub fn register_peer(&mut self, peer_id: String, node_name: String) {
-        self.peer_to_node.insert(peer_id, node_name);
-    }
-
-    /// Remove a peer mapping on disconnect.
-    pub fn remove_peer(&mut self, peer_id: &str) {
-        self.peer_to_node.remove(peer_id);
-    }
-
     /// Called when a connection snapshot changes (connect/disconnect).
     ///
     /// Returns [`SyncAction`]s for SPIRAL neighbors that are due for sync.
+    /// Actions are emitted for all due neighbors. The federation layer
+    /// filters by relay availability.
     pub fn on_snapshot_updated(
         &mut self,
         now_ms: i64,
@@ -82,15 +75,13 @@ impl ConnectionGossip {
         let mut actions = Vec::with_capacity(due.len());
 
         for peer_id in due {
-            if let Some(node_name) = self.peer_to_node.get(&peer_id) {
-                actions.push(SyncAction::SendHaveList {
-                    neighbor_node_name: node_name.clone(),
-                    message: SyncMessage::HaveList {
-                        spore_bytes: our_spore_bytes.to_vec(),
-                    },
-                });
-                self.mark_synced(&peer_id, now_ms);
-            }
+            actions.push(SyncAction::SendHaveList {
+                neighbor_peer_id: peer_id.clone(),
+                message: SyncMessage::HaveList {
+                    spore_bytes: our_spore_bytes.to_vec(),
+                },
+            });
+            self.mark_synced(&peer_id, now_ms);
         }
 
         actions
@@ -129,10 +120,8 @@ impl ConnectionGossip {
             return None;
         }
 
-        let node_name = self.peer_to_node.get(from_peer_id)?;
-
         Some(SyncAction::SendSnapshotDelta {
-            neighbor_node_name: node_name.clone(),
+            neighbor_peer_id: from_peer_id.to_owned(),
             message: SyncMessage::SnapshotDelta { entries },
         })
     }
@@ -174,7 +163,6 @@ mod tests {
     fn test_new_empty() {
         let g = make_gossip();
         assert!(g.spiral_neighbors.is_empty());
-        assert!(g.peer_to_node.is_empty());
         assert!(g.last_sync.is_empty());
     }
 
@@ -190,21 +178,9 @@ mod tests {
     }
 
     #[test]
-    fn test_register_remove_peer() {
-        let mut g = make_gossip();
-        g.register_peer("p1".into(), "node-a".into());
-        assert_eq!(g.peer_to_node.get("p1").unwrap(), "node-a");
-
-        g.remove_peer("p1");
-        assert!(g.peer_to_node.get("p1").is_none());
-    }
-
-    #[test]
     fn test_on_snapshot_updated_sends_to_due() {
         let mut g = make_gossip();
         g.set_spiral_neighbors(neighbors_set(&["a", "b"]));
-        g.register_peer("a".into(), "node-a".into());
-        g.register_peer("b".into(), "node-b".into());
 
         let actions = g.on_snapshot_updated(10_000, b"fake-spore");
         assert_eq!(actions.len(), 2);
@@ -214,7 +190,6 @@ mod tests {
     fn test_on_snapshot_updated_skips_recent() {
         let mut g = make_gossip();
         g.set_spiral_neighbors(neighbors_set(&["a"]));
-        g.register_peer("a".into(), "node-a".into());
 
         let _ = g.on_snapshot_updated(0, b"s");
         let actions = g.on_snapshot_updated(3000, b"s");
@@ -226,9 +201,7 @@ mod tests {
 
     #[test]
     fn test_on_have_list_with_diff() {
-        let mut g = make_gossip();
-        g.set_spiral_neighbors(neighbors_set(&["peer_x"]));
-        g.register_peer("peer_x".into(), "node-x".into());
+        let g = make_gossip();
 
         let content_id: [u8; 32] = blake3::hash(b"test data").into();
         let u = U256::from_be_bytes(&content_id);
@@ -246,10 +219,10 @@ mod tests {
 
         match action {
             SyncAction::SendSnapshotDelta {
-                neighbor_node_name,
+                neighbor_peer_id,
                 message,
             } => {
-                assert_eq!(neighbor_node_name, "node-x");
+                assert_eq!(neighbor_peer_id, "peer_x");
                 match message {
                     SyncMessage::SnapshotDelta { entries } => {
                         assert_eq!(entries.len(), 1);
@@ -263,9 +236,7 @@ mod tests {
 
     #[test]
     fn test_on_have_list_synced() {
-        let mut g = make_gossip();
-        g.set_spiral_neighbors(neighbors_set(&["peer_x"]));
-        g.register_peer("peer_x".into(), "node-x".into());
+        let g = make_gossip();
 
         let content_id: [u8; 32] = blake3::hash(b"data").into();
         let u = U256::from_be_bytes(&content_id);

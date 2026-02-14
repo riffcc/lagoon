@@ -90,6 +90,26 @@ impl SpiralTopology {
         self.recompute_neighbors();
     }
 
+    /// Force-register a peer at a SPIRAL slot, evicting any existing occupant.
+    ///
+    /// Used for collision resolution: the winner keeps the slot, the loser
+    /// is evicted. Returns the evicted mesh_key (if any).
+    pub fn force_add_peer(&mut self, mesh_key: &str, index: Spiral3DIndex) -> Option<String> {
+        let coord = spiral3d_to_coord(index);
+
+        // Remove existing occupant (if different from new claimant).
+        let evicted = self.occupied.get(&coord).cloned().filter(|existing| existing != mesh_key);
+        if let Some(ref evicted_key) = evicted {
+            self.peer_positions.remove(evicted_key);
+        }
+
+        self.occupied.insert(coord, mesh_key.to_string());
+        self.peer_positions
+            .insert(mesh_key.to_string(), (index, coord));
+        self.recompute_neighbors();
+        evicted
+    }
+
     /// Register a peer's claimed SPIRAL slot. Returns true if our neighbor
     /// set changed.
     pub fn add_peer(&mut self, mesh_key: &str, index: Spiral3DIndex) -> bool {
