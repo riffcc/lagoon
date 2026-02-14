@@ -60,6 +60,13 @@ impl SpiralTopology {
     /// not already occupied. This is SPIRAL self-assembly — first-come,
     /// first-served, sequential from center.
     pub fn claim_position(&mut self, our_mesh_key: &str) -> Spiral3DIndex {
+        // Clean up old self entry if re-claiming after a move.
+        if let Some(old_coord) = self.our_coord {
+            if self.occupied.get(&old_coord).map(|s| s.as_str()) == Some(our_mesh_key) {
+                self.occupied.remove(&old_coord);
+            }
+        }
+
         // Find first unclaimed slot in spiral order.
         let mut i = 0u64;
         let idx = loop {
@@ -80,8 +87,41 @@ impl SpiralTopology {
         idx
     }
 
+    /// Check if we should converge to a better (lower-indexed) slot.
+    ///
+    /// SPIRAL's iterative convergence protocol: after learning new topology
+    /// information (gossip, peer eviction), each node re-evaluates whether
+    /// there's an unoccupied slot closer to the origin than its current position.
+    /// If yes, the node should vacate and reclaim — filling holes naturally.
+    ///
+    /// Returns `Some(better_index)` if a lower slot is available, `None` if
+    /// we're already at the optimal position for the current topology.
+    pub fn evaluate_position(&self) -> Option<Spiral3DIndex> {
+        let our_idx = self.our_index?;
+        // If we're at slot 0 (origin), can't do better.
+        if our_idx.value() == 0 {
+            return None;
+        }
+        // Scan from slot 0 up to (but not including) our current slot.
+        for i in 0..our_idx.value() {
+            let idx = Spiral3DIndex::new(i);
+            let coord = spiral3d_to_coord(idx);
+            if !self.occupied.contains_key(&coord) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
     /// Restore a persisted SPIRAL position on restart.
     pub fn set_position(&mut self, our_mesh_key: &str, index: Spiral3DIndex) {
+        // Clean up old self entry if changing position.
+        if let Some(old_coord) = self.our_coord {
+            if self.occupied.get(&old_coord).map(|s| s.as_str()) == Some(our_mesh_key) {
+                self.occupied.remove(&old_coord);
+            }
+        }
+
         let coord = spiral3d_to_coord(index);
         self.our_index = Some(index);
         self.our_coord = Some(coord);
@@ -97,10 +137,26 @@ impl SpiralTopology {
     pub fn force_add_peer(&mut self, mesh_key: &str, index: Spiral3DIndex) -> Option<String> {
         let coord = spiral3d_to_coord(index);
 
-        // Remove existing occupant (if different from new claimant).
+        // Remove existing occupant at target coord (if different from new claimant).
         let evicted = self.occupied.get(&coord).cloned().filter(|existing| existing != mesh_key);
         if let Some(ref evicted_key) = evicted {
             self.peer_positions.remove(evicted_key);
+            // If we evicted ourselves, clear our_* fields.
+            if self.our_mesh_key.as_deref() == Some(evicted_key.as_str()) {
+                self.our_index = None;
+                self.our_coord = None;
+                self.our_mesh_key = None;
+            }
+        }
+
+        // If this peer was already at a DIFFERENT coord, free the old slot.
+        if let Some((_, old_coord)) = self.peer_positions.get(mesh_key) {
+            if *old_coord != coord {
+                // Only remove from occupied if this mesh_key still owns the old slot.
+                if self.occupied.get(old_coord).map(|s| s.as_str()) == Some(mesh_key) {
+                    self.occupied.remove(old_coord);
+                }
+            }
         }
 
         self.occupied.insert(coord, mesh_key.to_string());
@@ -122,6 +178,17 @@ impl SpiralTopology {
             }
         }
 
+        // If this peer was already at a DIFFERENT coord, free the old slot.
+        // Without this, moving a peer creates a ghost in `occupied` at the
+        // old coord — `claim_position()` skips it forever, inflating slot numbers.
+        if let Some((_, old_coord)) = self.peer_positions.get(mesh_key) {
+            if *old_coord != coord {
+                if self.occupied.get(old_coord).map(|s| s.as_str()) == Some(mesh_key) {
+                    self.occupied.remove(old_coord);
+                }
+            }
+        }
+
         self.occupied.insert(coord, mesh_key.to_string());
         self.peer_positions
             .insert(mesh_key.to_string(), (index, coord));
@@ -132,7 +199,26 @@ impl SpiralTopology {
     }
 
     /// Remove a peer from the topology. Returns true if our neighbor set changed.
+    ///
+    /// Handles both remote peers (in `peer_positions`) and ourselves (in
+    /// `our_*` fields). Calling `remove_peer` with our own key fully un-claims
+    /// our position — necessary before `claim_position` during convergence.
     pub fn remove_peer(&mut self, mesh_key: &str) -> bool {
+        // Check if this is ourselves.
+        if self.our_mesh_key.as_deref() == Some(mesh_key) {
+            if let Some(coord) = self.our_coord {
+                if self.occupied.get(&coord).map(|s| s.as_str()) == Some(mesh_key) {
+                    self.occupied.remove(&coord);
+                }
+            }
+            self.our_index = None;
+            self.our_coord = None;
+            self.our_mesh_key = None;
+            let old_neighbors = self.neighbors.clone();
+            self.recompute_neighbors();
+            return self.neighbors != old_neighbors;
+        }
+
         if let Some((_, coord)) = self.peer_positions.remove(mesh_key) {
             // Only remove from occupied if this mesh_key still owns the slot.
             if self.occupied.get(&coord).map(|s| s.as_str()) == Some(mesh_key) {
@@ -227,6 +313,37 @@ impl SpiralTopology {
     /// Get our world coordinates (None if unclaimed).
     pub fn our_world_coord(&self) -> Option<[f64; 3]> {
         self.our_coord.map(hex_to_world)
+    }
+
+    /// Iterate all occupied slots as (index, mesh_key) pairs, sorted by index.
+    /// Remove all peers NOT in the given set (keeps our own position).
+    /// Used to evict stale/dead peers before claim_position to prevent slot inflation.
+    pub fn retain_peers(&mut self, live_keys: &HashSet<String>) {
+        let stale: Vec<String> = self
+            .peer_positions
+            .keys()
+            .filter(|k| {
+                // Keep our own key.
+                if self.our_mesh_key.as_deref() == Some(k.as_str()) {
+                    return false;
+                }
+                !live_keys.contains(k.as_str())
+            })
+            .cloned()
+            .collect();
+        for key in stale {
+            self.remove_peer(&key);
+        }
+    }
+
+    pub fn occupied_slots(&self) -> Vec<(u64, String)> {
+        let mut slots: Vec<(u64, String)> = self
+            .peer_positions
+            .iter()
+            .map(|(key, (idx, _))| (idx.value(), key.clone()))
+            .collect();
+        slots.sort_by_key(|(idx, _)| *idx);
+        slots
     }
 }
 
