@@ -105,6 +105,33 @@ pub enum MeshMessage {
     /// Profile delta — missing profiles for intra-cluster sync (base64-bincode).
     #[serde(rename = "profile_delta")]
     ProfileDelta { data: String },
+
+    /// Connection snapshot SPORE HaveList (base64-bincode).
+    #[serde(rename = "connection_have")]
+    ConnectionHave { data: String },
+
+    /// Connection snapshot delta entries (base64-bincode).
+    #[serde(rename = "connection_delta")]
+    ConnectionDelta { data: String },
+
+    /// WebAuthn registration challenge — broadcast to cluster so any node
+    /// behind the same anycast IP can complete the ceremony.
+    #[serde(rename = "reg_challenge")]
+    RegChallenge { username: String, state: String },
+
+    /// WebAuthn authentication challenge — same cluster broadcast.
+    #[serde(rename = "auth_challenge")]
+    AuthChallenge { username: String, state: String },
+
+    /// Socket migration — TCP_REPAIR state delivered via existing mesh relay.
+    /// The target node calls `anymesh::restore()` to reconstruct the socket.
+    #[serde(rename = "socket_migrate")]
+    SocketMigrate {
+        /// Base64-encoded bincode `SocketMigration` from anymesh.
+        migration: String,
+        /// The peer_id of the original client (so target knows who to expect).
+        client_peer_id: String,
+    },
 }
 
 impl MeshMessage {
@@ -116,6 +143,71 @@ impl MeshMessage {
     /// Deserialize from JSON string (WebSocket text frame).
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(s)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Switchboard protocol — pre-WebSocket half-dial on raw TCP
+// ---------------------------------------------------------------------------
+
+/// Anycast Switchboard Protocol messages — JSON + newline on raw TCP.
+///
+/// These are exchanged BEFORE the WebSocket upgrade. The responder identifies
+/// itself immediately, the client requests a specific target, and the
+/// switchboard either confirms readiness or redirects the connection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SwitchboardMessage {
+    /// Responder announces identity immediately on accept.
+    #[serde(rename = "switchboard_hello")]
+    SwitchboardHello {
+        peer_id: String,
+        spiral_slot: Option<u64>,
+    },
+
+    /// Client requests connection to a specific target.
+    ///
+    /// `want` is a plain string:
+    /// - `"any"` — connect me to anyone (bootstrap)
+    /// - `"spiral_slot:N"` — connect me to whoever occupies SPIRAL slot N
+    /// - `"peer:ID"` — connect me to specific peer_id
+    #[serde(rename = "peer_request")]
+    PeerRequest {
+        my_peer_id: String,
+        want: String,
+    },
+
+    /// Responder IS the requested target — proceed with WebSocket upgrade.
+    #[serde(rename = "peer_ready")]
+    PeerReady { peer_id: String },
+
+    /// Responder is NOT the target — initiating redirect.
+    ///
+    /// `method`:
+    /// - `"direct"` — target's Ygg address included, client dials them directly
+    /// - `"splice"` — switchboard proxies bytes to target (bootstrap, no Ygg yet)
+    /// - `"repair"` — TCP_REPAIR socket migration (bare-metal BGP anycast)
+    #[serde(rename = "peer_redirect")]
+    PeerRedirect {
+        target_peer_id: String,
+        method: String,
+        /// Target's Ygg overlay address (for `"direct"` method).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ygg_addr: Option<String>,
+    },
+}
+
+impl SwitchboardMessage {
+    /// Serialize to a JSON line (JSON + `\n`) for raw TCP.
+    pub fn to_line(&self) -> Result<String, serde_json::Error> {
+        let mut json = serde_json::to_string(self)?;
+        json.push('\n');
+        Ok(json)
+    }
+
+    /// Deserialize from a JSON line (strips trailing newline/whitespace).
+    pub fn from_line(s: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(s.trim_end())
     }
 }
 
@@ -423,5 +515,170 @@ mod tests {
             MeshMessage::ProfileDelta { data } => assert_eq!(data, "ZGVsdGFfcHJvZmlsZXM="),
             other => panic!("expected ProfileDelta, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn socket_migrate_round_trip() {
+        let msg = MeshMessage::SocketMigrate {
+            migration: "bWlncmF0aW9uX2RhdGE=".into(),
+            client_peer_id: "b3b3/abc123".into(),
+        };
+        let json = msg.to_json().unwrap();
+        assert!(json.contains(r#""type":"socket_migrate""#));
+        assert!(json.contains(r#""client_peer_id":"b3b3/abc123""#));
+        let decoded = MeshMessage::from_json(&json).unwrap();
+        match decoded {
+            MeshMessage::SocketMigrate { migration, client_peer_id } => {
+                assert_eq!(migration, "bWlncmF0aW9uX2RhdGE=");
+                assert_eq!(client_peer_id, "b3b3/abc123");
+            }
+            other => panic!("expected SocketMigrate, got {other:?}"),
+        }
+    }
+
+    // --- Switchboard protocol tests ---
+
+    #[test]
+    fn switchboard_hello_round_trip() {
+        let msg = SwitchboardMessage::SwitchboardHello {
+            peer_id: "b3b3/deadbeef".into(),
+            spiral_slot: Some(7),
+        };
+        let line = msg.to_line().unwrap();
+        assert!(line.ends_with('\n'));
+        assert!(line.contains(r#""type":"switchboard_hello""#));
+        let decoded = SwitchboardMessage::from_line(&line).unwrap();
+        match decoded {
+            SwitchboardMessage::SwitchboardHello { peer_id, spiral_slot } => {
+                assert_eq!(peer_id, "b3b3/deadbeef");
+                assert_eq!(spiral_slot, Some(7));
+            }
+            other => panic!("expected SwitchboardHello, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_request_any() {
+        let msg = SwitchboardMessage::PeerRequest {
+            my_peer_id: "b3b3/aaa".into(),
+            want: "any".into(),
+        };
+        let line = msg.to_line().unwrap();
+        let decoded = SwitchboardMessage::from_line(&line).unwrap();
+        match decoded {
+            SwitchboardMessage::PeerRequest { my_peer_id, want } => {
+                assert_eq!(my_peer_id, "b3b3/aaa");
+                assert_eq!(want, "any");
+            }
+            other => panic!("expected PeerRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_request_spiral_slot() {
+        let msg = SwitchboardMessage::PeerRequest {
+            my_peer_id: "b3b3/bbb".into(),
+            want: "spiral_slot:42".into(),
+        };
+        let line = msg.to_line().unwrap();
+        assert!(line.contains(r#""want":"spiral_slot:42""#));
+        let decoded = SwitchboardMessage::from_line(&line).unwrap();
+        match decoded {
+            SwitchboardMessage::PeerRequest { want, .. } => assert_eq!(want, "spiral_slot:42"),
+            other => panic!("expected PeerRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_request_specific_peer() {
+        let msg = SwitchboardMessage::PeerRequest {
+            my_peer_id: "b3b3/ccc".into(),
+            want: "peer:b3b3/deadbeef".into(),
+        };
+        let line = msg.to_line().unwrap();
+        let decoded = SwitchboardMessage::from_line(&line).unwrap();
+        match decoded {
+            SwitchboardMessage::PeerRequest { want, .. } => {
+                assert_eq!(want, "peer:b3b3/deadbeef");
+            }
+            other => panic!("expected PeerRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_ready_round_trip() {
+        let msg = SwitchboardMessage::PeerReady { peer_id: "b3b3/fff".into() };
+        let line = msg.to_line().unwrap();
+        assert!(line.contains(r#""type":"peer_ready""#));
+        let decoded = SwitchboardMessage::from_line(&line).unwrap();
+        match decoded {
+            SwitchboardMessage::PeerReady { peer_id } => assert_eq!(peer_id, "b3b3/fff"),
+            other => panic!("expected PeerReady, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_redirect_splice() {
+        let msg = SwitchboardMessage::PeerRedirect {
+            target_peer_id: "b3b3/target".into(),
+            method: "splice".into(),
+            ygg_addr: None,
+        };
+        let line = msg.to_line().unwrap();
+        assert!(line.contains(r#""type":"peer_redirect""#));
+        assert!(line.contains(r#""method":"splice""#));
+        // ygg_addr omitted when None
+        assert!(!line.contains("ygg_addr"));
+        let decoded = SwitchboardMessage::from_line(&line).unwrap();
+        match decoded {
+            SwitchboardMessage::PeerRedirect { target_peer_id, method, ygg_addr } => {
+                assert_eq!(target_peer_id, "b3b3/target");
+                assert_eq!(method, "splice");
+                assert!(ygg_addr.is_none());
+            }
+            other => panic!("expected PeerRedirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_redirect_direct_with_ygg() {
+        let msg = SwitchboardMessage::PeerRedirect {
+            target_peer_id: "b3b3/target".into(),
+            method: "direct".into(),
+            ygg_addr: Some("200:abcd::1".into()),
+        };
+        let line = msg.to_line().unwrap();
+        assert!(line.contains(r#""method":"direct""#));
+        assert!(line.contains(r#""ygg_addr":"200:abcd::1""#));
+        let decoded = SwitchboardMessage::from_line(&line).unwrap();
+        match decoded {
+            SwitchboardMessage::PeerRedirect { target_peer_id, method, ygg_addr } => {
+                assert_eq!(target_peer_id, "b3b3/target");
+                assert_eq!(method, "direct");
+                assert_eq!(ygg_addr.as_deref(), Some("200:abcd::1"));
+            }
+            other => panic!("expected PeerRedirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_redirect_repair() {
+        let msg = SwitchboardMessage::PeerRedirect {
+            target_peer_id: "b3b3/target".into(),
+            method: "repair".into(),
+            ygg_addr: None,
+        };
+        let line = msg.to_line().unwrap();
+        let decoded = SwitchboardMessage::from_line(&line).unwrap();
+        match decoded {
+            SwitchboardMessage::PeerRedirect { method, .. } => assert_eq!(method, "repair"),
+            other => panic!("expected PeerRedirect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn switchboard_unknown_type_fails() {
+        let json = r#"{"type":"bogus_switchboard","data":"x"}"#;
+        assert!(SwitchboardMessage::from_line(json).is_err());
     }
 }

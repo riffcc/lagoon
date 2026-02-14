@@ -13,8 +13,11 @@ pub mod transport;
 pub mod vdf;
 pub mod yggdrasil;
 
+pub mod connection_gossip;
+pub mod connection_store;
 pub mod latency_gossip;
 pub mod polp;
 pub mod profile;
 pub mod proof_store;
+pub mod switchboard;
 pub mod wire;

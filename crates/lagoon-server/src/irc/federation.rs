@@ -187,6 +187,44 @@ pub fn dispatch_mesh_message(
             });
             None
         }
+        MeshMessage::ConnectionHave { data } => {
+            let _ = event_tx.send(RelayEvent::ConnectionHave {
+                remote_host: remote_host.to_string(),
+                payload_b64: data,
+            });
+            None
+        }
+        MeshMessage::ConnectionDelta { data } => {
+            let _ = event_tx.send(RelayEvent::ConnectionDelta {
+                remote_host: remote_host.to_string(),
+                payload_b64: data,
+            });
+            None
+        }
+        MeshMessage::RegChallenge { username, state } => {
+            let _ = event_tx.send(RelayEvent::RegChallenge {
+                remote_host: remote_host.to_string(),
+                username,
+                state,
+            });
+            None
+        }
+        MeshMessage::AuthChallenge { username, state } => {
+            let _ = event_tx.send(RelayEvent::AuthChallenge {
+                remote_host: remote_host.to_string(),
+                username,
+                state,
+            });
+            None
+        }
+        MeshMessage::SocketMigrate { migration, client_peer_id } => {
+            let _ = event_tx.send(RelayEvent::SocketMigrate {
+                remote_host: remote_host.to_string(),
+                migration,
+                client_peer_id,
+            });
+            None
+        }
     }
 }
 
@@ -522,6 +560,37 @@ pub enum RelayEvent {
         remote_host: String,
         payload_b64: String,
     },
+    /// Received CONNECTION_HAVE — remote peer's connection snapshot SPORE.
+    ConnectionHave {
+        remote_host: String,
+        payload_b64: String,
+    },
+    /// Received CONNECTION_DELTA — connection snapshots we're missing.
+    ConnectionDelta {
+        remote_host: String,
+        payload_b64: String,
+    },
+    /// Received REG_CHALLENGE — a cluster peer broadcast a WebAuthn registration challenge.
+    RegChallenge {
+        remote_host: String,
+        username: String,
+        state: String,
+    },
+    /// Received AUTH_CHALLENGE — a cluster peer broadcast a WebAuthn authentication challenge.
+    AuthChallenge {
+        remote_host: String,
+        username: String,
+        state: String,
+    },
+    /// Received SOCKET_MIGRATE — a switchboard node froze a TCP socket via TCP_REPAIR
+    /// and is delivering the migration state so we can restore it.
+    SocketMigrate {
+        remote_host: String,
+        /// Base64-encoded bincode `SocketMigration`.
+        migration: String,
+        /// The peer_id of the original client.
+        client_peer_id: String,
+    },
 }
 
 /// Manages all federated channel relay connections.
@@ -820,10 +889,13 @@ pub fn spawn_event_processor(
                         // neighbor slots to the next occupied node.
                         st.mesh.spiral.remove_peer(id);
                         st.mesh.latency_gossip.remove_peer(id);
+                        st.mesh.connection_gossip.remove_peer(id);
                     }
                     if !disconnected_ids.is_empty() {
                         let neighbors = st.mesh.spiral.neighbors().clone();
-                        st.mesh.latency_gossip.set_spiral_neighbors(neighbors);
+                        st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
+                        st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
+                        publish_connection_snapshot(&mut st);
                         st.notify_topology_change();
                     }
                 }
@@ -1028,17 +1100,23 @@ pub fn spawn_event_processor(
                         );
                     }
 
-                    // Register peer with latency gossip + update SPIRAL neighbor set.
+                    // Register peer with latency + connection gossip + update SPIRAL neighbor set.
                     st.mesh.latency_gossip.register_peer(
                         mkey.clone(), node_name.clone(),
                     );
+                    st.mesh.connection_gossip.register_peer(
+                        mkey.clone(), node_name.clone(),
+                    );
                     let neighbors = st.mesh.spiral.neighbors().clone();
-                    st.mesh.latency_gossip.set_spiral_neighbors(neighbors);
+                    st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
+                    st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
 
                     // Prune relay connections to non-SPIRAL peers now that the
                     // neighbor set may have changed.
                     prune_non_spiral_relays(&mut st);
 
+                    // Publish connection snapshot — we just connected to a new peer.
+                    publish_connection_snapshot(&mut st);
                     st.notify_topology_change();
 
                     // VDF-based liveness eviction.  VDF IS the heartbeat.
@@ -1080,6 +1158,7 @@ pub fn spawn_event_processor(
                                 st.mesh.connections.remove(evicted_key);
                                 st.mesh.spiral.remove_peer(evicted_key);
                                 st.mesh.latency_gossip.remove_peer(evicted_key);
+                                st.mesh.connection_gossip.remove_peer(evicted_key);
 
                                 // Cut the Ygg overlay connection — dead nodes don't
                                 // get to stay peered.
@@ -1110,7 +1189,9 @@ pub fn spawn_event_processor(
 
                         if !evicted.is_empty() {
                             let neighbors = st.mesh.spiral.neighbors().clone();
-                            st.mesh.latency_gossip.set_spiral_neighbors(neighbors);
+                            st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
+                            st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
+                            publish_connection_snapshot(&mut st);
                             st.notify_topology_change();
                         }
                     }
@@ -1148,10 +1229,13 @@ pub fn spawn_event_processor(
                                     st.mesh.connections.remove(id);
                                     st.mesh.spiral.remove_peer(id);
                                     st.mesh.latency_gossip.remove_peer(id);
+                                    st.mesh.connection_gossip.remove_peer(id);
                                 }
                                 if !ghost_ids.is_empty() {
                                     let neighbors = st.mesh.spiral.neighbors().clone();
-                                    st.mesh.latency_gossip.set_spiral_neighbors(neighbors);
+                                    st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
+                                    st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
+                                    publish_connection_snapshot(&mut st);
                                     st.notify_topology_change();
                                 }
                             }
@@ -1270,6 +1354,23 @@ pub fn spawn_event_processor(
                         if let Some(relay) = st.federation.relays.get(&remote_host) {
                             let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
                                 MeshMessage::LatencyHave { data: b64 },
+                            ));
+                        }
+                    }
+
+                    // Send CONNECTION_HAVE — our connection snapshot SPORE.
+                    {
+                        let spore_bytes = bincode::serialize(
+                            st.mesh.connection_store.spore(),
+                        ).unwrap_or_default();
+                        let sync_msg = super::connection_gossip::SyncMessage::HaveList {
+                            spore_bytes,
+                        };
+                        let b64 = base64::engine::general_purpose::STANDARD
+                            .encode(bincode::serialize(&sync_msg).unwrap_or_default());
+                        if let Some(relay) = st.federation.relays.get(&remote_host) {
+                            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                MeshMessage::ConnectionHave { data: b64 },
                             ));
                         }
                     }
@@ -1406,8 +1507,11 @@ pub fn spawn_event_processor(
                             );
                         }
 
-                        // Register with latency gossip (mesh_key → node_name routing).
+                        // Register with latency + connection gossip (mesh_key → node_name routing).
                         st.mesh.latency_gossip.register_peer(
+                            mkey.clone(), peer.node_name.clone(),
+                        );
+                        st.mesh.connection_gossip.register_peer(
                             mkey.clone(), peer.node_name.clone(),
                         );
 
@@ -1537,9 +1641,10 @@ pub fn spawn_event_processor(
                     }
 
                     if changed {
-                        // Update SPIRAL neighbor set for latency gossip.
+                        // Update SPIRAL neighbor set for latency + connection gossip.
                         let neighbors = st.mesh.spiral.neighbors().clone();
-                        st.mesh.latency_gossip.set_spiral_neighbors(neighbors);
+                        st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
+                        st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
                         st.notify_topology_change();
                     }
 
@@ -2172,6 +2277,144 @@ pub fn spawn_event_processor(
                         broadcast_profile_have_to_cluster(&st, Some(&remote_host));
                     }
                 }
+
+                RelayEvent::ConnectionHave { remote_host, payload_b64 } => {
+                    let msg_bytes = match base64::engine::general_purpose::STANDARD
+                        .decode(&payload_b64)
+                    {
+                        Ok(b) => b,
+                        Err(_) => {
+                            warn!(remote_host, "connection_gossip: invalid base64 in CONNECTION_HAVE");
+                            continue;
+                        }
+                    };
+                    let sync_msg: super::connection_gossip::SyncMessage =
+                        match bincode::deserialize(&msg_bytes) {
+                            Ok(m) => m,
+                            Err(_) => {
+                                warn!(remote_host, "connection_gossip: invalid bincode in CONNECTION_HAVE");
+                                continue;
+                            }
+                        };
+
+                    if let super::connection_gossip::SyncMessage::HaveList {
+                        spore_bytes,
+                    } = sync_msg
+                    {
+                        tracing::info!(remote_host, "connection_gossip: received CONNECTION_HAVE");
+
+                        let st = state.read().await;
+
+                        let from_mkey = st.mesh.known_peers.iter()
+                            .find(|(_, p)| p.node_name == remote_host)
+                            .map(|(id, _)| id.clone())
+                            .unwrap_or_default();
+
+                        let our_spore = st.mesh.connection_store.spore();
+                        let our_data = st.mesh.connection_store.snapshot_data_for_gossip();
+
+                        if let Some(action) = st.mesh.connection_gossip.on_have_list_received(
+                            &from_mkey,
+                            &spore_bytes,
+                            our_spore,
+                            &our_data,
+                        ) {
+                            tracing::info!(remote_host, "connection_gossip: sending CONNECTION_DELTA");
+                            execute_connection_gossip_actions(&st, vec![action]);
+                        }
+                    }
+                }
+
+                RelayEvent::ConnectionDelta { remote_host, payload_b64 } => {
+                    let msg_bytes = match base64::engine::general_purpose::STANDARD
+                        .decode(&payload_b64)
+                    {
+                        Ok(b) => b,
+                        Err(_) => {
+                            warn!(remote_host, "connection_gossip: invalid base64 in CONNECTION_DELTA");
+                            continue;
+                        }
+                    };
+                    let sync_msg: super::connection_gossip::SyncMessage =
+                        match bincode::deserialize(&msg_bytes) {
+                            Ok(m) => m,
+                            Err(_) => {
+                                warn!(remote_host, "connection_gossip: invalid bincode in CONNECTION_DELTA");
+                                continue;
+                            }
+                        };
+
+                    if let super::connection_gossip::SyncMessage::SnapshotDelta {
+                        entries,
+                    } = sync_msg
+                    {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+
+                        let mut st = state.write().await;
+
+                        let snapshots: Vec<super::connection_store::ConnectionSnapshot> = entries
+                            .iter()
+                            .filter_map(|bytes| bincode::deserialize(bytes).ok())
+                            .collect();
+
+                        let accepted = st.mesh.connection_store.merge(snapshots, now_ms);
+                        if accepted > 0 {
+                            info!(
+                                remote_host, accepted,
+                                "connection_gossip: merged snapshot delta",
+                            );
+
+                            let spore_bytes = bincode::serialize(
+                                st.mesh.connection_store.spore(),
+                            ).unwrap_or_default();
+                            let actions = st.mesh.connection_gossip
+                                .on_snapshot_updated(now_ms, &spore_bytes);
+                            execute_connection_gossip_actions(&st, actions);
+
+                            st.mesh.connection_store.prune_stale(now_ms);
+                            st.notify_topology_change();
+                        }
+                    }
+                }
+
+                RelayEvent::RegChallenge { remote_host, username, state: challenge_state } => {
+                    tracing::debug!(remote_host, username, "webauthn: received reg challenge from cluster");
+                    let mut st = state.write().await;
+                    st.reg_challenges.insert(username, challenge_state);
+                }
+
+                RelayEvent::AuthChallenge { remote_host, username, state: challenge_state } => {
+                    tracing::debug!(remote_host, username, "webauthn: received auth challenge from cluster");
+                    let mut st = state.write().await;
+                    st.auth_challenges.insert(username, challenge_state);
+                }
+
+                RelayEvent::SocketMigrate { remote_host, migration, client_peer_id } => {
+                    tracing::info!(
+                        remote_host,
+                        client_peer_id,
+                        "switchboard: received socket migration — restoring"
+                    );
+                    let state_clone = Arc::clone(&state);
+                    let client_id = client_peer_id.clone();
+                    let mig = migration.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = super::switchboard::handle_socket_migration(
+                            &mig,
+                            &client_id,
+                            state_clone,
+                        ).await {
+                            tracing::warn!(
+                                client_peer_id = %client_id,
+                                error = %e,
+                                "switchboard: socket migration restore failed"
+                            );
+                        }
+                    });
+                }
             } // match event
             } // Some(event) => {
 
@@ -2243,6 +2486,7 @@ pub fn spawn_event_processor(
                         st.mesh.connections.remove(evicted_key);
                         st.mesh.spiral.remove_peer(evicted_key);
                         st.mesh.latency_gossip.remove_peer(evicted_key);
+                        st.mesh.connection_gossip.remove_peer(evicted_key);
 
                         if let Some(ref ygg) = st.transport_config.ygg_node {
                             if let Some(ref uri) = peer.ygg_peer_uri {
@@ -2270,7 +2514,9 @@ pub fn spawn_event_processor(
 
                 if !evicted.is_empty() {
                     let neighbors = st.mesh.spiral.neighbors().clone();
-                    st.mesh.latency_gossip.set_spiral_neighbors(neighbors);
+                    st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
+                    st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
+                    publish_connection_snapshot(&mut st);
                     st.notify_topology_change();
                 }
             }
@@ -2312,6 +2558,26 @@ pub fn broadcast_profile_have_to_cluster(
     }
 }
 
+/// Broadcast a WebAuthn challenge to all cluster peers so any node behind
+/// the same anycast IP can complete the ceremony.
+pub fn broadcast_challenge_to_cluster(
+    st: &super::server::ServerState,
+    msg: MeshMessage,
+) {
+    let our_site = &*SITE_NAME;
+    for (_key, relay) in &st.federation.relays {
+        let is_cluster = relay.remote_node_name.as_ref().and_then(|nn| {
+            st.mesh.known_peers.values()
+                .find(|p| &p.node_name == nn)
+                .map(|p| super::gossip::is_cluster_peer(our_site, &p.site_name))
+        }).unwrap_or(false);
+
+        if is_cluster {
+            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(msg.clone()));
+        }
+    }
+}
+
 /// Execute latency gossip sync actions by sending MESH subcommands to relay peers.
 fn execute_latency_gossip_actions(
     st: &super::server::ServerState,
@@ -2339,6 +2605,75 @@ fn execute_latency_gossip_actions(
         if let Some(relay) = st.federation.relays.get(&node_name) {
             let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(mesh_msg));
         }
+    }
+}
+
+/// Execute connection gossip sync actions by sending MESH subcommands to relay peers.
+fn execute_connection_gossip_actions(
+    st: &super::server::ServerState,
+    actions: Vec<super::connection_gossip::SyncAction>,
+) {
+    for action in actions {
+        let (node_name, message) = match action {
+            super::connection_gossip::SyncAction::SendHaveList {
+                neighbor_node_name, message,
+            } => (neighbor_node_name, message),
+            super::connection_gossip::SyncAction::SendSnapshotDelta {
+                neighbor_node_name, message,
+            } => (neighbor_node_name, message),
+        };
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(bincode::serialize(&message).unwrap_or_default());
+        let mesh_msg = match &message {
+            super::connection_gossip::SyncMessage::HaveList { .. } => {
+                MeshMessage::ConnectionHave { data: b64 }
+            }
+            super::connection_gossip::SyncMessage::SnapshotDelta { .. } => {
+                MeshMessage::ConnectionDelta { data: b64 }
+            }
+        };
+        if let Some(relay) = st.federation.relays.get(&node_name) {
+            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(mesh_msg));
+        }
+    }
+}
+
+/// Publish a connection snapshot to the ConnectionStore and trigger SPORE gossip.
+///
+/// Call this after any change to `st.mesh.connections` (connect/disconnect).
+fn publish_connection_snapshot(st: &mut super::server::ServerState) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let our_pid = st.lens.peer_id.clone();
+    let connected_peers: Vec<String> = st.mesh.connections.iter()
+        .filter(|entry| *entry.1 == super::server::MeshConnectionState::Connected)
+        .map(|(mkey, _)| mkey.clone())
+        .collect();
+
+    let snapshot = super::connection_store::ConnectionStore::make_snapshot(
+        our_pid,
+        connected_peers,
+        now_ms,
+    );
+
+    if st.mesh.connection_store.insert(snapshot) {
+        let spore_bytes = bincode::serialize(
+            st.mesh.connection_store.spore(),
+        ).unwrap_or_default();
+        let actions = st.mesh.connection_gossip
+            .on_snapshot_updated(now_ms, &spore_bytes);
+        if !actions.is_empty() {
+            tracing::info!(
+                count = actions.len(),
+                "connection_gossip: sending CONNECTION_HAVE to SPIRAL neighbors",
+            );
+        }
+        execute_connection_gossip_actions(st, actions);
+
+        st.mesh.connection_store.prune_stale(now_ms);
     }
 }
 
@@ -2509,6 +2844,10 @@ async fn relay_task_native(
             }
             Ok(transport::NativeWs::Tls(ws)) => {
                 info!(%remote_host, "native relay: connected via TLS WebSocket");
+                native_ws_loop(ws, &remote_host, &mut cmd_rx, &event_tx, &state).await
+            }
+            Ok(transport::NativeWs::Switchboard(ws)) => {
+                info!(%remote_host, "native relay: connected via switchboard half-dial");
                 native_ws_loop(ws, &remote_host, &mut cmd_rx, &event_tx, &state).await
             }
             Err(e) => {
@@ -3678,6 +4017,17 @@ fn mesh_message_to_irc(msg: &MeshMessage) -> Message {
         }
         MeshMessage::ProfileHave { data } => ("PROFILE_HAVE".into(), data.clone()),
         MeshMessage::ProfileDelta { data } => ("PROFILE_DELTA".into(), data.clone()),
+        MeshMessage::ConnectionHave { data } => ("CONNECTION_HAVE".into(), data.clone()),
+        MeshMessage::ConnectionDelta { data } => ("CONNECTION_DELTA".into(), data.clone()),
+        MeshMessage::RegChallenge { username, state } => {
+            ("REG_CHALLENGE".into(), serde_json::json!({ "username": username, "state": state }).to_string())
+        }
+        MeshMessage::AuthChallenge { username, state } => {
+            ("AUTH_CHALLENGE".into(), serde_json::json!({ "username": username, "state": state }).to_string())
+        }
+        MeshMessage::SocketMigrate { migration, client_peer_id } => {
+            ("SOCKET_MIGRATE".into(), serde_json::json!({ "migration": migration, "client_peer_id": client_peer_id }).to_string())
+        }
     };
     let mut params = vec![sub];
     if !payload.is_empty() {

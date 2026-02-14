@@ -407,6 +407,8 @@ pub enum NativeWs {
     Ygg(tokio_tungstenite::WebSocketStream<yggbridge::YggStream>),
     /// TLS WebSocket: `wss://host:port/api/mesh/ws`, internet path.
     Tls(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>),
+    /// Switchboard: raw TCP WebSocket after half-dial PeerReady or splice.
+    Switchboard(tokio_tungstenite::WebSocketStream<TcpStream>),
 }
 
 /// Connect to a remote peer's native mesh WebSocket endpoint (`/api/mesh/ws`).
@@ -463,6 +465,185 @@ pub async fn connect_native(
         io::ErrorKind::Unsupported,
         format!("native mesh requires WebSocket transport (peer {remote_host} is PlainTcp)"),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Switchboard half-dial (client side)
+// ---------------------------------------------------------------------------
+
+/// Outcome of a switchboard half-dial. The client gets either:
+/// - A ready WebSocket stream (PeerReady or splice redirect), or
+/// - A direct redirect telling the client to dial the target via Ygg.
+pub enum SwitchboardOutcome {
+    /// We got PeerReady — the switchboard IS our target. WebSocket is live.
+    Ready(NativeWs),
+    /// The switchboard told us to dial the target directly via Ygg overlay.
+    /// Close this connection and use the provided address.
+    DirectRedirect {
+        target_peer_id: String,
+        ygg_addr: String,
+    },
+}
+
+/// Switchboard port — the default port for half-dial connections.
+const SWITCHBOARD_PORT: u16 = 9443;
+
+/// Client-side half-dial protocol.
+///
+/// 1. TCP connect to `addr:9443`
+/// 2. Send `PeerRequest` with our peer_id and what we want
+/// 3. Read `SwitchboardHello` (responder identifies first)
+/// 4. Read response: `PeerReady` or `PeerRedirect`
+/// 5. If `PeerReady` → WebSocket upgrade → return `Ready(NativeWs::Switchboard)`
+/// 6. If `PeerRedirect` with "direct" → return `DirectRedirect`
+/// 7. If `PeerRedirect` with "splice" → WebSocket upgrade → return `Ready`
+pub async fn connect_switchboard(
+    addr: &str,
+    our_peer_id: &str,
+    want: &str,
+) -> io::Result<SwitchboardOutcome> {
+    use super::wire::SwitchboardMessage;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let target = format!("{addr}:{SWITCHBOARD_PORT}");
+    info!(%target, want, "switchboard client: dialing");
+
+    let stream = TcpStream::connect(&target).await?;
+    set_tcp_keepalive(&stream)?;
+
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
+
+    // Step 1: Read the responder's SwitchboardHello.
+    let mut line = String::new();
+    let timeout = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        reader.read_line(&mut line),
+    );
+    match timeout.await {
+        Ok(Ok(0)) | Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "switchboard client: no SwitchboardHello received",
+            ));
+        }
+        Ok(Err(e)) => return Err(e),
+        Ok(Ok(_)) => {}
+    }
+
+    let hello = SwitchboardMessage::from_line(&line)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let (responder_peer_id, _responder_slot) = match hello {
+        SwitchboardMessage::SwitchboardHello { peer_id, spiral_slot } => (peer_id, spiral_slot),
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("switchboard client: expected SwitchboardHello, got {other:?}"),
+            ));
+        }
+    };
+
+    info!(
+        %responder_peer_id,
+        "switchboard client: received SwitchboardHello"
+    );
+
+    // Step 2: Send our PeerRequest.
+    let request = SwitchboardMessage::PeerRequest {
+        my_peer_id: our_peer_id.to_string(),
+        want: want.to_string(),
+    };
+    let request_line = request.to_line()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    writer.write_all(request_line.as_bytes()).await?;
+
+    // Step 3: Read response.
+    let mut response_line = String::new();
+    let timeout = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        reader.read_line(&mut response_line),
+    );
+    match timeout.await {
+        Ok(Ok(0)) | Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "switchboard client: no response to PeerRequest",
+            ));
+        }
+        Ok(Err(e)) => return Err(e),
+        Ok(Ok(_)) => {}
+    }
+
+    let response = SwitchboardMessage::from_line(&response_line)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    match response {
+        SwitchboardMessage::PeerReady { peer_id } => {
+            info!(
+                %peer_id,
+                "switchboard client: PeerReady — upgrading to WebSocket"
+            );
+
+            // Reunite the split stream for WebSocket upgrade.
+            let stream = reader.into_inner().unsplit(writer);
+
+            // WebSocket upgrade on the raw TCP stream.
+            let url = format!("ws://{addr}:{SWITCHBOARD_PORT}/api/mesh/ws");
+            let (ws, _) = tokio_tungstenite::client_async(&url, stream)
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+
+            Ok(SwitchboardOutcome::Ready(NativeWs::Switchboard(ws)))
+        }
+
+        SwitchboardMessage::PeerRedirect { target_peer_id, method, ygg_addr } => {
+            match method.as_str() {
+                "direct" => {
+                    let ygg = ygg_addr.ok_or_else(|| io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "switchboard: direct redirect without ygg_addr",
+                    ))?;
+                    info!(
+                        %target_peer_id,
+                        %ygg,
+                        "switchboard client: direct redirect — will dial via Ygg"
+                    );
+                    Ok(SwitchboardOutcome::DirectRedirect {
+                        target_peer_id,
+                        ygg_addr: ygg,
+                    })
+                }
+                "splice" => {
+                    info!(
+                        %target_peer_id,
+                        "switchboard client: splice redirect — upgrading to WebSocket"
+                    );
+
+                    // The switchboard is proxying bytes. WebSocket upgrade on our TCP.
+                    let stream = reader.into_inner().unsplit(writer);
+                    let url = format!("ws://{addr}:{SWITCHBOARD_PORT}/api/mesh/ws");
+                    let (ws, _) = tokio_tungstenite::client_async(&url, stream)
+                        .await
+                        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
+
+                    Ok(SwitchboardOutcome::Ready(NativeWs::Switchboard(ws)))
+                }
+                other => {
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        format!("switchboard: unknown redirect method '{other}'"),
+                    ))
+                }
+            }
+        }
+
+        other => {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("switchboard client: unexpected response: {other:?}"),
+            ))
+        }
+    }
 }
 
 /// Apply aggressive TCP keepalive for fast dead peer detection.

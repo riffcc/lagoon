@@ -25,10 +25,6 @@ pub struct AppState {
     webauthn: Arc<OnceCell<Webauthn>>,
     /// Users by username.
     pub users: Arc<RwLock<HashMap<String, User>>>,
-    /// In-flight registration challenges keyed by username.
-    pub reg_challenges: Arc<RwLock<HashMap<String, PasskeyRegistration>>>,
-    /// In-flight authentication challenges keyed by username.
-    pub auth_challenges: Arc<RwLock<HashMap<String, PasskeyAuthentication>>>,
     /// Active sessions: token → username.
     pub sessions: Arc<RwLock<HashMap<String, String>>>,
     /// IRC server address to bridge to.
@@ -40,6 +36,11 @@ pub struct AppState {
     /// True when running in embedded mode (default).
     /// All clients are web gateway users — their IPs are meaningless.
     pub gateway_mode: bool,
+    /// WebAuthn registration challenges (standalone fallback when no embedded IRC).
+    /// In embedded mode, challenges live in ServerState and are broadcast over the mesh.
+    pub reg_challenges: Arc<RwLock<HashMap<String, String>>>,
+    /// WebAuthn authentication challenges (standalone fallback).
+    pub auth_challenges: Arc<RwLock<HashMap<String, String>>>,
 }
 
 /// Build a WebAuthn instance from an origin URL string.
@@ -77,13 +78,13 @@ impl AppState {
         Ok(Self {
             webauthn: Arc::new(cell),
             users: Arc::new(RwLock::new(HashMap::new())),
-            reg_challenges: Arc::new(RwLock::new(HashMap::new())),
-            auth_challenges: Arc::new(RwLock::new(HashMap::new())),
             sessions: Arc::new(RwLock::new(HashMap::new())),
             irc_addr,
             irc_state: None,
             mesh_watch: None,
             gateway_mode: false,
+            reg_challenges: Arc::new(RwLock::new(HashMap::new())),
+            auth_challenges: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 

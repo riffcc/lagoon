@@ -69,6 +69,68 @@ async fn cache_profile_locally(state: &AppState, profile: &UserProfile) {
         .insert(profile.username.clone(), user);
 }
 
+/// Store a registration challenge and broadcast it to cluster peers.
+/// If embedded IRC is available, stores in ServerState (mesh-accessible).
+/// Otherwise falls back to AppState local HashMap (standalone mode).
+async fn store_reg_challenge(state: &AppState, username: &str, json: &str) {
+    if let Some(irc) = state.irc_state.as_ref() {
+        let mut st = irc.write().await;
+        st.reg_challenges.insert(username.to_string(), json.to_string());
+        lagoon_server::irc::federation::broadcast_challenge_to_cluster(
+            &st,
+            lagoon_server::irc::wire::MeshMessage::RegChallenge {
+                username: username.to_string(),
+                state: json.to_string(),
+            },
+        );
+    } else {
+        state
+            .reg_challenges
+            .write()
+            .await
+            .insert(username.to_string(), json.to_string());
+    }
+}
+
+/// Store an auth challenge and broadcast it to cluster peers.
+async fn store_auth_challenge(state: &AppState, username: &str, json: &str) {
+    if let Some(irc) = state.irc_state.as_ref() {
+        let mut st = irc.write().await;
+        st.auth_challenges.insert(username.to_string(), json.to_string());
+        lagoon_server::irc::federation::broadcast_challenge_to_cluster(
+            &st,
+            lagoon_server::irc::wire::MeshMessage::AuthChallenge {
+                username: username.to_string(),
+                state: json.to_string(),
+            },
+        );
+    } else {
+        state
+            .auth_challenges
+            .write()
+            .await
+            .insert(username.to_string(), json.to_string());
+    }
+}
+
+/// Look up and consume a registration challenge (removes from store).
+async fn take_reg_challenge(state: &AppState, username: &str) -> Option<String> {
+    if let Some(irc) = state.irc_state.as_ref() {
+        irc.write().await.reg_challenges.remove(username)
+    } else {
+        state.reg_challenges.write().await.remove(username)
+    }
+}
+
+/// Look up and consume an auth challenge (removes from store).
+async fn take_auth_challenge(state: &AppState, username: &str) -> Option<String> {
+    if let Some(irc) = state.irc_state.as_ref() {
+        irc.write().await.auth_challenges.remove(username)
+    } else {
+        state.auth_challenges.write().await.remove(username)
+    }
+}
+
 #[derive(Deserialize)]
 pub struct RegisterBeginRequest {
     pub username: String,
@@ -127,12 +189,11 @@ pub async fn register_begin(
         .start_passkey_registration(user_id, &username, &username, Some(exclude))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("WebAuthn error: {e}")))?;
 
-    // Store the registration state for completion.
-    state
-        .reg_challenges
-        .write()
-        .await
-        .insert(username, reg_state);
+    let reg_state_json = serde_json::to_string(&reg_state)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialize state: {e}")))?;
+
+    // Store locally + broadcast to cluster — any node can now complete this ceremony.
+    store_reg_challenge(&state, &username, &reg_state_json).await;
 
     Ok(Json(RegisterBeginResponse { options: challenge }))
 }
@@ -163,12 +224,12 @@ pub async fn register_complete(
 
     let username = req.username.trim().to_string();
 
-    let reg_state = state
-        .reg_challenges
-        .write()
+    let reg_state_json = take_reg_challenge(&state, &username)
         .await
-        .remove(&username)
-        .ok_or((StatusCode::BAD_REQUEST, "No pending registration".into()))?;
+        .ok_or((StatusCode::BAD_REQUEST, "No pending registration challenge for this user".into()))?;
+
+    let reg_state: PasskeyRegistration = serde_json::from_str(&reg_state_json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid registration state: {e}")))?;
 
     let passkey = webauthn
         .finish_passkey_registration(&req.credential, &reg_state)
@@ -265,11 +326,9 @@ pub async fn login_begin(
                     )
                 })?;
             drop(users);
-            state
-                .auth_challenges
-                .write()
-                .await
-                .insert(username, auth_state);
+            let state_json = serde_json::to_string(&auth_state)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialize state: {e}")))?;
+            store_auth_challenge(&state, &username, &state_json).await;
             return Ok(Json(LoginBeginResponse { options: challenge }));
         }
     }
@@ -292,11 +351,9 @@ pub async fn login_begin(
                             format!("WebAuthn error: {e}"),
                         )
                     })?;
-                state
-                    .auth_challenges
-                    .write()
-                    .await
-                    .insert(username, auth_state);
+                let state_json = serde_json::to_string(&auth_state)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialize state: {e}")))?;
+                store_auth_challenge(&state, &username, &state_json).await;
                 return Ok(Json(LoginBeginResponse { options: challenge }));
             }
         }
@@ -328,11 +385,9 @@ pub async fn login_begin(
                             format!("WebAuthn error: {e}"),
                         )
                     })?;
-                state
-                    .auth_challenges
-                    .write()
-                    .await
-                    .insert(username, auth_state);
+                let state_json = serde_json::to_string(&auth_state)
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialize state: {e}")))?;
+                store_auth_challenge(&state, &username, &state_json).await;
                 return Ok(Json(LoginBeginResponse { options: challenge }));
             }
             _ => {
@@ -365,12 +420,12 @@ pub async fn login_complete(
 
     let username = req.username.trim().to_string();
 
-    let auth_state = state
-        .auth_challenges
-        .write()
+    let auth_state_json = take_auth_challenge(&state, &username)
         .await
-        .remove(&username)
-        .ok_or((StatusCode::BAD_REQUEST, "No pending authentication".into()))?;
+        .ok_or((StatusCode::BAD_REQUEST, "No pending authentication challenge for this user".into()))?;
+
+    let auth_state: PasskeyAuthentication = serde_json::from_str(&auth_state_json)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid authentication state: {e}")))?;
 
     let auth_result = webauthn
         .finish_passkey_authentication(&req.credential, &auth_state)

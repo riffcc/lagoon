@@ -173,6 +173,12 @@ impl SpiralTopology {
         self.peer_positions.get(mesh_key).map(|(idx, _)| *idx)
     }
 
+    /// Reverse lookup: get the mesh_key occupying a given SPIRAL index.
+    pub fn peer_at_index(&self, index: u64) -> Option<&str> {
+        let coord = spiral3d_to_coord(Spiral3DIndex::new(index));
+        self.occupied.get(&coord).map(|s| s.as_str())
+    }
+
     /// Number of occupied slots in the topology.
     pub fn occupied_count(&self) -> usize {
         self.occupied.len()

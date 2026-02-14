@@ -291,6 +291,10 @@ pub struct MeshState {
     pub proof_store: super::proof_store::ProofStore,
     /// SPIRAL-scoped latency proof gossip coordinator.
     pub latency_gossip: super::latency_gossip::LatencyGossip,
+    /// SPORE-indexed connection snapshot store (mesh-wide visibility).
+    pub connection_store: super::connection_store::ConnectionStore,
+    /// SPIRAL-scoped connection snapshot gossip coordinator.
+    pub connection_gossip: super::connection_gossip::ConnectionGossip,
 }
 
 impl MeshState {
@@ -311,6 +315,8 @@ impl MeshState {
                 our_mesh_key.to_owned(),
                 10_000, // 10s sync interval
             ),
+            connection_store: super::connection_store::ConnectionStore::new(120_000), // 120s TTL
+            connection_gossip: super::connection_gossip::ConnectionGossip::new(10_000), // 10s sync interval
         }
     }
 }
@@ -480,6 +486,12 @@ pub struct ServerState {
     pub full_telemetry: bool,
     /// User profile CRDT store — local cache + mesh query support.
     pub profile_store: ProfileStore,
+    /// WebAuthn registration challenges: username → serialized PasskeyRegistration.
+    /// Populated locally on `register_begin` and via mesh broadcast from cluster peers.
+    pub reg_challenges: HashMap<String, String>,
+    /// WebAuthn authentication challenges: username → serialized PasskeyAuthentication.
+    /// Populated locally on `login_begin` and via mesh broadcast from cluster peers.
+    pub auth_challenges: HashMap<String, String>,
 }
 
 /// Handle to send messages to a connected client.
@@ -537,6 +549,8 @@ impl ServerState {
                 .map(|v| v != "0")
                 .unwrap_or(true), // ON by default
             profile_store,
+            reg_challenges: HashMap::new(),
+            auth_challenges: HashMap::new(),
         }
     }
 
@@ -741,6 +755,48 @@ impl ServerState {
             }
         }
 
+        // Connection gossip: edges reported by remote nodes via SPORE sync.
+        // Only include edges where both endpoints are known nodes.
+        {
+            let known_ids: HashSet<&str> = {
+                let mut s: HashSet<&str> = self.mesh.known_peers.keys().map(|k| k.as_str()).collect();
+                s.insert(&our_pid);
+                s
+            };
+            let existing_edges: HashSet<(String, String)> = links
+                .iter()
+                .map(|l| {
+                    if l.source < l.target {
+                        (l.source.clone(), l.target.clone())
+                    } else {
+                        (l.target.clone(), l.source.clone())
+                    }
+                })
+                .collect();
+            for (reporter, connected_peer) in self.mesh.connection_store.all_edges() {
+                if !known_ids.contains(reporter.as_str())
+                    || !known_ids.contains(connected_peer.as_str())
+                {
+                    continue;
+                }
+                let edge = if reporter < connected_peer {
+                    (reporter.clone(), connected_peer.clone())
+                } else {
+                    (connected_peer.clone(), reporter.clone())
+                };
+                if !existing_edges.contains(&edge) {
+                    links.push(MeshLinkReport {
+                        source: reporter,
+                        target: connected_peer,
+                        upload_bps: None,
+                        download_bps: None,
+                        latency_ms: None,
+                        link_type: "gossip".into(),
+                    });
+                }
+            }
+        }
+
         MeshSnapshot {
             self_mesh_key: our_pid,
             self_server_name: self.lens.server_name.clone(),
@@ -905,6 +961,18 @@ pub async fn start(
     // Spawn mesh connector — proactively connects to all LAGOON_PEERS.
     federation::spawn_mesh_connector(Arc::clone(&state), transport_config);
 
+    // Start the anycast switchboard on port 9443.
+    // This multiplexes: JSON `{` → half-dial protocol, anything else → Ygg proxy.
+    {
+        let switchboard_port: u16 = std::env::var("LAGOON_SWITCHBOARD_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(9443);
+        let switchboard_addr: std::net::SocketAddr =
+            ([0, 0, 0, 0, 0, 0, 0, 0], switchboard_port).into();
+        super::switchboard::start_switchboard(switchboard_addr, Arc::clone(&state)).await;
+    }
+
     // Bind all listeners first, so we fail fast on port conflicts.
     let mut listeners = Vec::with_capacity(addrs.len());
     for addr in addrs {
@@ -1023,7 +1091,9 @@ fn init_yggdrasil(lens: &super::lens::LensIdentity) -> Option<yggbridge::YggNode
     private_key[..32].copy_from_slice(&lens.secret_seed);
     private_key[32..].copy_from_slice(signing_key.verifying_key().as_bytes());
 
-    let listen = vec!["tcp://[::]:9443".to_string()];
+    // Ygg listens on internal-only port. The switchboard listener on [::]:9443
+    // handles external traffic and proxies non-switchboard bytes to this address.
+    let listen = vec!["tcp://127.0.0.1:19443".to_string()];
 
     // Always start with empty peers — APE populates from MESH HELLO.
     let empty_peers: Vec<String> = vec![];
