@@ -26,6 +26,7 @@ FROM node:22-slim AS web-build
 WORKDIR /build
 COPY crates/lagoon-web/web/package.json crates/lagoon-web/web/package-lock.json ./
 RUN npm ci
+ARG CACHEBUST=0
 COPY crates/lagoon-web/web/ ./
 RUN npm run build
 
