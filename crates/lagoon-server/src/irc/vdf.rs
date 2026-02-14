@@ -74,13 +74,26 @@ pub fn resonance_credit(actual_rate: f64, target_rate: f64, sigma: f64) -> f64 {
     (-((deviation / sigma).powi(2))).exp()
 }
 
-/// Derive a VDF genesis hash from an ed25519 public key.
+/// Mesh-wide VDF genesis — identical for ALL Lagoon nodes everywhere.
 ///
-/// Deterministic: given a public key, anyone can compute the expected genesis.
-/// Uses a domain separator to prevent collisions with other Blake3 usages.
-pub fn derive_genesis(public_key: &[u8]) -> [u8; 32] {
+/// This constant serves as:
+/// - The shared WebAuthn challenge signing key (stateless across anycast)
+/// - The common starting point from which per-node VDF chains diverge
+///
+/// Per-node chain uniqueness comes from `derive_chain_seed()`, not from genesis.
+pub fn derive_genesis() -> [u8; 32] {
+    *blake3::hash(b"lagoon-vdf-genesis-v1").as_bytes()
+}
+
+/// Derive a per-node VDF chain seed from the shared genesis + node public key.
+///
+/// Each node starts its VDF chain from this unique seed, so chains diverge
+/// from step 0. The genesis is shared (for signing), the chain is unique
+/// (for VDF identity, tiebreaks, and proof-of-work).
+pub fn derive_chain_seed(genesis: &[u8; 32], public_key: &[u8]) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
-    h.update(b"lagoon-vdf-genesis-v1");
+    h.update(b"lagoon-vdf-chain-seed-v1");
+    h.update(genesis);
     h.update(public_key);
     *h.finalize().as_bytes()
 }
@@ -219,27 +232,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn derive_genesis_deterministic() {
-        let key = [42u8; 32];
-        let g1 = derive_genesis(&key);
-        let g2 = derive_genesis(&key);
-        assert_eq!(g1, g2);
+    fn derive_genesis_is_constant() {
+        let g1 = derive_genesis();
+        let g2 = derive_genesis();
+        assert_eq!(g1, g2, "genesis must be the same constant every time");
     }
 
     #[test]
-    fn derive_genesis_different_keys() {
-        let g1 = derive_genesis(&[1u8; 32]);
-        let g2 = derive_genesis(&[2u8; 32]);
-        assert_ne!(g1, g2);
+    fn derive_chain_seed_differs_per_node() {
+        let genesis = derive_genesis();
+        let s1 = derive_chain_seed(&genesis, &[1u8; 32]);
+        let s2 = derive_chain_seed(&genesis, &[2u8; 32]);
+        assert_ne!(s1, s2, "different pubkeys must produce different chain seeds");
     }
 
     #[test]
-    fn derive_genesis_domain_separated() {
-        // Raw blake3 of the key should differ from our domain-separated genesis.
-        let key = [42u8; 32];
-        let raw = *blake3::hash(&key).as_bytes();
-        let genesis = derive_genesis(&key);
-        assert_ne!(raw, genesis);
+    fn derive_chain_seed_deterministic() {
+        let genesis = derive_genesis();
+        let s1 = derive_chain_seed(&genesis, &[42u8; 32]);
+        let s2 = derive_chain_seed(&genesis, &[42u8; 32]);
+        assert_eq!(s1, s2, "same pubkey must produce same chain seed");
+    }
+
+    #[test]
+    fn chain_seed_differs_from_genesis() {
+        let genesis = derive_genesis();
+        let seed = derive_chain_seed(&genesis, &[42u8; 32]);
+        assert_ne!(genesis, seed, "chain seed must differ from genesis");
     }
 
     #[test]
@@ -266,11 +285,12 @@ mod tests {
 
     #[tokio::test]
     async fn vdf_engine_ticks() {
-        let genesis = derive_genesis(&[99u8; 32]);
-        let chain = Arc::new(RwLock::new(lagoon_vdf::VdfChain::new(genesis)));
+        let genesis = derive_genesis();
+        let chain_seed = derive_chain_seed(&genesis, &[99u8; 32]);
+        let chain = Arc::new(RwLock::new(lagoon_vdf::VdfChain::new(chain_seed)));
         let (state_tx, mut state_rx) = watch::channel(VdfState {
             genesis,
-            current_hash: genesis,
+            current_hash: chain_seed,
             session_steps: 0,
             total_steps: 0,
             resonance: None,
@@ -291,7 +311,7 @@ mod tests {
         let state = state_rx.borrow().clone();
         assert!(state.session_steps > 0);
         assert!(state.total_steps > 0);
-        assert_ne!(state.current_hash, genesis);
+        assert_ne!(state.current_hash, chain_seed);
 
         let _ = shutdown_tx.send(());
         let _ = handle.await;
@@ -299,12 +319,13 @@ mod tests {
 
     #[tokio::test]
     async fn vdf_engine_restored_total() {
-        let genesis = derive_genesis(&[50u8; 32]);
-        let chain = Arc::new(RwLock::new(lagoon_vdf::VdfChain::new(genesis)));
+        let genesis = derive_genesis();
+        let chain_seed = derive_chain_seed(&genesis, &[50u8; 32]);
+        let chain = Arc::new(RwLock::new(lagoon_vdf::VdfChain::new(chain_seed)));
         let restored = 1000;
         let (state_tx, mut state_rx) = watch::channel(VdfState {
             genesis,
-            current_hash: genesis,
+            current_hash: chain_seed,
             session_steps: 0,
             total_steps: restored,
             resonance: None,
@@ -331,11 +352,12 @@ mod tests {
 
     #[tokio::test]
     async fn vdf_engine_produces_resonance_metrics() {
-        let genesis = derive_genesis(&[77u8; 32]);
-        let chain = Arc::new(RwLock::new(lagoon_vdf::VdfChain::new(genesis)));
+        let genesis = derive_genesis();
+        let chain_seed = derive_chain_seed(&genesis, &[77u8; 32]);
+        let chain = Arc::new(RwLock::new(lagoon_vdf::VdfChain::new(chain_seed)));
         let (state_tx, mut state_rx) = watch::channel(VdfState {
             genesis,
-            current_hash: genesis,
+            current_hash: chain_seed,
             session_steps: 0,
             total_steps: 0,
             resonance: None,
