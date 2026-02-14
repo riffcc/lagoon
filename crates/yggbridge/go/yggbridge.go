@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"runtime"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -21,6 +22,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -43,6 +45,17 @@ import (
 )
 
 // ── Global registries ────────────────────────────────────────────────
+
+func init() {
+	// Embedded in a Rust process — Go GC doesn't see the full picture.
+	// GOGC=50 means GC triggers at 50% heap growth (default 100%).
+	// Also cap soft memory limit to 64MB to prevent runaway growth.
+	debug.SetGCPercent(50)
+	debug.SetMemoryLimit(64 * 1024 * 1024)
+	// Cap Go's P count (active goroutine execution slots).
+	// We're embedded — the Rust binary owns the CPU budget.
+	runtime.GOMAXPROCS(2)
+}
 
 var (
 	nodeCounter     atomic.Uintptr
@@ -70,6 +83,7 @@ type yggNIC struct {
 	readBuf    []byte
 	writeBuf   []byte
 	rstPackets chan *stack.PacketBuffer
+	closeOnce  sync.Once
 }
 
 func (e *yggNIC) Attach(dispatcher stack.NetworkDispatcher) { e.dispatcher = dispatcher }
@@ -112,7 +126,11 @@ func (e *yggNIC) WritePackets(list stack.PacketBufferList) (int, tcpip.Error) {
 			if pkt.Network().TransportProtocol() == tcp.ProtocolNumber {
 				tcpHdr := header.TCP(pkt.TransportHeader().Slice())
 				if (tcpHdr.Flags() & header.TCPFlagRst) == header.TCPFlagRst {
-					e.rstPackets <- pkt
+					// Safe send: channel may be closed during shutdown.
+					func() {
+						defer func() { recover() }()
+						e.rstPackets <- pkt
+					}()
 					count++
 					continue
 				}
@@ -127,7 +145,10 @@ func (e *yggNIC) WritePackets(list stack.PacketBufferList) (int, tcpip.Error) {
 }
 
 func (e *yggNIC) Close() {
-	e.dispatcher = nil
+	e.closeOnce.Do(func() {
+		e.dispatcher = nil
+		close(e.rstPackets)
+	})
 }
 
 // createNetstack builds a gVisor TCP/IP stack wired to the Yggdrasil
@@ -221,6 +242,9 @@ func createNetstack(yggCore *core.Core) (*stack.Stack, *yggNIC, error) {
 // bridgeConn creates a Unix socketpair, spawns goroutines to pump data
 // between a net.Conn and one end, and returns the other end's raw FD
 // for Rust to use.
+//
+// When either io.Copy finishes (EOF, error, or Rust dropping the stream),
+// both sides are closed immediately so the other goroutine unblocks.
 func bridgeConn(conn net.Conn) (int, error) {
 	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
 	if err != nil {
@@ -237,15 +261,23 @@ func bridgeConn(conn net.Conn) (int, error) {
 		return -1, fmt.Errorf("FileConn: %w", err)
 	}
 
+	// closeAll ensures both sides shut down exactly once,
+	// unblocking whichever goroutine is still in io.Copy.
+	var once sync.Once
+	closeAll := func() {
+		once.Do(func() {
+			conn.Close()
+			goConn.Close()
+		})
+	}
+
 	go func() {
 		io.Copy(conn, goConn)
-		conn.Close()
-		goConn.Close()
+		closeAll()
 	}()
 	go func() {
 		io.Copy(goConn, conn)
-		conn.Close()
-		goConn.Close()
+		closeAll()
 	}()
 
 	return fds[1], nil
@@ -417,7 +449,11 @@ func (e *nodeEntry) dialTCP(address string) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return gonet.DialContextTCP(context.Background(), e.stack, fa, pn)
+	// 10-second timeout prevents indefinite thread pinning when the
+	// Ygg overlay can't route to the target (common during bootstrap).
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return gonet.DialContextTCP(ctx, e.stack, fa, pn)
 }
 
 func convertToFullAddr(ip net.IP, port int) (tcpip.FullAddress, tcpip.NetworkProtocolNumber, error) {
@@ -579,6 +615,11 @@ func ygg_shutdown(handle C.uintptr_t) {
 	entry.core.Stop()
 	entry.cancel()
 	fmt.Fprintf(os.Stderr, "[yggbridge] node %d shut down\n", handle)
+}
+
+//export ygg_goroutine_count
+func ygg_goroutine_count() C.int {
+	return C.int(runtime.NumGoroutine())
 }
 
 //export ygg_free

@@ -32,5 +32,6 @@ unsafe extern "C" {
     pub fn ygg_remove_peer(handle: usize, uri: *const c_char) -> c_int;
 
     pub fn ygg_shutdown(handle: usize);
+    pub fn ygg_goroutine_count() -> c_int;
     pub fn ygg_free(ptr: *mut c_char);
 }

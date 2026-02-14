@@ -196,6 +196,12 @@ impl Drop for YggNode {
     }
 }
 
+/// Number of goroutines in the embedded Go runtime.
+/// Useful for diagnosing goroutine leaks in the yggbridge layer.
+pub fn goroutine_count() -> i32 {
+    unsafe { ffi::ygg_goroutine_count() }
+}
+
 // ── YggListener ─────────────────────────────────────────────────────
 
 impl YggListener {
