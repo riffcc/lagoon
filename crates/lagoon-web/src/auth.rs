@@ -15,6 +15,107 @@ use lagoon_server::irc::profile::UserProfile;
 
 use crate::state::{AppState, User};
 
+// ── Stateless challenge envelope ────────────────────────────────────
+
+/// Signed envelope carrying WebAuthn challenge state.
+///
+/// Instead of storing challenge state server-side (which breaks under anycast),
+/// we serialize the state, sign it with BLAKE3 keyed hash using the VDF genesis
+/// as key, and return it to the client as an opaque base64 blob. The client
+/// sends it back with the credential. Any mesh node sharing the same VDF genesis
+/// can verify the signature and extract the state — fully stateless.
+#[derive(Serialize, Deserialize)]
+struct ChallengeEnvelope {
+    /// Serialized PasskeyRegistration or PasskeyAuthentication JSON.
+    state: String,
+    /// Unix timestamp (seconds) when the challenge was created.
+    timestamp: u64,
+    /// BLAKE3 keyed hash: blake3::keyed_hash(genesis, state || timestamp_bytes).
+    mac: String,
+}
+
+/// Maximum age of a challenge envelope before it's rejected (5 minutes).
+const CHALLENGE_MAX_AGE_SECS: u64 = 300;
+
+/// Get the VDF genesis hash (32 bytes) for challenge signing.
+/// Returns None if no embedded IRC or VDF hasn't started yet.
+async fn get_signing_key_async(state: &AppState) -> Option<[u8; 32]> {
+    let irc = state.irc_state.as_ref()?;
+    let st = irc.read().await;
+    st.mesh.vdf_state_rx.as_ref().map(|rx| rx.borrow().genesis)
+}
+
+/// Compute BLAKE3 keyed MAC over state + timestamp.
+fn compute_mac(key: &[u8; 32], state_json: &str, timestamp: u64) -> String {
+    let mut input = state_json.as_bytes().to_vec();
+    input.extend_from_slice(&timestamp.to_le_bytes());
+    let hash = blake3::keyed_hash(key, &input);
+    hex::encode(hash.as_bytes())
+}
+
+/// Create a signed challenge envelope from serialized WebAuthn state.
+fn seal_envelope(key: &[u8; 32], state_json: &str) -> Result<String, (StatusCode, String)> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mac = compute_mac(key, state_json, timestamp);
+    let envelope = ChallengeEnvelope {
+        state: state_json.to_string(),
+        timestamp,
+        mac,
+    };
+
+    let json = serde_json::to_string(&envelope)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Envelope serialize: {e}")))?;
+
+    use base64::Engine as _;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json.as_bytes()))
+}
+
+/// Verify and extract challenge state from a signed envelope.
+fn open_envelope(key: &[u8; 32], envelope_b64: &str) -> Result<String, (StatusCode, String)> {
+    use base64::Engine as _;
+    let json_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(envelope_b64)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid challenge_state encoding".into()))?;
+
+    let envelope: ChallengeEnvelope = serde_json::from_slice(&json_bytes)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "Invalid challenge_state format".into()))?;
+
+    // Verify MAC.
+    let expected_mac = compute_mac(key, &envelope.state, envelope.timestamp);
+    if !constant_time_eq(expected_mac.as_bytes(), envelope.mac.as_bytes()) {
+        return Err((StatusCode::BAD_REQUEST, "Challenge signature invalid".into()));
+    }
+
+    // Verify timestamp freshness.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now.saturating_sub(envelope.timestamp) > CHALLENGE_MAX_AGE_SECS {
+        return Err((StatusCode::BAD_REQUEST, "Challenge expired".into()));
+    }
+
+    Ok(envelope.state)
+}
+
+/// Constant-time comparison to prevent timing attacks on MAC verification.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
 /// Extract the origin URL from request headers for WebAuthn auto-detection.
 /// Prefers the `Origin` header (set by browsers on POST), falls back to `Host`.
 fn extract_origin(headers: &HeaderMap) -> Result<String, (StatusCode, String)> {
@@ -69,68 +170,6 @@ async fn cache_profile_locally(state: &AppState, profile: &UserProfile) {
         .insert(profile.username.clone(), user);
 }
 
-/// Store a registration challenge and broadcast it to cluster peers.
-/// If embedded IRC is available, stores in ServerState (mesh-accessible).
-/// Otherwise falls back to AppState local HashMap (standalone mode).
-async fn store_reg_challenge(state: &AppState, username: &str, json: &str) {
-    if let Some(irc) = state.irc_state.as_ref() {
-        let mut st = irc.write().await;
-        st.reg_challenges.insert(username.to_string(), json.to_string());
-        lagoon_server::irc::federation::broadcast_challenge_to_cluster(
-            &st,
-            lagoon_server::irc::wire::MeshMessage::RegChallenge {
-                username: username.to_string(),
-                state: json.to_string(),
-            },
-        );
-    } else {
-        state
-            .reg_challenges
-            .write()
-            .await
-            .insert(username.to_string(), json.to_string());
-    }
-}
-
-/// Store an auth challenge and broadcast it to cluster peers.
-async fn store_auth_challenge(state: &AppState, username: &str, json: &str) {
-    if let Some(irc) = state.irc_state.as_ref() {
-        let mut st = irc.write().await;
-        st.auth_challenges.insert(username.to_string(), json.to_string());
-        lagoon_server::irc::federation::broadcast_challenge_to_cluster(
-            &st,
-            lagoon_server::irc::wire::MeshMessage::AuthChallenge {
-                username: username.to_string(),
-                state: json.to_string(),
-            },
-        );
-    } else {
-        state
-            .auth_challenges
-            .write()
-            .await
-            .insert(username.to_string(), json.to_string());
-    }
-}
-
-/// Look up and consume a registration challenge (removes from store).
-async fn take_reg_challenge(state: &AppState, username: &str) -> Option<String> {
-    if let Some(irc) = state.irc_state.as_ref() {
-        irc.write().await.reg_challenges.remove(username)
-    } else {
-        state.reg_challenges.write().await.remove(username)
-    }
-}
-
-/// Look up and consume an auth challenge (removes from store).
-async fn take_auth_challenge(state: &AppState, username: &str) -> Option<String> {
-    if let Some(irc) = state.irc_state.as_ref() {
-        irc.write().await.auth_challenges.remove(username)
-    } else {
-        state.auth_challenges.write().await.remove(username)
-    }
-}
-
 #[derive(Deserialize)]
 pub struct RegisterBeginRequest {
     pub username: String,
@@ -139,6 +178,8 @@ pub struct RegisterBeginRequest {
 #[derive(Serialize)]
 pub struct RegisterBeginResponse {
     pub options: CreationChallengeResponse,
+    /// Opaque signed envelope — client must send this back in the complete request.
+    pub challenge_state: String,
 }
 
 /// Begin passkey registration — returns a challenge for the browser.
@@ -192,16 +233,20 @@ pub async fn register_begin(
     let reg_state_json = serde_json::to_string(&reg_state)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialize state: {e}")))?;
 
-    // Store locally + broadcast to cluster — any node can now complete this ceremony.
-    store_reg_challenge(&state, &username, &reg_state_json).await;
+    // Seal the registration state into a signed envelope — stateless, any node can verify.
+    let key = get_signing_key_async(&state).await
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "VDF not ready — cannot sign challenge".into()))?;
+    let challenge_state = seal_envelope(&key, &reg_state_json)?;
 
-    Ok(Json(RegisterBeginResponse { options: challenge }))
+    Ok(Json(RegisterBeginResponse { options: challenge, challenge_state }))
 }
 
 #[derive(Deserialize)]
 pub struct RegisterCompleteRequest {
     pub username: String,
     pub credential: RegisterPublicKeyCredential,
+    /// Opaque signed envelope from register_begin.
+    pub challenge_state: String,
 }
 
 #[derive(Serialize)]
@@ -224,9 +269,10 @@ pub async fn register_complete(
 
     let username = req.username.trim().to_string();
 
-    let reg_state_json = take_reg_challenge(&state, &username)
-        .await
-        .ok_or((StatusCode::BAD_REQUEST, "No pending registration challenge for this user".into()))?;
+    // Open the signed envelope — verifies MAC + freshness. Any mesh node can do this.
+    let key = get_signing_key_async(&state).await
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "VDF not ready — cannot verify challenge".into()))?;
+    let reg_state_json = open_envelope(&key, &req.challenge_state)?;
 
     let reg_state: PasskeyRegistration = serde_json::from_str(&reg_state_json)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid registration state: {e}")))?;
@@ -292,6 +338,8 @@ pub struct LoginBeginRequest {
 #[derive(Serialize)]
 pub struct LoginBeginResponse {
     pub options: RequestChallengeResponse,
+    /// Opaque signed envelope — client must send this back in the complete request.
+    pub challenge_state: String,
 }
 
 /// Begin passkey authentication — returns a challenge.
@@ -313,6 +361,9 @@ pub async fn login_begin(
 
     let username = req.username.trim().to_string();
 
+    let key = get_signing_key_async(&state).await
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "VDF not ready — cannot sign challenge".into()))?;
+
     // 1. Check local hot cache — fastest path.
     {
         let users = state.users.read().await;
@@ -328,8 +379,8 @@ pub async fn login_begin(
             drop(users);
             let state_json = serde_json::to_string(&auth_state)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialize state: {e}")))?;
-            store_auth_challenge(&state, &username, &state_json).await;
-            return Ok(Json(LoginBeginResponse { options: challenge }));
+            let challenge_state = seal_envelope(&key, &state_json)?;
+            return Ok(Json(LoginBeginResponse { options: challenge, challenge_state }));
         }
     }
 
@@ -353,8 +404,8 @@ pub async fn login_begin(
                     })?;
                 let state_json = serde_json::to_string(&auth_state)
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialize state: {e}")))?;
-                store_auth_challenge(&state, &username, &state_json).await;
-                return Ok(Json(LoginBeginResponse { options: challenge }));
+                let challenge_state = seal_envelope(&key, &state_json)?;
+                return Ok(Json(LoginBeginResponse { options: challenge, challenge_state }));
             }
         }
 
@@ -387,8 +438,8 @@ pub async fn login_begin(
                     })?;
                 let state_json = serde_json::to_string(&auth_state)
                     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Serialize state: {e}")))?;
-                store_auth_challenge(&state, &username, &state_json).await;
-                return Ok(Json(LoginBeginResponse { options: challenge }));
+                let challenge_state = seal_envelope(&key, &state_json)?;
+                return Ok(Json(LoginBeginResponse { options: challenge, challenge_state }));
             }
             _ => {
                 return Err((StatusCode::NOT_FOUND, "User not found".into()));
@@ -404,6 +455,8 @@ pub async fn login_begin(
 pub struct LoginCompleteRequest {
     pub username: String,
     pub credential: PublicKeyCredential,
+    /// Opaque signed envelope from login_begin.
+    pub challenge_state: String,
 }
 
 /// Complete passkey authentication — verify and issue session.
@@ -420,9 +473,10 @@ pub async fn login_complete(
 
     let username = req.username.trim().to_string();
 
-    let auth_state_json = take_auth_challenge(&state, &username)
-        .await
-        .ok_or((StatusCode::BAD_REQUEST, "No pending authentication challenge for this user".into()))?;
+    // Open the signed envelope — verifies MAC + freshness. Any mesh node can do this.
+    let key = get_signing_key_async(&state).await
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "VDF not ready — cannot verify challenge".into()))?;
+    let auth_state_json = open_envelope(&key, &req.challenge_state)?;
 
     let auth_state: PasskeyAuthentication = serde_json::from_str(&auth_state_json)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid authentication state: {e}")))?;

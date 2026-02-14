@@ -50,7 +50,8 @@ async function register() {
       error.value = await beginRes.text()
       return
     }
-    const { options } = await beginRes.json()
+    const beginData = await beginRes.json()
+    const { options, challenge_state } = beginData
 
     // webauthn-rs wraps in { publicKey: ... }, simplewebauthn wants the inner object.
     const optionsJSON = options.publicKey || options
@@ -62,6 +63,7 @@ async function register() {
       body: JSON.stringify({
         username: username.value.trim(),
         credential,
+        challenge_state,
       }),
     })
     if (!completeRes.ok) {
@@ -92,9 +94,10 @@ async function login() {
       error.value = await beginRes.text()
       return
     }
-    const { options } = await beginRes.json()
+    const loginData = await beginRes.json()
+    const { options: loginOptions, challenge_state: loginChallengeState } = loginData
 
-    const optionsJSON = options.publicKey || options
+    const optionsJSON = loginOptions.publicKey || loginOptions
     const credential = await startAuthentication({ optionsJSON })
 
     const completeRes = await fetch(api('/api/auth/login/complete'), {
@@ -103,6 +106,7 @@ async function login() {
       body: JSON.stringify({
         username: username.value.trim(),
         credential,
+        challenge_state: loginChallengeState,
       }),
     })
     if (!completeRes.ok) {
