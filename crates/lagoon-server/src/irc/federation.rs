@@ -55,7 +55,7 @@ pub fn ape_peer_uri(
 /// Ygg overlay addresses start with 02xx or 03xx (200:/300: in IPv6 notation).
 /// Peering with an overlay address tunnels Ygg through Ygg — double
 /// encapsulation, 1s+ latency, dies when the underlying path changes.
-fn is_underlay_uri(uri: &str) -> bool {
+pub fn is_underlay_uri(uri: &str) -> bool {
     // Extract the address from tcp://[addr]:port format.
     if let Some(start) = uri.find('[') {
         if let Some(end) = uri.find(']') {
@@ -5708,5 +5708,62 @@ mod tests {
         assert!(!is_relay_nick("zorlin"));
         assert!(!is_relay_nick("relay_bot"));
         assert!(!is_relay_nick("LagoonBot"));
+    }
+
+    // ── Ygg underlay/overlay address validation ─────────────────────────
+
+    #[test]
+    fn is_underlay_uri_accepts_fly_6pn() {
+        // Fly.io 6PN addresses (fdaa::/32) are ULA — real underlay.
+        assert!(is_underlay_uri("tcp://[fdaa:47:35ee:a7b:16a:7de5:43b9:2]:9443"));
+    }
+
+    #[test]
+    fn is_underlay_uri_accepts_lan_ipv4() {
+        assert!(is_underlay_uri("tcp://10.7.1.37:9443"));
+    }
+
+    #[test]
+    fn is_underlay_uri_accepts_ula() {
+        // fd00::/8 — private IPv6.
+        assert!(is_underlay_uri("tcp://[fd00::1]:9443"));
+    }
+
+    #[test]
+    fn is_underlay_uri_rejects_ygg_200() {
+        // 200: addresses = Ygg overlay. NEVER peer with these.
+        assert!(!is_underlay_uri("tcp://[200:ee10:28e8:6927:2f00:87fc:2e81:3be7]:9443"));
+    }
+
+    #[test]
+    fn is_underlay_uri_rejects_ygg_201() {
+        assert!(!is_underlay_uri("tcp://[201:6456:33da:ad57:e160:97a0:80e8:1a0e]:9443"));
+    }
+
+    #[test]
+    fn is_underlay_uri_rejects_ygg_300() {
+        // 300: addresses = Ygg subnet overlay.
+        assert!(!is_underlay_uri("tcp://[300:ee10:28e8:6927::1]:9443"));
+    }
+
+    #[test]
+    fn is_underlay_uri_accepts_global_unicast() {
+        // 2001:db8:: = documentation prefix, but any non-02/03 global is fine.
+        assert!(is_underlay_uri("tcp://[2001:db8::1]:9443"));
+    }
+
+    #[test]
+    fn ape_peer_uri_uses_relay_addr() {
+        let addr: SocketAddr = "[fdaa:47:35ee:a7b:16a:7de5:43b9:2]:9443".parse().unwrap();
+        let uri = ape_peer_uri(Some(addr));
+        assert_eq!(uri, Some("tcp://[fdaa:47:35ee:a7b:16a:7de5:43b9:2]:9443".into()));
+        // Verify it's underlay.
+        assert!(is_underlay_uri(uri.as_ref().unwrap()));
+    }
+
+    #[test]
+    fn ape_peer_uri_returns_none_without_relay() {
+        // No relay_peer_addr = no peering. Never fall back to overlay.
+        assert_eq!(ape_peer_uri(None), None);
     }
 }

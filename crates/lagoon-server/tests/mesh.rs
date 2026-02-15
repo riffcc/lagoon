@@ -1410,49 +1410,34 @@ fn dispatch_wire_round_trip_peers() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn ape_peer_uri_prefers_underlay() {
-    // Relay TCP peer address (underlay) should be preferred over overlay.
+fn ape_peer_uri_ipv4_underlay() {
+    // Relay TCP peer address (underlay) → underlay URI.
     let peer_addr: SocketAddr = "10.7.1.37:6667".parse().unwrap();
-    let overlay_uri = "tcp://[200:1234::1]:9443";
-    let result = ape_peer_uri(Some(peer_addr), Some(overlay_uri));
+    let result = ape_peer_uri(Some(peer_addr));
     assert_eq!(result.unwrap(), "tcp://[10.7.1.37]:9443");
 }
 
 #[test]
 fn ape_peer_uri_ipv6_underlay() {
-    // IPv6 underlay address (e.g. Fly 6PN fdaa: or public 2605:).
+    // IPv6 underlay address (e.g. Fly 6PN fdaa:).
     let peer_addr: SocketAddr = "[fdaa:0:dead:a7b:66:2:9b55:2]:6667".parse().unwrap();
-    let result = ape_peer_uri(Some(peer_addr), Some("tcp://[200:1234::1]:9443"));
+    let result = ape_peer_uri(Some(peer_addr));
     assert_eq!(result.unwrap(), "tcp://[fdaa:0:dead:a7b:66:2:9b55:2]:9443");
 }
 
 #[test]
-fn ape_peer_uri_falls_back_to_overlay() {
-    // No relay TCP address → use ygg_peer_uri from MESH HELLO.
-    let result = ape_peer_uri(None, Some("tcp://[200:1234::1]:9443"));
-    assert_eq!(result.unwrap(), "tcp://[200:1234::1]:9443");
-}
-
-#[test]
-fn ape_peer_uri_none_when_neither() {
-    // No relay address and no ygg_peer_uri → None.
-    let result = ape_peer_uri(None, None);
+fn ape_peer_uri_never_falls_back_to_overlay() {
+    // No relay TCP address → None. NEVER fall back to overlay addresses.
+    // This prevents Ygg-over-Ygg tunneling (double encapsulation, 1s+ latency).
+    let result = ape_peer_uri(None);
     assert!(result.is_none());
-}
-
-#[test]
-fn ape_peer_uri_underlay_with_no_overlay() {
-    // Relay address exists but no ygg_peer_uri → use underlay.
-    let peer_addr: SocketAddr = "192.168.1.50:6667".parse().unwrap();
-    let result = ape_peer_uri(Some(peer_addr), None);
-    assert_eq!(result.unwrap(), "tcp://[192.168.1.50]:9443");
 }
 
 #[test]
 fn ape_peer_uri_always_port_9443() {
     // Regardless of the relay's port, APE URI always uses 9443 (Ygg listen port).
     let peer_addr: SocketAddr = "10.0.0.1:443".parse().unwrap();
-    let result = ape_peer_uri(Some(peer_addr), None);
+    let result = ape_peer_uri(Some(peer_addr));
     assert_eq!(result.unwrap(), "tcp://[10.0.0.1]:9443");
 }
 
