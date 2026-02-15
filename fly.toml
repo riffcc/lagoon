@@ -11,9 +11,9 @@ primary_region = 'lhr'
   LAGOON_DATA_DIR = '/data'
   SERVER_NAME = 'lagun.co'
   LAGOON_FULL_TELEMETRY = '1'
-  RUST_LOG = 'info,lagoon_server::irc::federation=debug,lagoon_server::irc::transport=debug'
-  LAGOON_URL = 'anycast-mesh.fly.dev:443'
-  LAGOON_PEERS = '66.241.125.195:9443'
+  RUST_LOG = 'info,lagoon_server::irc::federation=debug,lagoon_server::irc::transport=debug,lagoon_server::irc::switchboard=debug'
+  LAGOON_URL = 'fly.lagun.co:9443'
+  LAGOON_PEERS = 'fly.lagun.co:9443'
 
 [http_service]
   internal_port = 8080
@@ -22,9 +22,11 @@ primary_region = 'lhr'
   auto_stop_machines = 'stop'
   min_machines_running = 3
 
+# Switchboard — raw TCP, bypasses Fly's HTTP proxy.
+# Mesh federation dials this port for bootstrap + half-dial routing.
 [[services]]
   internal_port = 9443
-  protocol = 'tcp'
+  protocol = "tcp"
 
   [[services.ports]]
     port = 9443

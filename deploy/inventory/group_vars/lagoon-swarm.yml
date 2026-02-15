@@ -1,0 +1,2 @@
+lagoon_peers: "lon.lagun.co:9443"
+rust_log: info
