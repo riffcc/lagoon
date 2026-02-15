@@ -134,17 +134,35 @@ pub fn dispatch_mesh_message(
             None
         }
         MeshMessage::VdfProofReq => {
+            // Legacy: old nodes send this. Respond with a window proof instead.
             let _ = event_tx.send(RelayEvent::MeshVdfProofReq {
                 remote_host: remote_host.to_string(),
             });
             None
         }
         MeshMessage::VdfProof { proof } => {
+            // Legacy: old nodes send full-chain proofs. Still accepted.
             let _ = event_tx.send(RelayEvent::MeshVdfProof {
                 remote_host: remote_host.to_string(),
                 proof_json: proof.to_string(),
                 mesh_key: remote_mesh_key.clone(),
             });
+            None
+        }
+        MeshMessage::VdfWindow { data } => {
+            tracing::debug!(
+                remote_host,
+                mesh_key = ?remote_mesh_key,
+                data_len = data.len(),
+                "dispatch: received VdfWindow"
+            );
+            if let Err(e) = event_tx.send(RelayEvent::MeshVdfWindow {
+                remote_host: remote_host.to_string(),
+                data,
+                mesh_key: remote_mesh_key.clone(),
+            }) {
+                tracing::error!("dispatch: event_tx.send(MeshVdfWindow) FAILED — event loop dead? err={e}");
+            }
             None
         }
         MeshMessage::Sync => {
@@ -231,6 +249,20 @@ pub fn dispatch_mesh_message(
             });
             None
         }
+        MeshMessage::LivenessHave { data } => {
+            let _ = event_tx.send(RelayEvent::LivenessHave {
+                remote_host: remote_host.to_string(),
+                payload_b64: data,
+            });
+            None
+        }
+        MeshMessage::LivenessDelta { data } => {
+            let _ = event_tx.send(RelayEvent::LivenessDelta {
+                remote_host: remote_host.to_string(),
+                payload_b64: data,
+            });
+            None
+        }
         MeshMessage::SocketMigrate { migration, client_peer_id } => {
             let _ = event_tx.send(RelayEvent::SocketMigrate {
                 remote_host: remote_host.to_string(),
@@ -298,7 +330,12 @@ fn prune_non_spiral_relays(st: &mut super::server::ServerState) {
             if handle.is_bootstrap {
                 return false;
             }
-            // Relay key IS the peer_id — direct SPIRAL neighbor check.
+            // Don't prune peers still bootstrapping (no SPIRAL slot yet).
+            // They need this relay to receive their slot assignment.
+            if !st.mesh.spiral.has_slot(peer_id) {
+                return false;
+            }
+            // Peer HAS a slot — check if it's our neighbor.
             let is_neighbor = st.mesh.spiral.is_neighbor(peer_id);
             if !is_neighbor {
                 info!(
@@ -703,6 +740,12 @@ pub enum RelayEvent {
         /// Mesh key from HELLO — O(1) lookup into known_peers.
         mesh_key: Option<String>,
     },
+    /// Received VDF window proof — push-based sequential computation proof.
+    MeshVdfWindow {
+        remote_host: String,
+        data: String,
+        mesh_key: Option<String>,
+    },
     /// Received MESH SYNC — a peer wants our full peer table.
     MeshSync {
         remote_host: String,
@@ -778,6 +821,16 @@ pub enum RelayEvent {
     },
     /// Received CONNECTION_DELTA — connection snapshots we're missing.
     ConnectionDelta {
+        remote_host: String,
+        payload_b64: String,
+    },
+    /// Received LIVENESS_HAVE — remote peer's liveness attestation SPORE.
+    LivenessHave {
+        remote_host: String,
+        payload_b64: String,
+    },
+    /// Received LIVENESS_DELTA — liveness attestations we're missing.
+    LivenessDelta {
         remote_host: String,
         payload_b64: String,
     },
@@ -876,7 +929,9 @@ pub fn spawn_event_processor(
     state: SharedState,
     mut event_rx: mpsc::UnboundedReceiver<RelayEvent>,
 ) {
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
+        info!("federation event loop: starting");
+
         // Get a reference to the embedded Ygg node for metrics queries.
         let ygg_node = {
             let st = state.read().await;
@@ -908,17 +963,18 @@ pub fn spawn_event_processor(
             st.mesh.cvdf_service = Some(svc);
         }
 
-        // VDF liveness: challenge SPIRAL neighbors every 5 seconds.
-        // Responses update last_vdf_advance; peers that stop responding
-        // get evicted by the VDF_DEAD_SECS sweep below.
-        let mut vdf_challenge_interval = tokio::time::interval(
-            std::time::Duration::from_secs(5),
+        // VDF liveness: broadcast window proof to SPIRAL neighbors every 3s.
+        // Push-based: no challenge-response. Each proof covers ~30 VDF steps
+        // (3s at 10 Hz) and is verified by neighbors for chain continuity.
+        // Replaces the old 5s challenge-response VdfProofReq/VdfProof cycle.
+        let mut vdf_window_interval = tokio::time::interval(
+            std::time::Duration::from_secs(3),
         );
-        vdf_challenge_interval.set_missed_tick_behavior(
+        vdf_window_interval.set_missed_tick_behavior(
             tokio::time::MissedTickBehavior::Skip,
         );
-        // Skip the first immediate tick.
-        vdf_challenge_interval.tick().await;
+        // Skip the first immediate tick — need chain steps to accumulate.
+        vdf_window_interval.tick().await;
 
         // Bootstrap retry: if we have no real connections, periodically
         // re-attempt LAGOON_PEERS. Stops trying once real connections exist.
@@ -1160,7 +1216,8 @@ pub fn spawn_event_processor(
                         reconverge_spiral(&mut st, state.clone());
                         let neighbors = st.mesh.spiral.neighbors().clone();
                         st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
-                        st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
+                        st.mesh.connection_gossip.set_spiral_neighbors(neighbors.clone());
+                        st.mesh.liveness_gossip.set_spiral_neighbors(neighbors);
                         dial_missing_spiral_neighbors(&mut st, state.clone());
                         publish_connection_snapshot(&mut st);
                         st.notify_topology_change();
@@ -1501,7 +1558,8 @@ pub fn spawn_event_processor(
                             // with fresh topology from this HELLO.
                             let neighbors = st.mesh.spiral.neighbors().clone();
                             st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
-                            st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
+                            st.mesh.connection_gossip.set_spiral_neighbors(neighbors.clone());
+                            st.mesh.liveness_gossip.set_spiral_neighbors(neighbors);
                             dial_missing_spiral_neighbors(&mut st, state.clone());
                             publish_connection_snapshot(&mut st);
                             st.notify_topology_change();
@@ -1717,6 +1775,23 @@ pub fn spawn_event_processor(
                         }
                     }
 
+                    // Send LIVENESS_HAVE — our liveness bitmap SPORE.
+                    {
+                        let spore_bytes = bincode::serialize(
+                            st.mesh.liveness_bitmap.spore(),
+                        ).unwrap_or_default();
+                        let sync_msg = super::liveness_gossip::SyncMessage::HaveList {
+                            spore_bytes,
+                        };
+                        let b64 = base64::engine::general_purpose::STANDARD
+                            .encode(bincode::serialize(&sync_msg).unwrap_or_default());
+                        if let Some(relay) = st.federation.relays.get(&remote_host) {
+                            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                MeshMessage::LivenessHave { data: b64 },
+                            ));
+                        }
+                    }
+
                     // SPORE gossip catch-up: send our HaveList so the peer can
                     // diff and send us anything we missed while disconnected.
                     if super::gossip::is_cluster_peer(&SITE_NAME, &site_name) {
@@ -1750,17 +1825,47 @@ pub fn spawn_event_processor(
                         }
                     }
 
-                    // Immediate VDF challenge: demand proof of work from the
-                    // new peer.  This starts the liveness clock — if they don't
-                    // respond with a VDF proof, last_vdf_advance won't advance
-                    // and the periodic sweep will evict them.
-                    if let Some(relay) = st.federation.relays.get(&remote_host) {
-                        let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
-                            MeshMessage::VdfProofReq,
-                        ));
-                    }
+                    // VDF liveness is now push-based: the 3s window proof
+                    // broadcast handles liveness.  No immediate challenge needed.
+                    // The peer's first window proof will update last_vdf_advance.
 
                     } // end first_hello gate
+
+                    // ── Concierge fallback ──────────────────────────────
+                    // The first_hello gate blocks response Hellos on re-contact.
+                    // But the concierge MUST send assigned_slot even on
+                    // subsequent Hellos — e.g. when an outbound relay's
+                    // mesh_connected=true suppressed the ceremony and the
+                    // remote is still unclaimed.  No PEERS/SPORE/gossip here,
+                    // just the bare concierge Hello.
+                    if !first_hello
+                        && !spiral_changed
+                        && spiral_index.is_none()
+                        && st.mesh.spiral.is_claimed()
+                    {
+                        if let Some(slot) = compute_concierge_slot(&mut st) {
+                            let mut our_hello = build_wire_hello(&mut st);
+                            our_hello.assigned_slot = Some(slot);
+                            st.mesh.spiral.add_peer(
+                                &mkey,
+                                citadel_topology::Spiral3DIndex::new(slot),
+                            );
+                            if let Some(peer) = st.mesh.known_peers.get_mut(&mkey) {
+                                peer.spiral_index = Some(slot);
+                            }
+                            st.mesh.pending_assigned_slots.remove(&slot);
+                            if let Some(relay) = st.federation.relays.get(&remote_host) {
+                                let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                    MeshMessage::Hello(our_hello),
+                                ));
+                            }
+                            info!(
+                                slot,
+                                remote = %mkey,
+                                "SPIRAL concierge: assigned slot on re-hello (fallback)"
+                            );
+                        }
+                    }
 
                     // Dedup is automatic: relays are keyed by peer_id. If both an
                     // inbound and outbound connection exist to the same peer, the
@@ -2124,75 +2229,132 @@ pub fn spawn_event_processor(
                 }
 
                 RelayEvent::MeshVdfProofReq { remote_host } => {
-                    // A peer wants us to prove our VDF chain.
-                    let st = state.read().await;
-                    if let Some(ref chain) = st.mesh.vdf_chain {
-                        let c = chain.read().await;
-                        if c.steps() > 0 {
-                            let spiral_slot = st.lens.spiral_index;
-                            let proof =
-                                lagoon_vdf::VdfProof::generate_with_slot(&c, 3, spiral_slot);
-                            drop(c);
-                            if let Ok(proof_val) = serde_json::to_value(&proof) {
-                                if let Some(relay) = st.federation.relays.get(&remote_host) {
-                                    let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
-                                        MeshMessage::VdfProof { proof: proof_val },
-                                    ));
-                                    info!(
-                                        remote_host,
-                                        steps = proof.steps,
-                                        spiral_slot = ?spiral_slot,
-                                        "mesh: sent VDF proof with SPIRAL slot"
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    // Legacy: old peers may still send VdfProofReq.
+                    // Ignore — window proofs replaced challenge-response.
+                    tracing::debug!(remote_host, "mesh: ignoring legacy VdfProofReq (use window proofs)");
                 }
 
                 RelayEvent::MeshVdfProof {
                     remote_host,
-                    proof_json,
+                    proof_json: _,
+                    mesh_key: _,
+                } => {
+                    // Legacy: old peers may still send VdfProof.
+                    // Ignore — window proofs replaced challenge-response.
+                    tracing::debug!(remote_host, "mesh: ignoring legacy VdfProof (use window proofs)");
+                }
+
+                RelayEvent::MeshVdfWindow {
+                    remote_host,
+                    data,
                     mesh_key,
                 } => {
-                    match serde_json::from_str::<lagoon_vdf::VdfProof>(&proof_json) {
-                        Ok(proof) => {
-                            if proof.verify() {
-                                // VDF proof verified = this peer is alive and doing work.
-                                // Update vdf_step — VDF IS the heartbeat.
-                                // A verified proof IS proof of liveness. Always
-                                // update last_vdf_advance — even if the step
-                                // hasn't changed (gossip can race with proofs,
-                                // setting vdf_step to the same value the proof
-                                // carries, causing the old `old_step != new`
-                                // check to skip the timestamp update).
-                                if let Some(ref mkey) = mesh_key {
-                                    let mut st = state.write().await;
-                                    if let Some(peer) = st.mesh.known_peers.get_mut(mkey) {
-                                        let now = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_secs();
-                                        let old_step = peer.vdf_step;
-                                        if old_step != Some(proof.steps) {
-                                            peer.prev_vdf_step = old_step;
-                                        }
-                                        peer.vdf_step = Some(proof.steps);
-                                        peer.last_vdf_advance = now;
-                                    }
-                                }
+                    info!(
+                        remote_host,
+                        mesh_key = ?mesh_key,
+                        data_len = data.len(),
+                        "event: MeshVdfWindow handler entered"
+                    );
+
+                    // Decode: base64 → bincode → VdfWindowProof.
+                    // Explicit error handling — no silent .ok() swallowing.
+                    let b64_bytes = match base64::engine::general_purpose::STANDARD.decode(&data) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!(remote_host, error = %e, "mesh: VDF window proof base64 decode failed");
+                            continue;
+                        }
+                    };
+                    let proof = match bincode::deserialize::<lagoon_vdf::VdfWindowProof>(&b64_bytes) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!(remote_host, error = %e, bytes_len = b64_bytes.len(),
+                                "mesh: VDF window proof bincode deserialize failed");
+                            continue;
+                        }
+                    };
+
+                    if !proof.verify() {
+                        warn!(
+                            remote_host,
+                            height_start = proof.height_start,
+                            height_end = proof.height_end,
+                            challenges = proof.proof.challenges.len(),
+                            "mesh: VDF window proof FAILED verification"
+                        );
+                        continue;
+                    }
+
+                    // Check chain continuity if we have a previous tip.
+                    let mut st = state.write().await;
+                    if let Some(ref mkey) = mesh_key {
+                        let chain_ok = if let Some(tip) =
+                            st.mesh.verified_vdf_tips.get(mkey)
+                        {
+                            if proof.continues_from(tip) {
+                                true
+                            } else {
+                                // Chain fork — node restarted or
+                                // equivocated. Accept new chain.
                                 info!(
                                     remote_host,
-                                    mesh_key = ?mesh_key,
-                                    steps = proof.steps,
-                                    "mesh: VDF proof VERIFIED — heartbeat"
+                                    mesh_key = mkey,
+                                    "mesh: VDF chain fork detected, accepting new chain"
                                 );
-                            } else {
-                                warn!(remote_host, "mesh: VDF proof FAILED verification");
+                                true
                             }
-                        }
-                        Err(e) => {
-                            warn!(remote_host, error = %e, "mesh: invalid VDF proof JSON");
+                        } else {
+                            // First proof from this peer — accept.
+                            true
+                        };
+
+                        if chain_ok {
+                            // Update verified tip.
+                            st.mesh
+                                .verified_vdf_tips
+                                .insert(mkey.clone(), proof.h_end());
+
+                            // Update peer liveness — same as old
+                            // VdfProof handler.
+                            if let Some(peer) =
+                                st.mesh.known_peers.get_mut(mkey)
+                            {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(
+                                        std::time::UNIX_EPOCH,
+                                    )
+                                    .unwrap_or_default()
+                                    .as_secs();
+                                let old_step = peer.vdf_step;
+                                if old_step != Some(proof.height_end)
+                                {
+                                    peer.prev_vdf_step = old_step;
+                                }
+                                peer.vdf_step =
+                                    Some(proof.height_end);
+                                peer.last_vdf_advance = now;
+                            }
+
+                            info!(
+                                remote_host,
+                                mesh_key = mkey,
+                                height_end = proof.height_end,
+                                steps = proof.window_steps(),
+                                "mesh: VDF window proof VERIFIED"
+                            );
+
+                            // Set neighbor alive in bitmap — we directly
+                            // observed their VDF advancing.
+                            if let Some(slot) = st.mesh.known_peers.get(mkey)
+                                .and_then(|p| p.spiral_index)
+                            {
+                                let now_secs = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs()).unwrap_or(0);
+                                st.mesh.liveness_bitmap.set_alive(slot, now_secs);
+                            }
+                            // Propagate the entire bitmap.
+                            propagate_liveness(&st);
                         }
                     }
                 }
@@ -2781,6 +2943,107 @@ pub fn spawn_event_processor(
                 }
 
 
+                RelayEvent::LivenessHave { remote_host, payload_b64 } => {
+                    let msg_bytes = match base64::engine::general_purpose::STANDARD
+                        .decode(&payload_b64)
+                    {
+                        Ok(b) => b,
+                        Err(_) => {
+                            warn!(remote_host, "liveness_gossip: invalid base64 in LIVENESS_HAVE");
+                            continue;
+                        }
+                    };
+                    let sync_msg: super::liveness_gossip::SyncMessage =
+                        match bincode::deserialize(&msg_bytes) {
+                            Ok(m) => m,
+                            Err(_) => {
+                                warn!(remote_host, "liveness_gossip: invalid bincode in LIVENESS_HAVE");
+                                continue;
+                            }
+                        };
+
+                    if let super::liveness_gossip::SyncMessage::HaveList {
+                        spore_bytes,
+                    } = sync_msg
+                    {
+                        tracing::debug!(remote_host, "liveness_gossip: received LIVENESS_HAVE");
+
+                        let st = state.read().await;
+
+                        let from_mkey = remote_host.clone();
+                        let our_spore = st.mesh.liveness_bitmap.spore();
+                        let our_data = st.mesh.liveness_bitmap.slot_data();
+
+                        if let Some(action) = st.mesh.liveness_gossip.on_have_list_received(
+                            &from_mkey,
+                            &spore_bytes,
+                            our_spore,
+                            &our_data,
+                        ) {
+                            tracing::debug!(remote_host, "liveness_gossip: sending LIVENESS_DELTA");
+                            execute_liveness_gossip_actions(&st, vec![action]);
+                        }
+                    }
+                }
+
+                RelayEvent::LivenessDelta { remote_host, payload_b64 } => {
+                    let msg_bytes = match base64::engine::general_purpose::STANDARD
+                        .decode(&payload_b64)
+                    {
+                        Ok(b) => b,
+                        Err(_) => {
+                            warn!(remote_host, "liveness_gossip: invalid base64 in LIVENESS_DELTA");
+                            continue;
+                        }
+                    };
+                    let sync_msg: super::liveness_gossip::SyncMessage =
+                        match bincode::deserialize(&msg_bytes) {
+                            Ok(m) => m,
+                            Err(_) => {
+                                warn!(remote_host, "liveness_gossip: invalid bincode in LIVENESS_DELTA");
+                                continue;
+                            }
+                        };
+
+                    if let super::liveness_gossip::SyncMessage::LivenessDelta {
+                        entries,
+                    } = sync_msg
+                    {
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+
+                        let mut st = state.write().await;
+
+                        // OR-merge: each entry is a bincode-serialized u64 slot.
+                        let accepted = st.mesh.liveness_bitmap.merge_slots(&entries, now_secs);
+                        if accepted > 0 {
+                            tracing::info!(
+                                remote_host, accepted,
+                                "liveness_bitmap: merged liveness delta (new alive slots)",
+                            );
+
+                            // Update last_seen for peers whose slots are now alive.
+                            // Slot → mesh_key lookup via known_peers' spiral_index.
+                            let received_slots: Vec<u64> = entries
+                                .iter()
+                                .filter_map(|b| bincode::deserialize::<u64>(b).ok())
+                                .collect();
+                            for (_mkey, peer) in st.mesh.known_peers.iter_mut() {
+                                if let Some(slot) = peer.spiral_index {
+                                    if received_slots.contains(&slot) && now_secs > peer.last_seen {
+                                        peer.last_seen = now_secs;
+                                    }
+                                }
+                            }
+
+                            // Propagate the entire bitmap to neighbors.
+                            propagate_liveness(&st);
+                        }
+                    }
+                }
+
                 RelayEvent::CvdfMessage { remote_host, data } => {
                     use base64::Engine as _;
                     // Decode: base64 → bincode → CvdfServiceMessage
@@ -2838,32 +3101,91 @@ pub fn spawn_event_processor(
             } // match event
             } // Some(event) => {
 
-            // VDF liveness: challenge direct SPIRAL neighbors and sweep
-            // for dead peers whose VDF stopped advancing.
+            // VDF liveness: broadcast window proof to SPIRAL neighbors and
+            // sweep for dead peers whose VDF stopped advancing.
             //
-            // VDF proof is a handshake with your direct neighbors and
-            // nodes you contact. Only your direct SPIRAL neighbors can
-            // disconnect you, so only they need your proof. Proofs are
-            // NOT gossiped — they stop at the recipient. Each node
-            // proves liveness to ≤20 neighbors. O(1) per node.
-            _ = vdf_challenge_interval.tick() => {
-                let st = state.read().await;
-                // Challenge direct SPIRAL neighbors only.
-                let neighbor_keys: Vec<String> = st.mesh.spiral.neighbors()
-                    .iter().cloned().collect();
-                for nkey in &neighbor_keys {
-                    // Relay is keyed by peer_id = nkey (mesh_key).
-                    if let Some(relay) = st.federation.relays.get(nkey) {
-                        let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
-                            MeshMessage::VdfProofReq,
-                        ));
+            // Push-based: generate a VdfWindowProof covering the last ~30
+            // VDF steps (3 seconds at 10 Hz), broadcast it to all SPIRAL
+            // neighbors, then trim the chain.  Merkle+Fiat-Shamir: ~500
+            // bytes constant-size regardless of window length.
+            // O(1) per node (≤20 neighbors), not O(N) flooding.
+            _ = vdf_window_interval.tick() => {
+                // Generate window proof from accumulated chain steps.
+                let mut st = state.write().await;
+                let window_msg = if let Some(ref chain) = st.mesh.vdf_chain {
+                    let mut c = chain.write().await;
+                    if c.window_len() >= 2 {
+                        let spiral_slot = st.lens.spiral_index;
+                        let proof = c.generate_window_proof(spiral_slot, 3);
+                        // Trim chain: keep only the tip as anchor for next window.
+                        c.trim_to(1);
+                        drop(c);
+                        // Encode as bincode → base64 for the wire.
+                        if let Ok(bytes) = bincode::serialize(&proof) {
+                            let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            Some((
+                                MeshMessage::VdfWindow { data: encoded },
+                                proof.height_end,
+                                proof.window_steps(),
+                            ))
+                        } else {
+                            None
+                        }
+                    } else {
+                        drop(c);
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Broadcast to SPIRAL neighbors.
+                if let Some((msg, height, steps)) = window_msg {
+                    let neighbor_keys: Vec<String> = st.mesh.spiral.neighbors()
+                        .iter().cloned().collect();
+                    let mut sent = 0usize;
+                    let mut dead_relays: Vec<String> = Vec::new();
+                    for nkey in &neighbor_keys {
+                        if let Some(relay) = st.federation.relays.get(nkey) {
+                            if relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                msg.clone(),
+                            )).is_err() {
+                                // Receiver dropped — handler exited.
+                                dead_relays.push(nkey.clone());
+                            } else {
+                                sent += 1;
+                            }
+                        }
+                    }
+                    // Reap zombie relays whose handlers already exited.
+                    for dead in &dead_relays {
+                        st.federation.relays.remove(dead);
+                        tracing::warn!(
+                            relay = dead.as_str(),
+                            "mesh: reaped zombie relay (handler exited)"
+                        );
+                    }
+                    if sent > 0 {
+                        tracing::debug!(
+                            height,
+                            steps,
+                            sent,
+                            "mesh: broadcast VDF window proof"
+                        );
                     }
                 }
 
-                drop(st);
+                // Self-attestation: set our own bit alive on every VDF tick.
+                // Propagation happens with the entire bitmap, not per-slot.
+                if let Some(our_slot) = st.mesh.spiral.our_index().map(|i| i.value()) {
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs()).unwrap_or(0);
+                    st.mesh.liveness_bitmap.set_alive(our_slot, now_secs);
+                }
+                propagate_liveness(&st);
 
                 // VDF dead-peer sweep. 10s. One rule. No exceptions.
-                let mut st = state.write().await;
                 let evicted = evict_dead_peers(&mut st);
                 if !evicted.is_empty() {
                     // Do NOT reconverge here. Timer-driven reconverge has no
@@ -2875,7 +3197,8 @@ pub fn spawn_event_processor(
                     // (Lean: reconverge_requires_complete_topology)
                     let neighbors = st.mesh.spiral.neighbors().clone();
                     st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
-                    st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
+                    st.mesh.connection_gossip.set_spiral_neighbors(neighbors.clone());
+                    st.mesh.liveness_gossip.set_spiral_neighbors(neighbors);
                     dial_missing_spiral_neighbors(&mut st, state.clone());
                     publish_connection_snapshot(&mut st);
                     st.notify_topology_change();
@@ -3053,6 +3376,27 @@ pub fn spawn_event_processor(
         } // select!
         } // loop
     });
+    // Monitor the event loop task — if it panics, log the panic message.
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(()) => info!("federation event loop: exited normally"),
+            Err(e) => {
+                if e.is_panic() {
+                    let panic_msg = if let Some(s) = e.into_panic().downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "(non-string panic payload)".to_string()
+                    };
+                    tracing::error!(
+                        panic_msg,
+                        "CRITICAL: federation event loop PANICKED — all mesh processing stopped"
+                    );
+                } else {
+                    tracing::error!(error = %e, "CRITICAL: federation event loop task aborted");
+                }
+            }
+        }
+    });
 }
 
 /// Broadcast our profile SPORE HaveList to all connected cluster peers.
@@ -3143,6 +3487,61 @@ fn execute_connection_gossip_actions(
             let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(mesh_msg));
         }
     }
+}
+
+/// Execute liveness gossip sync actions by sending MESH subcommands to relay peers.
+fn execute_liveness_gossip_actions(
+    st: &super::server::ServerState,
+    actions: Vec<super::liveness_gossip::SyncAction>,
+) {
+    for action in actions {
+        let (peer_id, message) = match action {
+            super::liveness_gossip::SyncAction::SendHaveList {
+                neighbor_peer_id, message,
+            } => (neighbor_peer_id, message),
+            super::liveness_gossip::SyncAction::SendLivenessDelta {
+                neighbor_peer_id, message,
+            } => (neighbor_peer_id, message),
+        };
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(bincode::serialize(&message).unwrap_or_default());
+        let mesh_msg = match &message {
+            super::liveness_gossip::SyncMessage::HaveList { .. } => {
+                MeshMessage::LivenessHave { data: b64 }
+            }
+            super::liveness_gossip::SyncMessage::LivenessDelta { .. } => {
+                MeshMessage::LivenessDelta { data: b64 }
+            }
+        };
+        if let Some(relay) = st.federation.relays.get(&peer_id) {
+            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(mesh_msg));
+        }
+    }
+}
+
+/// Propagate the entire liveness bitmap to SPIRAL neighbors via SPORE.
+///
+/// Push-push protocol — no request step:
+///   1. We send our HaveList (SPORE ranges) to each neighbor
+///   2. Each neighbor XORs against their own → computes the difference set
+///   3. Each neighbor sends us a Delta with entries we're missing
+///
+/// Convergence = MIN_LATENCY × HOPS (one-way per hop, not RTT).
+/// Only difference sets flow — O(churn), not O(mesh_size).
+fn propagate_liveness(st: &super::server::ServerState) {
+    let spore_bytes = bincode::serialize(
+        st.mesh.liveness_bitmap.spore(),
+    ).unwrap_or_default();
+    let actions = st.mesh.liveness_gossip
+        .propagate(&spore_bytes);
+    if !actions.is_empty() {
+        tracing::debug!(
+            neighbors = actions.len(),
+            alive = st.mesh.liveness_bitmap.alive_count(),
+            "liveness_bitmap: propagating difference sets to SPIRAL neighbors",
+        );
+    }
+    execute_liveness_gossip_actions(st, actions);
 }
 
 /// Publish a connection snapshot to the ConnectionStore and trigger SPORE gossip.
@@ -5313,18 +5712,19 @@ fn evaluate_spiral_merge(
     false
 }
 
-/// Evict stale peers from SPIRAL topology before claiming.
-/// Keeps peers that have active relay connections OR are in known_peers
-/// with recent VDF activity (last 5 minutes). This prevents slot inflation
-/// from truly dead peers while preserving topology learned from gossip.
-/// VDF-based liveness eviction. VDF IS the heartbeat.
-/// If a peer's VDF step hasn't advanced in 10 seconds, it's dead.
-/// One rule. One timer. No special cases for gossip vs connected.
+/// Evict stale peers. Only evict peers we're connected to (neighbor or relay).
+/// Ghosts (no connection) are left alone — they're harmless HashMap entries
+/// and gossip doesn't refresh last_seen periodically, so any timeout would
+/// incorrectly evict alive peers we simply can't directly observe.
 ///
 /// Returns the list of evicted peer keys.
 fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
-    const VDF_DEAD_SECS: u64 = 10;
-    const TOMBSTONE_TTL_SECS: u64 = 120;
+    // Connected peers: 10s — we directly observe their VDF via window proofs.
+    const CONNECTED_DEAD_SECS: u64 = 10;
+    // Ghost peers: 20s — freshness comes from SPORE liveness gossip which
+    // propagates VDF attestations mesh-wide. VDF is the authority. The bitmap
+    // is the gossip transport; last_seen (refreshed by gossip) is the truth.
+    const GHOST_DEAD_SECS: u64 = 20;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -5332,35 +5732,54 @@ fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
     let our_pid = st.lens.peer_id.clone();
     let mut evicted = Vec::new();
 
-    // Prune expired tombstones.
-    st.mesh.eviction_tombstones.retain(|_, ts| now.saturating_sub(*ts) < TOMBSTONE_TTL_SECS);
+    // Run bitmap decay — stale bits flip to 0, SPORE rebuilt.
+    st.mesh.liveness_bitmap.decay(now);
+
+    // Prune expired tombstones. 250ms = one SPORE convergence cycle.
+    // Stale gossip can't arrive after that. Direct HELLO clears immediately.
+    st.mesh.eviction_tombstones.retain(|_, ts| ts.elapsed() < std::time::Duration::from_millis(250));
+
+    let spiral_neighbors = st.mesh.spiral.neighbors().clone();
 
     for (peer_mkey, peer) in &st.mesh.known_peers {
         if *peer_mkey == our_pid {
             continue;
         }
-        if peer.last_vdf_advance == 0 {
-            if now.saturating_sub(peer.last_seen) < VDF_DEAD_SECS {
-                continue;
-            }
-        } else if now.saturating_sub(peer.last_vdf_advance) < VDF_DEAD_SECS {
+        let is_connected = spiral_neighbors.contains(peer_mkey)
+            || st.federation.relays.contains_key(peer_mkey);
+
+        // VDF is the eviction authority. The bitmap is gossip transport.
+        // Connected peers: direct VDF observation (last_vdf_advance).
+        // Ghost peers: last_seen refreshed by SPORE liveness gossip
+        // (which carries VDF-derived attestations mesh-wide).
+        let (fresh_at, timeout) = if is_connected {
+            let ts = if peer.last_vdf_advance > 0 { peer.last_vdf_advance } else { peer.last_seen };
+            (ts, CONNECTED_DEAD_SECS)
+        } else {
+            (peer.last_seen, GHOST_DEAD_SECS)
+        };
+        if now.saturating_sub(fresh_at) < timeout {
             continue;
         }
         evicted.push(peer_mkey.clone());
     }
 
     for evicted_key in &evicted {
-        // Tombstone: prevent gossip from resurrecting this peer.
-        st.mesh.eviction_tombstones.insert(evicted_key.clone(), now);
+        // Tombstone: prevent stale gossip from resurrecting this peer.
+        // 250ms — one SPORE convergence cycle. Direct HELLO clears it instantly.
+        st.mesh.eviction_tombstones.insert(evicted_key.clone(), std::time::Instant::now());
         if let Some(peer) = st.mesh.known_peers.remove(evicted_key) {
+            let is_connected = spiral_neighbors.contains(evicted_key)
+                || st.federation.relays.contains_key(evicted_key);
             info!(
                 mesh_key = %evicted_key,
                 server_name = %peer.server_name,
                 node_name = %peer.node_name,
                 vdf_step = ?peer.vdf_step,
                 last_vdf_advance = peer.last_vdf_advance,
-                dead_secs = VDF_DEAD_SECS,
-                "mesh: evicting dead peer — VDF not advancing"
+                last_seen = peer.last_seen,
+                connected = is_connected,
+                "mesh: evicting dead peer"
             );
             st.mesh.connections.remove(evicted_key);
             st.mesh.spiral.remove_peer(evicted_key);
@@ -5601,7 +6020,8 @@ fn announce_hello_to_all_relays(st: &mut super::server::ServerState) {
 fn update_spiral_neighbors(st: &mut super::server::ServerState) {
     let neighbors = st.mesh.spiral.neighbors().clone();
     st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
-    st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
+    st.mesh.connection_gossip.set_spiral_neighbors(neighbors.clone());
+    st.mesh.liveness_gossip.set_spiral_neighbors(neighbors);
 }
 
 fn build_hello_payload(st: &mut super::server::ServerState) -> MeshHelloPayload {
@@ -5821,6 +6241,8 @@ fn mesh_message_to_irc(msg: &MeshMessage) -> Message {
         MeshMessage::ProfileDelta { data } => ("PROFILE_DELTA".into(), data.clone()),
         MeshMessage::ConnectionHave { data } => ("CONNECTION_HAVE".into(), data.clone()),
         MeshMessage::ConnectionDelta { data } => ("CONNECTION_DELTA".into(), data.clone()),
+        MeshMessage::LivenessHave { data } => ("LIVENESS_HAVE".into(), data.clone()),
+        MeshMessage::LivenessDelta { data } => ("LIVENESS_DELTA".into(), data.clone()),
         MeshMessage::SocketMigrate { migration, client_peer_id } => {
             ("SOCKET_MIGRATE".into(), serde_json::json!({ "migration": migration, "client_peer_id": client_peer_id }).to_string())
         }
@@ -5833,6 +6255,9 @@ fn mesh_message_to_irc(msg: &MeshMessage) -> Message {
         }
         MeshMessage::PolResponse { nonce } => {
             ("POL_RESPONSE".into(), nonce.to_string())
+        }
+        MeshMessage::VdfWindow { .. } => {
+            ("VDF_WINDOW".into(), String::new())
         }
     };
     let mut params = vec![sub];

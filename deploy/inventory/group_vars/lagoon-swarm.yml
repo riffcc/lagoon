@@ -1,2 +1,2 @@
 lagoon_peers: "lon.lagun.co:9443"
-rust_log: info
+rust_log: "info,lagoon_server::irc::federation=debug,lagoon_server::irc::switchboard=debug"

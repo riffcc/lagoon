@@ -580,6 +580,11 @@ async fn raw_mesh_handler(
         }
     }
 
+    // Kill the command channel FIRST — any sends to outgoing_tx will now
+    // return Err, preventing the race where the VDF broadcast finds the
+    // relay during cleanup and sends into a dead channel.
+    drop(cmd_rx);
+
     // Stop the reader task — it may be blocked on read_mesh_frame.
     reader_task.abort();
 

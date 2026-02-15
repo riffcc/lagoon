@@ -129,7 +129,10 @@ impl YggNode {
                         peers.insert(info.key, handle);
                         let _ = peer_count_tx_clone.send(peers.len());
                         drop(peers);
-                        let _ = consumer_tx.send(event).await;
+                        // try_send: never block. If nobody is consuming events,
+                        // dropping them is better than stalling the event processor
+                        // (which blocks ALL peer management).
+                        let _ = consumer_tx.try_send(event);
                     }
                     PeerEvent::Disconnected { peer_key, reason } => {
                         tracing::info!(
@@ -141,10 +144,10 @@ impl YggNode {
                         peers.remove(peer_key);
                         let _ = peer_count_tx_clone.send(peers.len());
                         drop(peers);
-                        let _ = consumer_tx.send(event).await;
+                        let _ = consumer_tx.try_send(event);
                     }
                     PeerEvent::Frame { .. } => {
-                        let _ = consumer_tx.send(event).await;
+                        let _ = consumer_tx.try_send(event);
                     }
                 }
             }

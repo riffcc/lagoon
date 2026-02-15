@@ -57,10 +57,19 @@ async fn topology_ws_handler(
         }
     }
 
-    // Push updates as they arrive.
+    // Push updates with debounce — coalesce rapid changes into one push per second.
     loop {
         if watch.changed().await.is_err() {
             break;
+        }
+        // Drain any further changes that arrive within 1s.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match tokio::time::timeout_at(deadline, watch.changed()).await {
+                Ok(Ok(())) => continue,  // More changes — keep draining.
+                Ok(Err(_)) => return,    // Sender dropped.
+                Err(_) => break,         // Timeout — send the latest snapshot.
+            }
         }
         let snapshot = watch.borrow_and_update().clone();
         if let Ok(json) = serde_json::to_string(&snapshot) {

@@ -16,6 +16,7 @@ primary_region = 'lhr'
   RUST_LOG = 'info,lagoon_server::irc::federation=debug,lagoon_server::irc::transport=debug,lagoon_server::irc::switchboard=debug'
   LAGOON_URL = 'fly.lagun.co:9443'
   LAGOON_PEERS = 'fly.lagun.co:9443'
+  LAGOON_UNDERLAY_INCLUDE = 'fdaa::/16'
 
 [http_service]
   internal_port = 8080

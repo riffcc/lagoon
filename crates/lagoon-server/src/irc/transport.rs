@@ -828,6 +828,35 @@ pub fn detect_yggdrasil_addr() -> Option<Ipv6Addr> {
     None
 }
 
+/// Parse a CIDR string like "fdaa::/16" or "10.7.1.0/24" into (network_addr, prefix_len).
+fn parse_cidr(s: &str) -> Option<(IpAddr, u8)> {
+    let (addr_part, len_part) = s.split_once('/')?;
+    let addr: IpAddr = addr_part.parse().ok()?;
+    let prefix_len: u8 = len_part.parse().ok()?;
+    match addr {
+        IpAddr::V4(_) if prefix_len > 32 => None,
+        IpAddr::V6(_) if prefix_len > 128 => None,
+        _ => Some((addr, prefix_len)),
+    }
+}
+
+/// Check whether `addr` falls within the CIDR range (network_addr/prefix_len).
+fn addr_in_cidr(addr: IpAddr, network: IpAddr, prefix_len: u8) -> bool {
+    match (addr, network) {
+        (IpAddr::V4(a), IpAddr::V4(n)) => {
+            if prefix_len == 0 { return true; }
+            let mask = u32::MAX.checked_shl(32 - prefix_len as u32).unwrap_or(0);
+            (u32::from(a) & mask) == (u32::from(n) & mask)
+        }
+        (IpAddr::V6(a), IpAddr::V6(n)) => {
+            if prefix_len == 0 { return true; }
+            let mask = u128::MAX.checked_shl(128 - prefix_len as u32).unwrap_or(0);
+            (u128::from(a) & mask) == (u128::from(n) & mask)
+        }
+        _ => false, // v4 addr vs v6 network or vice versa
+    }
+}
+
 /// Detect a non-Yggdrasil, non-loopback, non-link-local IPv6 address.
 ///
 /// This is the node's **underlay** address — the real IP that other nodes
@@ -836,95 +865,50 @@ pub fn detect_yggdrasil_addr() -> Option<Ipv6Addr> {
 ///
 /// Reads `/proc/net/if_inet6` directly (no dependency on `ip` or `iproute2`).
 pub fn detect_underlay_addr() -> Option<IpAddr> {
-    // Collect all candidate addresses, then pick the best one.
-    // Priority: private IPv4 (RFC1918) > ULA IPv6 > global IPv6.
+    // ── Explicit address override ─────────────────────────────────────────
+    //   LAGOON_UNDERLAY_ADDR=10.7.1.37       (bare metal LAN)
+    //   LAGOON_UNDERLAY_ADDR=fdaa::1          (Fly.io 6PN)
+    if let Ok(val) = std::env::var("LAGOON_UNDERLAY_ADDR") {
+        if let Ok(addr) = val.parse::<IpAddr>() {
+            tracing::info!(%addr, "underlay: using LAGOON_UNDERLAY_ADDR override");
+            return Some(addr);
+        } else {
+            tracing::warn!(val, "underlay: LAGOON_UNDERLAY_ADDR is not a valid IP, falling back");
+        }
+    }
+
+    // ── Candidate filters ──────────────────────────────────────────────
     //
-    // Private IPv4 is preferred because it is universally reachable on LAN
-    // networks. ULA IPv6 (fd00::/8) can come from Docker bridges, WireGuard
-    // tunnels, or other isolated virtual networks that aren't reachable from
-    // peer machines. Global IPv6 may also be unreachable if the LAN lacks
-    // IPv6 routing. On providers like Fly.io where fdaa:: is the correct
-    // address, there is typically no RFC1918 IPv4, so ULA naturally wins.
-    let mut private_ipv4: Option<IpAddr> = None;
-    let mut ula_addr: Option<Ipv6Addr> = None;
-    let mut global_addr: Option<Ipv6Addr> = None;
+    // EXCLUDE (CIDR) — remove addresses matching this range from candidates:
+    //   LAGOON_UNDERLAY_EXCLUDE=172.16.0.0/12   (Fly.io edge proxy IPs)
+    //   LAGOON_UNDERLAY_EXCLUDE=169.254.0.0/16  (APIPA link-local)
+    //   LAGOON_UNDERLAY_EXCLUDE=100.64.0.0/10   (CGNAT range)
+    //
+    // INCLUDE (CIDR) — keep only addresses within this range:
+    //   LAGOON_UNDERLAY_INCLUDE=fdaa::/16        (Fly.io 6PN — all regions)
+    //   LAGOON_UNDERLAY_INCLUDE=10.7.1.0/24      (bare metal LAN subnet)
+    //   LAGOON_UNDERLAY_INCLUDE=192.168.1.0/24   (home lab)
+    //
+    // Both are optional. The heuristic always runs on whatever candidates
+    // remain after filtering. On most deployments neither is needed —
+    // the heuristic picks private networks by default.
+    let exclude_cidr = std::env::var("LAGOON_UNDERLAY_EXCLUDE").ok().and_then(|val| {
+        parse_cidr(&val).or_else(|| {
+            tracing::warn!(val, "underlay: LAGOON_UNDERLAY_EXCLUDE is not a valid CIDR, ignoring");
+            None
+        })
+    });
+    let include_cidr = std::env::var("LAGOON_UNDERLAY_INCLUDE").ok().and_then(|val| {
+        parse_cidr(&val).or_else(|| {
+            tracing::warn!(val, "underlay: LAGOON_UNDERLAY_INCLUDE is not a valid CIDR, ignoring");
+            None
+        })
+    });
 
-    // First pass: collect IPv4 candidates from hostname -I.
-    if let Ok(output) = std::process::Command::new("hostname")
-        .args(["-I"])
-        .output()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for token in stdout.split_whitespace() {
-            if let Ok(IpAddr::V4(v4)) = token.parse::<IpAddr>() {
-                if !v4.is_loopback() && (v4.is_private() || v4.is_link_local()) {
-                    private_ipv4 = Some(IpAddr::V4(v4));
-                    break;
-                }
-            }
-        }
-    }
+    // Collect ALL candidate addresses, then pick the best match.
+    let mut candidates: Vec<IpAddr> = Vec::new();
 
-    // If we found a private IPv4, prefer it (most universally reachable).
-    if private_ipv4.is_some() {
-        return private_ipv4;
-    }
-
-    // Second pass: scan IPv6 from /proc/net/if_inet6, skipping virtual interfaces.
-    // Format: <hex_addr> <index> <prefix_len> <scope> <flags> <device_name>
-    if let Ok(content) = std::fs::read_to_string("/proc/net/if_inet6") {
-        for line in content.lines() {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            let hex = fields.first().copied().unwrap_or("");
-            let dev = fields.get(5).copied().unwrap_or("");
-            if hex.len() != 32 {
-                continue;
-            }
-            // Skip virtual/bridge/tunnel interfaces — their addresses are
-            // typically isolated networks not reachable from peer machines.
-            if dev.starts_with("br-")
-                || dev.starts_with("docker")
-                || dev.starts_with("veth")
-                || dev.starts_with("virbr")
-                || dev.starts_with("tun")
-                || dev.starts_with("tap")
-                || dev.starts_with("wg")
-            {
-                continue;
-            }
-            // Skip Yggdrasil (02xx, 03xx), loopback (::1), link-local (fe80::).
-            if hex.starts_with("02") || hex.starts_with("03") {
-                continue; // Yggdrasil overlay
-            }
-            if hex == "00000000000000000000000000000001" {
-                continue; // ::1 loopback
-            }
-            if hex.starts_with("fe80") {
-                continue; // link-local
-            }
-            // Convert 32-char hex to colon-separated IPv6.
-            let groups: Vec<&str> = (0..8).map(|i| &hex[i * 4..(i + 1) * 4]).collect();
-            let addr_str = groups.join(":");
-            if let Ok(addr) = addr_str.parse::<Ipv6Addr>() {
-                // ULA = fc00::/7 (first byte fc or fd).
-                let first_byte = addr.octets()[0];
-                if first_byte == 0xfc || first_byte == 0xfd {
-                    if ula_addr.is_none() {
-                        ula_addr = Some(addr);
-                    }
-                } else if global_addr.is_none() {
-                    global_addr = Some(addr);
-                }
-            }
-        }
-    }
-
-    // Prefer ULA (private, locally reachable) over global unicast.
-    if let Some(addr) = ula_addr.or(global_addr) {
-        return Some(IpAddr::V6(addr));
-    }
-
-    // Final fallback: any non-loopback IPv4 from hostname -I.
+    // IPv4 from hostname -I.
     if let Ok(output) = std::process::Command::new("hostname")
         .args(["-I"])
         .output()
@@ -933,12 +917,100 @@ pub fn detect_underlay_addr() -> Option<IpAddr> {
         for token in stdout.split_whitespace() {
             if let Ok(ip) = token.parse::<IpAddr>() {
                 if !ip.is_loopback() {
-                    return Some(ip);
+                    candidates.push(ip);
                 }
             }
         }
     }
 
+    // IPv6 from /proc/net/if_inet6, skipping virtual/overlay interfaces.
+    if let Ok(content) = std::fs::read_to_string("/proc/net/if_inet6") {
+        for line in content.lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let hex = fields.first().copied().unwrap_or("");
+            let dev = fields.get(5).copied().unwrap_or("");
+            if hex.len() != 32 { continue; }
+            // Skip virtual/bridge/tunnel interfaces.
+            if dev.starts_with("br-")
+                || dev.starts_with("docker")
+                || dev.starts_with("veth")
+                || dev.starts_with("virbr")
+                || dev.starts_with("tun")
+                || dev.starts_with("tap")
+                || dev.starts_with("wg")
+            { continue; }
+            // Skip Yggdrasil overlay (02xx, 03xx), loopback, link-local.
+            if hex.starts_with("02") || hex.starts_with("03") { continue; }
+            if hex == "00000000000000000000000000000001" { continue; }
+            if hex.starts_with("fe80") { continue; }
+            let groups: Vec<&str> = (0..8).map(|i| &hex[i * 4..(i + 1) * 4]).collect();
+            let addr_str = groups.join(":");
+            if let Ok(addr) = addr_str.parse::<Ipv6Addr>() {
+                candidates.push(IpAddr::V6(addr));
+            }
+        }
+    }
+
+    // ── Apply filters ───────────────────────────────────────────────────
+    if let Some((net_addr, prefix_len)) = exclude_cidr {
+        let before = candidates.len();
+        candidates.retain(|c| !addr_in_cidr(*c, net_addr, prefix_len));
+        let removed = before - candidates.len();
+        if removed > 0 {
+            tracing::info!(removed, "underlay: excluded {removed} addresses via LAGOON_UNDERLAY_EXCLUDE");
+        }
+    }
+    if let Some((net_addr, prefix_len)) = include_cidr {
+        let before = candidates.len();
+        candidates.retain(|c| addr_in_cidr(*c, net_addr, prefix_len));
+        let kept = candidates.len();
+        tracing::info!(before, kept, "underlay: filtered by LAGOON_UNDERLAY_INCLUDE, {kept}/{before} remain");
+    }
+
+    // ── Heuristic ─────────────────────────────────────────────────────────
+    // Priority: private IPv4 (RFC1918) > ULA IPv6 > global IPv6 > any.
+    // Filters above narrow the candidate set; this picks the best from
+    // whatever remains.
+    let mut private_ipv4: Option<IpAddr> = None;
+    let mut ula_v6: Option<IpAddr> = None;
+    let mut global_v6: Option<IpAddr> = None;
+    let mut any_addr: Option<IpAddr> = None;
+
+    for candidate in &candidates {
+        match candidate {
+            IpAddr::V4(v4) => {
+                if private_ipv4.is_none() && (v4.is_private() || v4.is_link_local()) {
+                    private_ipv4 = Some(*candidate);
+                }
+                if any_addr.is_none() {
+                    any_addr = Some(*candidate);
+                }
+            }
+            IpAddr::V6(v6) => {
+                let first_byte = v6.octets()[0];
+                if (first_byte == 0xfc || first_byte == 0xfd) && ula_v6.is_none() {
+                    ula_v6 = Some(*candidate);
+                } else if global_v6.is_none() && first_byte != 0xfc && first_byte != 0xfd {
+                    global_v6 = Some(*candidate);
+                }
+                if any_addr.is_none() {
+                    any_addr = Some(*candidate);
+                }
+            }
+        }
+    }
+
+    let selected = private_ipv4.or(ula_v6).or(global_v6).or(any_addr);
+    if let Some(addr) = selected {
+        tracing::info!(
+            %addr,
+            candidates = ?candidates,
+            "underlay: heuristic selected address"
+        );
+        return Some(addr);
+    }
+
+    tracing::warn!("underlay: no suitable address found");
     None
 }
 

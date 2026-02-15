@@ -141,6 +141,14 @@ pub enum MeshMessage {
     #[serde(rename = "connection_delta")]
     ConnectionDelta { data: String },
 
+    /// Liveness attestation SPORE HaveList (base64-bincode).
+    #[serde(rename = "liveness_have")]
+    LivenessHave { data: String },
+
+    /// Liveness attestation delta entries (base64-bincode).
+    #[serde(rename = "liveness_delta")]
+    LivenessDelta { data: String },
+
 
     /// Socket migration — TCP_REPAIR state delivered via existing mesh relay.
     /// The target node calls `anymesh::restore()` to reconstruct the socket.
@@ -175,6 +183,12 @@ pub enum MeshMessage {
     /// Must be sent as fast as possible (no routing through event loop).
     #[serde(rename = "pol_response")]
     PolResponse { nonce: u64 },
+
+    /// VDF window proof — push-based proof of sequential computation.
+    /// Replaces the old VdfProofReq/VdfProof challenge-response.
+    /// Sent every 3 seconds to SPIRAL neighbors (base64-bincode encoded).
+    #[serde(rename = "vdf_window")]
+    VdfWindow { data: String },
 }
 
 impl MeshMessage {

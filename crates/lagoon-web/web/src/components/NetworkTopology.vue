@@ -14,11 +14,15 @@ let ws = null
 let showBeams = true
 let showNodes = true
 
+// Mesh stats — updated on every snapshot.
+const stats = ref({ nodes: 0, connected: 0, disconnected: 0, links: 0, spiralLinks: 0 })
+
 // Color palette — Tokyo Night theme.
 const COLORS = {
   self: '#7aa2f7',       // Blue — this node
   connected: '#9ece6a',  // Green — connected peer
-  offline: '#f7768e',    // Red — known but not connected
+  pruning: '#4d7a3a',    // Dark green — disconnected but VDF still ticking (pruning/transient)
+  offline: '#f7768e',    // Red — actually unhealthy (VDF stalled or no data)
   browser: '#bb9af7',    // Purple — browser/web peer
   link: '#565f89',       // Muted — default link color (no metrics)
   background: '#1a1b26', // Dark background
@@ -29,6 +33,10 @@ function nodeColor(node) {
   if (node.node_type === 'browser') return COLORS.browser
   if (node.is_self) return COLORS.self
   if (node.connected) return COLORS.connected
+  // Disconnected: dark green if VDF is still ticking (pruning/transient),
+  // red only if VDF has stalled or no VDF data (actually unhealthy).
+  const liveness = vdfLiveness(node)
+  if (liveness === 'ticking') return COLORS.pruning
   return COLORS.offline
 }
 
@@ -40,18 +48,25 @@ function nodeLabel(node) {
   return node.server_name
 }
 
-/** VDF liveness state for a node.
- *  VDF step progression IS the heartbeat — no timestamps, no timeouts.
- *  Returns: 'ticking' (step advancing), 'stalled' (step frozen), or null (no VDF data). */
+/** VDF liveness tracking.
+ *  Updated in updateGraph() on each snapshot.  nodeColor() and the tooltip
+ *  read _vdf_liveness from the node object — no side effects on read. */
 const prevVdfSteps = new Map()
-function vdfLiveness(node) {
-  if (node.is_self) return 'ticking' // we're always alive
-  if (node.vdf_step == null) return null
+
+/** Update VDF liveness tracking for a node.  Called once per node per snapshot. */
+function updateVdfLiveness(node) {
+  if (node.is_self) { node._vdf_liveness = 'ticking'; return }
+  if (node.vdf_step == null) { node._vdf_liveness = null; return }
   const key = node.id || node.mesh_key
   const prev = prevVdfSteps.get(key)
   prevVdfSteps.set(key, node.vdf_step)
-  if (prev == null) return 'ticking' // first observation, assume alive
-  return node.vdf_step > prev ? 'ticking' : 'stalled'
+  if (prev == null) { node._vdf_liveness = 'ticking'; return } // first observation
+  node._vdf_liveness = node.vdf_step > prev ? 'ticking' : 'stalled'
+}
+
+/** Read VDF liveness state.  Side-effect-free — safe to call from any accessor. */
+function vdfLiveness(node) {
+  return node._vdf_liveness ?? null
 }
 
 /** Count links touching a given node ID in the current graph data. */
@@ -414,6 +429,18 @@ async function initGraph() {
 }
 
 function updateGraph(snapshot) {
+  // Update stats from snapshot.
+  const serverNodes = snapshot.nodes.filter(n => (n.node_type || 'server') === 'server')
+  const connCount = serverNodes.filter(n => n.connected || n.is_self).length
+  const spiralCount = snapshot.links.filter(l => l.link_type === 'spiral').length
+  stats.value = {
+    nodes: serverNodes.length,
+    connected: connCount,
+    disconnected: serverNodes.length - connCount,
+    links: snapshot.links.length,
+    spiralLinks: spiralCount,
+  }
+
   if (!graph) return
 
   const current = graph.graphData()
@@ -460,10 +487,12 @@ function updateGraph(snapshot) {
       existing.spiral_index = n.spiral_index ?? null
       existing.is_spiral_neighbor = n.is_spiral_neighbor || false
 
+      existing.vdf_step = n.vdf_step ?? null
       existing.peer_count = n.peer_count ?? null
       existing.connected_count = n.connected_count ?? null
       existing.ygg_up_count = n.ygg_up_count ?? null
       existing.disconnected_count = n.disconnected_count ?? null
+      updateVdfLiveness(existing)
     } else {
       // New node — must rebuild.
       structureChanged = true
@@ -527,11 +556,13 @@ function updateGraph(snapshot) {
         spiral_index: n.spiral_index ?? null,
         is_spiral_neighbor: n.is_spiral_neighbor || false,
 
+        vdf_step: n.vdf_step ?? null,
         peer_count: n.peer_count ?? null,
         connected_count: n.connected_count ?? null,
         ygg_up_count: n.ygg_up_count ?? null,
         disconnected_count: n.disconnected_count ?? null,
       }
+      updateVdfLiveness(base)
       // Preserve previous position so d3 doesn't reset the simulation.
       if (prev) {
         base.x = prev.x
@@ -617,6 +648,30 @@ onUnmounted(() => {
     </div>
   </div>
   <div v-else class="topology-container" ref="container"></div>
+
+  <!-- Mesh stats overlay -->
+  <div v-if="stats.nodes > 0" class="stats-panel">
+    <div class="stats-row">
+      <span class="stats-value">{{ stats.nodes }}</span>
+      <span class="stats-label">nodes</span>
+    </div>
+    <div class="stats-row">
+      <span class="stats-value status-up">{{ stats.connected }}</span>
+      <span class="stats-label">connected</span>
+    </div>
+    <div v-if="stats.disconnected > 0" class="stats-row">
+      <span class="stats-value status-down">{{ stats.disconnected }}</span>
+      <span class="stats-label">disconnected</span>
+    </div>
+    <div class="stats-row">
+      <span class="stats-value">{{ stats.links }}</span>
+      <span class="stats-label">links</span>
+    </div>
+    <div v-if="stats.spiralLinks > 0" class="stats-row">
+      <span class="stats-value spiral-tag">{{ stats.spiralLinks }}</span>
+      <span class="stats-label">SPIRAL</span>
+    </div>
+  </div>
 
   <!-- Node hover info panel -->
   <div
@@ -788,5 +843,40 @@ onUnmounted(() => {
   height: 1px;
   background: #3b4261;
   margin: 6px 0;
+}
+
+.stats-panel {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  z-index: 900;
+  background: rgba(31, 35, 53, 0.85);
+  border: 1px solid #3b4261;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 13px;
+  color: #c0caf5;
+  backdrop-filter: blur(8px);
+  pointer-events: none;
+}
+
+.stats-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 1px 0;
+}
+
+.stats-value {
+  font-weight: 700;
+  font-size: 15px;
+  min-width: 28px;
+  text-align: right;
+}
+
+.stats-label {
+  color: #565f89;
+  font-size: 12px;
 }
 </style>

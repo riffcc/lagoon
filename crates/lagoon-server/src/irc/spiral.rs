@@ -370,6 +370,11 @@ impl SpiralTopology {
         self.our_index.is_some()
     }
 
+    /// Whether a specific peer has claimed a SPIRAL slot.
+    pub fn has_slot(&self, mesh_key: &str) -> bool {
+        self.peer_positions.contains_key(mesh_key)
+    }
+
     /// Get all unique SPIRAL neighbor mesh_keys as a Vec.
     ///
     /// With fewer than 20 nodes, gap-and-wrap deduplicates to the actual

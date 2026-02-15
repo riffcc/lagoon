@@ -307,6 +307,10 @@ pub struct MeshState {
     pub connection_store: super::connection_store::ConnectionStore,
     /// SPIRAL-scoped connection snapshot gossip coordinator.
     pub connection_gossip: super::connection_gossip::ConnectionGossip,
+    /// Bitmap-based liveness tracker: 1 bit per SPIRAL slot, SPORE reconciliation.
+    pub liveness_bitmap: super::liveness_store::LivenessBitmap,
+    /// SPIRAL-scoped liveness gossip coordinator (SPORE HaveList/Delta protocol).
+    pub liveness_gossip: super::liveness_gossip::LivenessGossip,
     /// CVDF cooperative VDF service — Citadel's cooperative chain as a framework service.
     /// None until the node has peers and initializes the chain.
     pub cvdf_service: Option<citadel_lens::service::CvdfService<super::cvdf_transport::LagoonCvdfTransport>>,
@@ -333,9 +337,10 @@ pub struct MeshState {
     pub pending_assigned_slots: HashMap<u64, std::time::Instant>,
     /// Tombstones for evicted peer_ids — prevents gossip from resurrecting dead peers.
     /// Key: mesh_key of evicted peer. Value: UNIX timestamp of eviction.
-    /// Gossip handlers skip any peer_id found in this set. TTL: 120s.
-    /// Without this, evict→gossip→re-insert→evict cycles at ~10Hz forever.
-    pub eviction_tombstones: HashMap<String, u64>,
+    /// Gossip handlers skip any peer_id found in this set. TTL: 250ms.
+    /// Matches SPORE convergence time — stale gossip won't arrive after that.
+    /// Direct HELLO always clears tombstones (proof of life).
+    pub eviction_tombstones: HashMap<String, std::time::Instant>,
     /// Snapshot of our own VDF hash, frozen at HELLO build time.
     /// Used in PEERS universal merge for deterministic tiebreaking.
     /// Reading live `vdf_state_rx.current_hash` oscillates because it changes
@@ -354,6 +359,10 @@ pub struct MeshState {
     /// flooding: SPIRAL instability (reconverge, merge, collision) can trigger
     /// broadcasts at >30 Hz. 5 s minimum interval between broadcasts.
     pub last_hello_broadcast: Option<std::time::Instant>,
+    /// Per-peer verified VDF chain tips. Key = mesh_key (peer_id), value =
+    /// the last verified `h_end` from a VdfWindowProof. Chain continuity:
+    /// each new proof's `h_start` must match this tip.
+    pub verified_vdf_tips: HashMap<String, [u8; 32]>,
 }
 
 impl MeshState {
@@ -376,6 +385,8 @@ impl MeshState {
             ),
             connection_store: super::connection_store::ConnectionStore::new(120_000), // 120s TTL
             connection_gossip: super::connection_gossip::ConnectionGossip::new(10_000), // 10s sync interval
+            liveness_bitmap: super::liveness_store::LivenessBitmap::new(20), // 20s decay — convergence ~250ms
+            liveness_gossip: super::liveness_gossip::LivenessGossip::new(0), // interval ignored — event-driven
             cvdf_service: None,
             our_cluster_vdf_work: 0.0,
             switchboard_ctl: None,
@@ -386,6 +397,7 @@ impl MeshState {
             ygg_peered_uris: HashSet::new(),
             ygg_peer_count: 0,
             last_hello_broadcast: None,
+            verified_vdf_tips: HashMap::new(),
         }
     }
 }

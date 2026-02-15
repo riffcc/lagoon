@@ -17,6 +17,8 @@ pub mod connection_gossip;
 pub mod connection_store;
 pub mod cvdf_transport;
 pub mod latency_gossip;
+pub mod liveness_gossip;
+pub mod liveness_store;
 pub mod polp;
 pub mod profile;
 pub mod proof_store;
