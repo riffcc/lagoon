@@ -346,6 +346,10 @@ pub struct MeshState {
     /// Prevents dial_missing_spiral_neighbors from hammering add_peer()
     /// on every cycle for already-configured peers.
     pub ygg_peered_uris: HashSet<String>,
+    /// Cached count of connected Ygg underlay peers. Updated by the event
+    /// processor in `refresh_ygg_metrics_embedded()`. Used by the sync
+    /// `build_mesh_snapshot()` method (can't call async `.peers()`).
+    pub ygg_peer_count: u32,
 }
 
 impl MeshState {
@@ -376,6 +380,7 @@ impl MeshState {
             eviction_tombstones: HashMap::new(),
             our_vdf_hash_snapshot: None,
             ygg_peered_uris: HashSet::new(),
+            ygg_peer_count: 0,
         }
     }
 }
@@ -630,9 +635,7 @@ impl ServerState {
         let connected_peers = self.mesh.connections.values()
             .filter(|&&s| s == MeshConnectionState::Connected)
             .count() as u32;
-        let ygg_up = self.transport_config.ygg_node.as_ref()
-            .map(|n| n.peers().iter().filter(|p| p.up).count() as u32)
-            .unwrap_or(0);
+        let ygg_up = self.mesh.ygg_peer_count;
 
         nodes.push(MeshNodeReport {
             mesh_key: our_pid.clone(),
@@ -932,7 +935,7 @@ pub async fn start(
     );
 
     // Start embedded Yggdrasil node (if YGG_PEERS is set).
-    let ygg_node = init_yggdrasil(&lens).map(Arc::new);
+    let ygg_node = init_yggdrasil(&lens).await.map(Arc::new);
     if let Some(ref node) = ygg_node {
         info!(address = %node.address(), "embedded Yggdrasil node started");
         transport_config.yggdrasil_available = true;
@@ -1132,7 +1135,7 @@ async fn accept_loop(
 /// or `LAGOON_YGG=1` (explicit enable).
 ///
 /// Returns `None` if neither is set or initialization fails.
-fn init_yggdrasil(lens: &super::lens::LensIdentity) -> Option<yggbridge::YggNode> {
+async fn init_yggdrasil(lens: &super::lens::LensIdentity) -> Option<yggdrasil_rs::YggNode> {
     if !should_start_yggdrasil() {
         return None;
     }
@@ -1150,7 +1153,7 @@ fn init_yggdrasil(lens: &super::lens::LensIdentity) -> Option<yggbridge::YggNode
     // Always start with empty peers — APE populates from MESH HELLO.
     let empty_peers: Vec<String> = vec![];
 
-    match yggbridge::YggNode::new(&private_key, &empty_peers, &listen) {
+    match yggdrasil_rs::YggNode::new(&private_key, &empty_peers, &listen).await {
         Ok(node) => {
             info!(
                 address = %node.address(),

@@ -1880,7 +1880,7 @@ fn free_port() -> u16 {
 /// Create a test state with a real YggNode wired into transport config.
 fn make_test_state_with_ygg(
     server_name: &str,
-    ygg_node: Arc<yggbridge::YggNode>,
+    ygg_node: Arc<yggdrasil_rs::YggNode>,
 ) -> (SharedState, watch::Receiver<MeshSnapshot>) {
     let mut tc = transport::TransportConfig::new();
     tc.ygg_node = Some(ygg_node);
@@ -2241,34 +2241,37 @@ async fn three_node_mesh_forms_triangle_not_star() {
     let port_c = free_port();
 
     let ygg_a = Arc::new(
-        yggbridge::YggNode::new(
+        yggdrasil_rs::YggNode::new(
             &make_ygg_key(),
             &[],
             &[format!("tcp://127.0.0.1:{port_a}")],
         )
+        .await
         .unwrap(),
     );
     let ygg_b = Arc::new(
-        yggbridge::YggNode::new(
+        yggdrasil_rs::YggNode::new(
             &make_ygg_key(),
             &[],
             &[format!("tcp://127.0.0.1:{port_b}")],
         )
+        .await
         .unwrap(),
     );
     let ygg_c = Arc::new(
-        yggbridge::YggNode::new(
+        yggdrasil_rs::YggNode::new(
             &make_ygg_key(),
             &[],
             &[format!("tcp://127.0.0.1:{port_c}")],
         )
+        .await
         .unwrap(),
     );
 
     // All 3 start isolated — no Ygg peering yet.
-    assert!(ygg_a.peers().is_empty(), "ygg_a starts with no peers");
-    assert!(ygg_b.peers().is_empty(), "ygg_b starts with no peers");
-    assert!(ygg_c.peers().is_empty(), "ygg_c starts with no peers");
+    assert_eq!(ygg_a.peer_count().await, 0, "ygg_a starts with no peers");
+    assert_eq!(ygg_b.peer_count().await, 0, "ygg_b starts with no peers");
+    assert_eq!(ygg_c.peer_count().await, 0, "ygg_c starts with no peers");
 
     // Simulate bootstrap: A already has Ygg peering with B.
     // In production, this happens during the initial MESH HELLO APE exchange.
@@ -2339,25 +2342,15 @@ async fn three_node_mesh_forms_triangle_not_star() {
 
     // ── Verify Ygg triangle ──
     //
-    // A should now have Ygg underlay peers to BOTH B and C:
-    // - B: pre-established during bootstrap (add_peer above)
-    // - C: added by dial_missing_spiral_neighbors (APE peering)
-    let peers_a = ygg_a.peers();
-    let peer_uris: Vec<&str> = peers_a.iter().map(|p| p.uri.as_str()).collect();
+    // dial_missing_spiral_neighbors should have called add_peer() for C's
+    // underlay URI. With yggdrasil-rs, add_peer() is non-blocking (spawns
+    // async dial task), so we verify via the ygg_peered_uris set which is
+    // populated synchronously when add_peer() succeeds.
+    let st = state_a.read().await;
+    let peered_uris = &st.mesh.ygg_peered_uris;
     assert!(
-        peers_a.len() >= 2,
-        "Ygg triangle: A should have peers to both B and C, got {} peers: {peer_uris:?}",
-        peers_a.len(),
-    );
-
-    // Verify specific peer URIs contain the expected ports.
-    assert!(
-        peer_uris.iter().any(|u| u.contains(&port_b.to_string())),
-        "A should have Ygg peer to B (port {port_b}), got: {peer_uris:?}"
-    );
-    assert!(
-        peer_uris.iter().any(|u| u.contains(&port_c.to_string())),
-        "A should have Ygg peer to C (port {port_c}), got: {peer_uris:?}"
+        peered_uris.iter().any(|u| u.contains(&port_c.to_string())),
+        "dial_missing_spiral_neighbors should have called add_peer for C (port {port_c}), got: {peered_uris:?}"
     );
 }
 

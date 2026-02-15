@@ -70,7 +70,7 @@ pub struct TransportConfig {
     pub yggdrasil_available: bool,
     /// Embedded Yggdrasil node for overlay networking.
     /// When present, Ygg-addressed peers are dialed directly through the overlay.
-    pub ygg_node: Option<Arc<yggbridge::YggNode>>,
+    pub ygg_node: Option<Arc<yggdrasil_rs::YggNode>>,
 }
 
 impl std::fmt::Debug for TransportConfig {
@@ -101,7 +101,6 @@ impl TransportConfig {
 ///
 /// Generic over the underlying stream `S` so we can use the same adapter for:
 /// - `wss://` over TCP (`MaybeTlsStream<TcpStream>`) — public internet
-/// - `ws://` over Ygg overlay (`YggStream`) — encrypted mesh
 ///
 /// Wraps a `WebSocketStream<S>` to implement `AsyncRead + AsyncWrite`, allowing
 /// the relay task's `Framed<RelayStream, IrcCodec>` to work transparently
@@ -266,10 +265,6 @@ pub struct ConnectResult {
     pub peer_addr: Option<SocketAddr>,
 }
 
-/// Web gateway port — the HTTP/WS server that lagoon-web runs on.
-/// Overlay connections use this for `ws://` federation.
-const WEB_GATEWAY_PORT: u16 = 8080;
-
 /// Which transport to use for a federation connection.
 ///
 /// Determined by `select_transport()` from the peer's configuration.
@@ -340,32 +335,8 @@ pub async fn connect(
     let peer = config.peers.get(remote_host);
     let port = peer.map(|p| p.port).unwrap_or(DEFAULT_PORT);
     let tls = peer.map(|p| p.tls).unwrap_or(false);
-    let ygg_addr = peer.and_then(|p| p.yggdrasil_addr);
 
-    // ── Priority 1: Ygg overlay WebSocket ──────────────────────────────
-    //
-    // If we have an embedded Ygg node and this peer has a known overlay
-    // address, dial ws:// through the mesh. Ygg encrypts, no TLS needed.
-    // The web gateway on port 8080 handles the WebSocket federation
-    // endpoint with all the authentication and proxying already built in.
-    if let (Some(ygg_node), Some(ygg_v6)) = (&config.ygg_node, ygg_addr) {
-        let url = format!("ws://[{ygg_v6}]:{WEB_GATEWAY_PORT}/api/mesh/ws");
-        info!(remote_host, %url, "transport: connecting via WebSocket over Ygg overlay");
-        let stream = ygg_node
-            .dial(ygg_v6, WEB_GATEWAY_PORT)
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
-        let (ws_stream, _response) = tokio_tungstenite::client_async(&url, stream)
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
-        info!(remote_host, "transport: WebSocket over Ygg overlay connected");
-        return Ok(ConnectResult {
-            stream: Box::new(WsRelayStream::new(ws_stream)),
-            peer_addr: None, // overlay — no underlay APE needed
-        });
-    }
-
-    // ── Priority 2: TLS WebSocket ──────────────────────────────────────
+    // ── Priority 1: TLS WebSocket ──────────────────────────────────────
     //
     // Public internet path — wss:// through CDN/proxy/anycast.
     if tls {
@@ -405,10 +376,8 @@ pub async fn connect(
 /// Connection stream for the native mesh relay — NOT wrapped in IRC framing.
 ///
 /// The relay_task_native() uses these directly for JSON MeshMessage exchange.
-/// Generic over the underlying transport (Ygg overlay, TLS, or raw TCP).
+/// Generic over the underlying transport (TLS WebSocket or raw TCP switchboard).
 pub enum NativeWs {
-    /// Ygg overlay: `ws://[200:xxxx]:8080/api/mesh/ws`, encrypted by Ygg.
-    Ygg(tokio_tungstenite::WebSocketStream<yggbridge::YggStream>),
     /// TLS WebSocket: `wss://host:port/api/mesh/ws`, internet path.
     Tls(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>),
     /// Switchboard: raw TCP with JSON lines (no WebSocket). After half-dial
@@ -419,16 +388,14 @@ pub enum NativeWs {
     },
 }
 
-/// Connect to a remote peer's native mesh WebSocket endpoint (`/api/mesh/ws`).
+/// Connect to a remote peer's native mesh endpoint.
 ///
-/// Returns a raw `WebSocketStream` (not IRC-wrapped). The caller sends/receives
-/// JSON `MeshMessage` text frames directly.
+/// Returns a `NativeWs` stream for JSON MeshMessage exchange.
 ///
 /// Priority:
-/// 1. **Ygg overlay** if we have an embedded Ygg node AND the peer has a known
-///    overlay address.
+/// 1. **Switchboard half-dial** (port 9443, raw TCP JSON lines).
 /// 2. **TLS WebSocket** if the peer is configured with `tls: true` (port 443).
-/// 3. **PlainTcp** → error (native mode requires WebSocket).
+/// 3. **PlainTcp** → error (native mode requires WebSocket or switchboard).
 pub async fn connect_native(
     remote_host: &str,
     config: &TransportConfig,
@@ -437,7 +404,6 @@ pub async fn connect_native(
     let peer = config.peers.get(remote_host);
     let port = peer.map(|p| p.port).unwrap_or(DEFAULT_PORT);
     let tls = peer.map(|p| p.tls).unwrap_or(false);
-    let ygg_addr = peer.and_then(|p| p.yggdrasil_addr);
 
     // Mesh WS path — includes `from` param so the listener can detect
     // self-connections and drop them at the TCP level (transparent self).
@@ -446,22 +412,7 @@ pub async fn connect_native(
         None => "/api/mesh/ws".to_string(),
     };
 
-    // Priority 1: Ygg overlay WebSocket.
-    if let (Some(ygg_node), Some(ygg_v6)) = (&config.ygg_node, ygg_addr) {
-        let url = format!("ws://[{ygg_v6}]:{WEB_GATEWAY_PORT}{ws_path}");
-        info!(remote_host, %url, "transport: native mesh via Ygg overlay");
-        let stream = ygg_node
-            .dial(ygg_v6, WEB_GATEWAY_PORT)
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
-        let (ws_stream, _response) = tokio_tungstenite::client_async(&url, stream)
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
-        info!(remote_host, "transport: native mesh via Ygg overlay connected");
-        return Ok(NativeWs::Ygg(ws_stream));
-    }
-
-    // Priority 2: Switchboard half-dial (port 9443, raw TCP JSON lines).
+    // Priority 1: Switchboard half-dial (port 9443, raw TCP JSON lines).
     //
     // Raw TCP anycast — bypasses Fly's HTTP proxy entirely. No WebSocket.
     // The switchboard handles self-rejection at the TCP level: if the peeked

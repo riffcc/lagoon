@@ -395,18 +395,12 @@ pub fn dial_missing_spiral_neighbors(
                             st.mesh.ygg_peered_uris.insert(uri.to_string());
                         }
                         Err(e) => {
-                            let err_str = e.to_string();
-                            if err_str.contains("already configured") {
-                                // Peer is already there — record it and stop retrying.
-                                st.mesh.ygg_peered_uris.insert(uri.to_string());
-                            } else {
-                                warn!(
-                                    underlay_uri = %uri,
-                                    peer = %node_name,
-                                    error = %e,
-                                    "mesh: failed to add SPIRAL neighbor as Ygg underlay peer"
-                                );
-                            }
+                            warn!(
+                                underlay_uri = %uri,
+                                peer = %node_name,
+                                error = %e,
+                                "mesh: failed to add SPIRAL neighbor as Ygg underlay peer"
+                            );
                         }
                     }
                 }
@@ -879,28 +873,26 @@ fn format_remote_prefix(nick: &str, remote_host: &str) -> String {
 /// Spawn the federation event processor that listens for relay events
 /// and dispatches them to local users.
 /// Query Yggdrasil peer metrics from the embedded node (if available).
-fn refresh_ygg_metrics_embedded(
-    ygg_node: &Option<Arc<yggbridge::YggNode>>,
+async fn refresh_ygg_metrics_embedded(
+    ygg_node: &Option<Arc<yggdrasil_rs::YggNode>>,
 ) -> Option<Vec<super::yggdrasil::YggPeer>> {
     let node = ygg_node.as_ref()?;
-    let peers = node.peers();
+    let peers = node.peers().await;
     Some(
         peers
             .into_iter()
             .map(|p| {
-                let address = super::yggdrasil::key_to_address(&p.key)
-                    .map(|a| a.to_string())
-                    .unwrap_or_default();
+                let address = yggdrasil_rs::crypto::address_for_key(&p.key).to_string();
                 super::yggdrasil::YggPeer {
                     address,
                     remote: p.uri,
-                    bytes_sent: p.tx_bytes,
-                    bytes_recvd: p.rx_bytes,
-                    latency: p.latency_ms * 1_000_000.0, // ms → ns
-                    key: p.key,
+                    bytes_sent: 0,
+                    bytes_recvd: 0,
+                    latency: 0.0,
+                    key: hex::encode(p.key),
                     port: 0,
-                    uptime: p.uptime,
-                    up: p.up,
+                    uptime: 0.0,
+                    up: true, // connected = up in yggdrasil-rs
                     inbound: p.inbound,
                 }
             })
@@ -1137,11 +1129,12 @@ pub fn spawn_event_processor(
                 }
                 RelayEvent::Disconnected { remote_host } => {
                     // Query Ygg metrics before acquiring write lock.
-                    let ygg_peers = refresh_ygg_metrics_embedded(&ygg_node);
+                    let ygg_peers = refresh_ygg_metrics_embedded(&ygg_node).await;
 
                     let mut st = state.write().await;
 
                     if let Some(yp) = ygg_peers {
+                        st.mesh.ygg_peer_count = yp.len() as u32;
                         st.mesh.ygg_metrics.update(yp);
                     }
 
@@ -1266,7 +1259,7 @@ pub fn spawn_event_processor(
                     }
 
                     // Query Yggdrasil metrics BEFORE acquiring write lock.
-                    let ygg_peers = refresh_ygg_metrics_embedded(&ygg_node);
+                    let ygg_peers = refresh_ygg_metrics_embedded(&ygg_node).await;
 
                     let mut st = state.write().await;
 
@@ -1424,12 +1417,7 @@ pub fn spawn_event_processor(
                                         st.mesh.ygg_peered_uris.insert(uri.clone());
                                     }
                                     Err(e) => {
-                                        let err_str = e.to_string();
-                                        if err_str.contains("already configured") {
-                                            st.mesh.ygg_peered_uris.insert(uri.clone());
-                                        } else {
-                                            warn!(uri, peer_id, error = %e, "APE: failed to add Yggdrasil peer");
-                                        }
+                                        warn!(uri, peer_id, error = %e, "APE: failed to add Yggdrasil peer");
                                     }
                                 }
                             }
@@ -1791,11 +1779,12 @@ pub fn spawn_event_processor(
                     peers,
                 } => {
                     // Query Yggdrasil metrics before acquiring write lock.
-                    let ygg_peers = refresh_ygg_metrics_embedded(&ygg_node);
+                    let ygg_peers = refresh_ygg_metrics_embedded(&ygg_node).await;
 
                     let mut st = state.write().await;
 
                     if let Some(yp) = ygg_peers {
+                        st.mesh.ygg_peer_count = yp.len() as u32;
                         st.mesh.ygg_metrics.update(yp);
                     }
                     let mut changed = false;
@@ -2230,7 +2219,7 @@ pub fn spawn_event_processor(
 
                 RelayEvent::MeshSync { remote_host } => {
                     // Query Ygg metrics before responding.
-                    let ygg_peers = refresh_ygg_metrics_embedded(&ygg_node);
+                    let ygg_peers = refresh_ygg_metrics_embedded(&ygg_node).await;
 
                     // A peer wants our full peer table — respond with MESH PEERS.
                     let mut st = state.write().await;
@@ -3311,14 +3300,6 @@ async fn relay_task_native(
         }
 
         let outcome = match connect_result {
-            Ok(transport::NativeWs::Ygg(ws)) => {
-                self_hits = 0;
-                info!(%connect_target, "native relay: connected via Ygg overlay");
-                native_ws_loop(
-                    ws, &connect_target, &cmd_tx, &mut cmd_rx, &event_tx,
-                    &state, is_bootstrap, &mut current_peer_id,
-                ).await
-            }
             Ok(transport::NativeWs::Tls(ws)) => {
                 self_hits = 0;
                 info!(%connect_target, "native relay: connected via TLS WebSocket");
@@ -5244,18 +5225,23 @@ fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
             // Cut the Ygg overlay connection — dead nodes don't get to stay peered.
             if let Some(ref ygg) = st.transport_config.ygg_node {
                 if let Some(ref uri) = peer.ygg_peer_uri {
-                    match ygg.remove_peer(uri) {
-                        Ok(()) => info!(
-                            uri,
-                            node_name = %peer.node_name,
-                            "APE: removed dead peer from Ygg overlay"
-                        ),
-                        Err(e) => tracing::debug!(
-                            uri,
-                            error = %e,
-                            "APE: remove_peer failed (may already be gone)"
-                        ),
-                    }
+                    let ygg = ygg.clone();
+                    let uri = uri.clone();
+                    let node_name = peer.node_name.clone();
+                    tokio::spawn(async move {
+                        match ygg.remove_peer(&uri).await {
+                            Ok(()) => info!(
+                                uri,
+                                node_name = %node_name,
+                                "APE: removed dead peer from Ygg overlay"
+                            ),
+                            Err(e) => tracing::debug!(
+                                uri,
+                                error = %e,
+                                "APE: remove_peer failed (may already be gone)"
+                            ),
+                        }
+                    });
                 }
             }
 
