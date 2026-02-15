@@ -1,6 +1,10 @@
 app = 'anycast-mesh'
 primary_region = 'lhr'
 
+# Target layout: 9 machines across 3 regions (3x LHR, 3x AMS, 3x CDG).
+# fly.toml can't declare per-region counts (Fly feature request pending).
+# After deploy: flyctl scale count 3 --region lhr,ams,cdg
+
 [build]
   dockerfile = 'Dockerfile'
 
@@ -19,8 +23,8 @@ primary_region = 'lhr'
   internal_port = 8080
   force_https = true
   auto_start_machines = true
-  auto_stop_machines = 'stop'
-  min_machines_running = 3
+  auto_stop_machines = 'off'
+  min_machines_running = 9
 
 # Switchboard — raw TCP, bypasses Fly's HTTP proxy.
 # Mesh federation dials this port for bootstrap + half-dial routing.

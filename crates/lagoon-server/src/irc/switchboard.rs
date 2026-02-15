@@ -47,6 +47,7 @@ use super::federation::{
     build_wire_hello, dispatch_mesh_message, RelayCommand, RelayEvent, RelayHandle,
 };
 use super::server::ServerState;
+use super::wire;
 use super::wire::{MeshMessage, SwitchboardMessage};
 
 /// Internal Ygg listener address — the switchboard proxies non-switchboard
@@ -93,6 +94,7 @@ pub async fn start_switchboard(
                 result = listener.accept() => {
                     match result {
                         Ok((stream, peer_addr)) => {
+                            let _ = stream.set_nodelay(true);
                             let state = state.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = handle_connection(stream, peer_addr, state).await {
@@ -266,7 +268,7 @@ async fn half_dial(
             );
 
             // Enter raw TCP mesh handler (JSON lines, no WebSocket).
-            raw_mesh_handler(reader, writer, state).await?;
+            raw_mesh_handler(reader, writer, state, peer_addr).await?;
             Ok(())
         }
         ResolveResult::Redirect { peer_id, underlay_addr } => {
@@ -320,25 +322,14 @@ enum ResolveResult {
 fn resolve_target(
     want: &str,
     our_peer_id: &str,
-    client_peer_id: &str,
+    _client_peer_id: &str,
     st: &ServerState,
 ) -> ResolveResult {
     if want == "any" {
-        // Bootstrap: find any connected peer that isn't the client or us.
-        for (peer_id, info) in &st.mesh.known_peers {
-            if peer_id != our_peer_id && peer_id != client_peer_id {
-                // Prefer underlay_uri (derived from TCP peer addr), fall back
-                // to ygg_peer_uri (self-reported). Both are UNDERLAY addresses.
-                let underlay = info.underlay_uri.clone()
-                    .or_else(|| info.ygg_peer_uri.clone());
-                return ResolveResult::Redirect {
-                    peer_id: peer_id.clone(),
-                    underlay_addr: underlay,
-                };
-            }
-        }
-        // No other peers known. We're the only node (or bootstrap hasn't completed).
-        // Accept locally — the client will get our HELLO and can proceed.
+        // The client dialed us directly and is happy to talk to whoever
+        // answered. Accept locally — we ARE who they reached. Redirect
+        // is only for specific targets (peer_id, spiral_slot) where the
+        // switchboard routes the client to the right node.
         return ResolveResult::IsSelf;
     }
 
@@ -385,18 +376,18 @@ async fn raw_mesh_handler(
     mut reader: BufReader<OwnedReadHalf>,
     mut writer: OwnedWriteHalf,
     state: Arc<RwLock<ServerState>>,
+    peer_addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ── Phase 1: Hello exchange ─────────────────────────────────────────
 
-    // Read first message — must be Hello.
+    // Read first message — must be Hello (length-prefixed frame).
     let timeout = Duration::from_secs(30);
-    let mut hello_line = String::new();
-    match tokio::time::timeout(timeout, reader.read_line(&mut hello_line)).await {
-        Ok(Ok(n)) if n > 0 => {}
-        _ => return Err("switchboard: no Hello received within timeout".into()),
-    }
-
-    let first_msg = MeshMessage::from_json(hello_line.trim_end())?;
+    let first_msg = match tokio::time::timeout(timeout, wire::read_mesh_frame(&mut reader)).await {
+        Ok(Ok(Some(text))) => MeshMessage::from_json(&text)?,
+        Ok(Ok(None)) => return Err("switchboard: received keepalive instead of Hello".into()),
+        Ok(Err(e)) => return Err(format!("switchboard: Hello read error: {e}").into()),
+        Err(_) => return Err("switchboard: no Hello received within timeout".into()),
+    };
     let remote_hello = match first_msg {
         MeshMessage::Hello(hello) => hello,
         _ => return Err("switchboard: first message must be Hello".into()),
@@ -450,53 +441,82 @@ async fn raw_mesh_handler(
     dispatch_mesh_message(
         MeshMessage::Hello(remote_hello),
         &remote_peer_id,
-        None,
+        Some(peer_addr),
         &None,
         &event_tx,
     );
 
-    // ── Phase 3: Bidirectional message loop (JSON lines) ────────────────
+    // ── Phase 3: Bidirectional message loop (length-prefixed frames) ────
+    //
+    // CRITICAL: read_exact is NOT cancellation-safe. If tokio::select! drops
+    // a read_mesh_frame future mid-flight (because a cmd or timer fired),
+    // any bytes already consumed by read_exact are LOST — desynchronising
+    // the stream. We solve this by running all reads in a dedicated task
+    // that never gets cancelled, sending complete frames over a channel.
+    // Channel recv() IS cancellation-safe.
 
     let remote_mesh_key: Option<String> = Some(remote_peer_id.clone());
     let mut last_ping = Instant::now();
     let ping_interval = Duration::from_secs(30);
-    let mut incoming_line = String::new();
+
+    // Spawn reader task — owns the BufReader, never cancelled mid-read.
+    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Result<Option<String>, String>>();
+    let reader_task = tokio::spawn(async move {
+        loop {
+            match wire::read_mesh_frame(&mut reader).await {
+                Ok(frame) => {
+                    if frame_tx.send(Ok(frame)).is_err() { break; }
+                }
+                Err(e) => {
+                    let _ = frame_tx.send(Err(e.to_string()));
+                    break;
+                }
+            }
+        }
+    });
 
     loop {
         let next_ping = last_ping + ping_interval;
         let ping_delay = tokio::time::sleep_until(next_ping.into());
 
         tokio::select! {
-            // Read incoming JSON line.
-            result = reader.read_line(&mut incoming_line) => {
-                match result {
-                    Ok(0) | Err(_) => {
-                        info!(node = %remote_node_name, "switchboard: connection closed");
+            // Receive complete frames from the reader task (cancel-safe).
+            frame = frame_rx.recv() => {
+                match frame {
+                    Some(Err(e)) => {
+                        info!(node = %remote_node_name, error = %e,
+                            "switchboard: connection closed");
                         break;
                     }
-                    Ok(_) => {
-                        let trimmed = incoming_line.trim_end();
-                        if !trimmed.is_empty() {
-                            match MeshMessage::from_json(trimmed) {
-                                Ok(msg) => {
-                                    let _ = dispatch_mesh_message(
-                                        msg,
-                                        &remote_peer_id,
-                                        None,
-                                        &remote_mesh_key,
-                                        &event_tx,
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        node = %remote_node_name,
-                                        error = %e,
-                                        "switchboard: failed to parse message"
-                                    );
-                                }
+                    Some(Ok(None)) => {} // keepalive — ignore
+                    Some(Ok(Some(text))) => {
+                        match MeshMessage::from_json(&text) {
+                            Ok(msg) => {
+                                let _ = dispatch_mesh_message(
+                                    msg,
+                                    &remote_peer_id,
+                                    Some(peer_addr),
+                                    &remote_mesh_key,
+                                    &event_tx,
+                                );
+                            }
+                            Err(e) => {
+                                let preview: String = text.chars().take(200).collect();
+                                warn!(
+                                    node = %remote_node_name,
+                                    error = %e,
+                                    len = text.len(),
+                                    preview = %preview,
+                                    "switchboard: failed to parse message"
+                                );
                             }
                         }
-                        incoming_line.clear();
+                    }
+                    None => {
+                        // Reader task exited without sending an error.
+                        info!(node = %remote_node_name,
+                            "switchboard: reader task closed");
+                        break;
                     }
                 }
             }
@@ -506,8 +526,7 @@ async fn raw_mesh_handler(
                 match cmd {
                     Some(RelayCommand::SendMesh(mesh_msg)) => {
                         if let Ok(json) = mesh_msg.to_json() {
-                            if writer.write_all(json.as_bytes()).await.is_err() { break; }
-                            if writer.write_all(b"\n").await.is_err() { break; }
+                            if wire::write_mesh_frame(&mut writer, json.as_bytes()).await.is_err() { break; }
                         }
                     }
                     Some(RelayCommand::MeshHello { json: _ }) => {
@@ -517,8 +536,7 @@ async fn raw_mesh_handler(
                         };
                         let msg = MeshMessage::Hello(hello);
                         if let Ok(json) = msg.to_json() {
-                            if writer.write_all(json.as_bytes()).await.is_err() { break; }
-                            if writer.write_all(b"\n").await.is_err() { break; }
+                            if wire::write_mesh_frame(&mut writer, json.as_bytes()).await.is_err() { break; }
                         }
                     }
                     Some(RelayCommand::Shutdown | RelayCommand::Reconnect) => {
@@ -529,15 +547,18 @@ async fn raw_mesh_handler(
                 }
             }
 
-            // Keepalive — write an empty line so the remote knows we're alive.
+            // Keepalive — zero-length frame.
             _ = ping_delay => {
-                if writer.write_all(b"\n").await.is_err() {
+                if wire::write_mesh_keepalive(&mut writer).await.is_err() {
                     break;
                 }
                 last_ping = Instant::now();
             }
         }
     }
+
+    // Stop the reader task — it may be blocked on read_mesh_frame.
+    reader_task.abort();
 
     // Cleanup — relay keyed by peer_id.
     let _ = event_tx.send(RelayEvent::Disconnected {
@@ -592,7 +613,8 @@ pub async fn handle_socket_migration(
         "switchboard: socket restored — entering raw mesh handler"
     );
 
+    let peer_addr = migration.remote_addr;
     let (read_half, write_half) = tcp_stream.into_split();
     let reader = BufReader::new(read_half);
-    raw_mesh_handler(reader, write_half, state).await
+    raw_mesh_handler(reader, write_half, state, peer_addr).await
 }

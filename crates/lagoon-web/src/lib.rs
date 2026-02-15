@@ -16,7 +16,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tower::Service;
 use tower_http::{
     cors::CorsLayer,
-    services::ServeDir,
+    services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
 use tracing::{debug, info};
@@ -56,7 +56,11 @@ fn build_router(state: AppState) -> Router {
         .route("/api/communities/{id}/channels", post(communities::add_channel))
         .route("/api/communities/{id}/channels/{name}", delete(communities::remove_channel))
         // Serve Vue.js SPA (static files)
-        .fallback_service(ServeDir::new("web/dist").append_index_html_on_directories(true))
+        .fallback_service(
+            ServeDir::new("web/dist")
+                .append_index_html_on_directories(true)
+                .fallback(ServeFile::new("web/dist/index.html")),
+        )
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)

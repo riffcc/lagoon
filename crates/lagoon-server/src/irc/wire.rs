@@ -178,6 +178,72 @@ impl MeshMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Length-prefixed framing for raw TCP mesh sessions
+// ---------------------------------------------------------------------------
+//
+// After the switchboard handshake (which uses newline-delimited JSON),
+// the TCP stream switches to length-prefixed framing:
+//   [4-byte big-endian u32 length][JSON bytes]
+//
+// This eliminates the newline-delimiter bug where large messages (200KB+
+// CVDF proofs) were being split across read_line() boundaries.
+// A zero-length frame is a keepalive.
+
+/// Maximum mesh message size (4 MiB). Reject anything larger to prevent OOM.
+const MAX_MESH_FRAME: u32 = 4 * 1024 * 1024;
+
+/// Write a length-prefixed mesh message to a raw TCP stream.
+pub async fn write_mesh_frame(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    data: &[u8],
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let len = data.len() as u32;
+    // Combine length header + payload into a single buffer to avoid
+    // Nagle-induced splits between the header and payload.
+    let mut buf = Vec::with_capacity(4 + data.len());
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(data);
+    writer.write_all(&buf).await
+}
+
+/// Write a keepalive (zero-length frame).
+pub async fn write_mesh_keepalive(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    writer.write_all(&0u32.to_be_bytes()).await
+}
+
+/// Read a length-prefixed mesh message from a raw TCP stream.
+///
+/// Returns `Ok(None)` for keepalive frames (length = 0).
+/// Returns `Ok(Some(String))` for message frames.
+/// Returns `Err` on I/O error or protocol violation.
+pub async fn read_mesh_frame(
+    reader: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> std::io::Result<Option<String>> {
+    use tokio::io::AsyncReadExt;
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf);
+    if len == 0 {
+        return Ok(None); // keepalive
+    }
+    if len > MAX_MESH_FRAME {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("mesh frame too large: {len} bytes (max {MAX_MESH_FRAME})"),
+        ));
+    }
+    let mut buf = vec![0u8; len as usize];
+    reader.read_exact(&mut buf).await?;
+    String::from_utf8(buf).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+    }).map(Some)
+}
+
+// ---------------------------------------------------------------------------
 // Switchboard protocol — pre-WebSocket half-dial on raw TCP
 // ---------------------------------------------------------------------------
 

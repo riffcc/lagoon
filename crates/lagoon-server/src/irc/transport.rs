@@ -576,6 +576,7 @@ pub async fn connect_switchboard(
     info!(%target, want, "switchboard client: dialing");
 
     let stream = TcpStream::connect(&target).await?;
+    stream.set_nodelay(true)?;
     set_tcp_keepalive(&stream)?;
 
     let (read_half, mut write_half) = stream.into_split();

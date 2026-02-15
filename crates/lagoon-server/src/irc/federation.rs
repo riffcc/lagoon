@@ -3589,10 +3589,13 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
                                 }
                             }
                             Err(e) => {
+                                let preview: String = text.chars().take(200).collect();
                                 warn!(
                                     %connect_target,
                                     peer_id = %remote_peer_id,
                                     error = %e,
+                                    len = text.len(),
+                                    preview = %preview,
                                     "native relay: failed to parse message"
                                 );
                             }
@@ -3696,9 +3699,9 @@ async fn native_raw_loop(
     is_bootstrap: bool,
     current_peer_id: &mut Option<String>,
 ) -> NativeLoopOutcome {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use super::wire;
 
-    // ── Hello exchange ──────────────────────────────────────────────────
+    // ── Hello exchange (length-prefixed frames) ─────────────────────────
 
     // Send our Hello.
     let our_hello = {
@@ -3713,22 +3716,19 @@ async fn native_raw_loop(
             return NativeLoopOutcome::Reconnect;
         }
     };
-    if writer.write_all(hello_json.as_bytes()).await.is_err()
-        || writer.write_all(b"\n").await.is_err()
-    {
+    if wire::write_mesh_frame(&mut writer, hello_json.as_bytes()).await.is_err() {
         warn!(%connect_target, "native relay (raw): failed to send Hello");
         return NativeLoopOutcome::Reconnect;
     }
 
     // Receive their Hello (30s timeout).
-    let mut hello_line = String::new();
     let remote_hello = match tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        reader.read_line(&mut hello_line),
+        wire::read_mesh_frame(&mut reader),
     )
     .await
     {
-        Ok(Ok(n)) if n > 0 => match MeshMessage::from_json(hello_line.trim_end()) {
+        Ok(Ok(Some(text))) => match MeshMessage::from_json(&text) {
             Ok(MeshMessage::Hello(hello)) => hello,
             Ok(other) => {
                 warn!(%connect_target, ?other, "native relay (raw): first message must be Hello");
@@ -3779,24 +3779,18 @@ async fn native_raw_loop(
             drop(st);
 
             // Drain buffer — inbound side may have sent a Redirect.
-            let mut drain_line = String::new();
-            if let Ok(Ok(n)) = tokio::time::timeout(
+            if let Ok(Ok(Some(text))) = tokio::time::timeout(
                 std::time::Duration::from_millis(500),
-                reader.read_line(&mut drain_line),
+                wire::read_mesh_frame(&mut reader),
             ).await {
-                if n > 0 {
-                    let trimmed = drain_line.trim_end();
-                    if !trimmed.is_empty() {
-                        if let Ok(msg) = MeshMessage::from_json(trimmed) {
-                            let _ = dispatch_mesh_message(
-                                msg,
-                                &remote_peer_id,
-                                None,
-                                &remote_mesh_key,
-                                event_tx,
-                            );
-                        }
-                    }
+                if let Ok(msg) = MeshMessage::from_json(&text) {
+                    let _ = dispatch_mesh_message(
+                        msg,
+                        &remote_peer_id,
+                        None,
+                        &remote_mesh_key,
+                        event_tx,
+                    );
                 }
             }
 
@@ -3842,85 +3836,107 @@ async fn native_raw_loop(
         event_tx,
     );
 
-    // ── Bidirectional message loop (JSON lines) ─────────────────────────
+    // ── Bidirectional message loop (length-prefixed frames) ─────────────
+    //
+    // CRITICAL: read_exact is NOT cancellation-safe. If tokio::select! drops
+    // a read_mesh_frame future mid-flight (because a cmd or timer fired),
+    // any bytes already consumed by read_exact are LOST — desynchronising
+    // the stream. We solve this by running all reads in a dedicated task
+    // that never gets cancelled, sending complete frames over a channel.
+    // Channel recv() IS cancellation-safe.
+
+    // Spawn reader task — owns the BufReader, never cancelled mid-read.
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::unbounded_channel::<Result<Option<String>, String>>();
+    let reader_task = tokio::spawn(async move {
+        loop {
+            match wire::read_mesh_frame(&mut reader).await {
+                Ok(frame) => {
+                    if frame_tx.send(Ok(frame)).is_err() { break; }
+                }
+                Err(e) => {
+                    let _ = frame_tx.send(Err(e.to_string()));
+                    break;
+                }
+            }
+        }
+    });
 
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     keepalive.tick().await; // skip first immediate tick
 
-    let mut incoming_line = String::new();
-
-    loop {
+    let outcome = loop {
         tokio::select! {
-            // Read incoming JSON line from remote peer.
-            result = reader.read_line(&mut incoming_line) => {
-                match result {
-                    Ok(0) => {
-                        info!(%connect_target, peer_id = %remote_peer_id,
-                            "native relay (raw): connection closed by remote");
-                        return NativeLoopOutcome::Reconnect;
-                    }
-                    Err(e) => {
+            // Receive complete frames from the reader task (cancel-safe).
+            frame = frame_rx.recv() => {
+                match frame {
+                    Some(Err(e)) => {
                         warn!(%connect_target, peer_id = %remote_peer_id,
                             error = %e, "native relay (raw): read error");
-                        return NativeLoopOutcome::Reconnect;
+                        break NativeLoopOutcome::Reconnect;
                     }
-                    Ok(_) => {
-                        let trimmed = incoming_line.trim_end();
-                        if !trimmed.is_empty() {
-                            match MeshMessage::from_json(trimmed) {
-                                Ok(msg) => {
-                                    if matches!(&msg, MeshMessage::Redirect { .. }) {
+                    Some(Ok(None)) => {} // keepalive
+                    Some(Ok(Some(text))) => {
+                        match MeshMessage::from_json(&text) {
+                            Ok(msg) => {
+                                if matches!(&msg, MeshMessage::Redirect { .. }) {
+                                    info!(
+                                        %connect_target,
+                                        peer_id = %remote_peer_id,
+                                        "native relay (raw): received redirect — dispatching peers"
+                                    );
+                                }
+                                let _ = dispatch_mesh_message(
+                                    msg,
+                                    &remote_peer_id,
+                                    None,
+                                    &remote_mesh_key,
+                                    event_tx,
+                                );
+
+                                // Shadow promotion (same as WS path).
+                                if current_peer_id.is_none() {
+                                    let mut st = state.write().await;
+                                    if !st.federation.relays.contains_key(&remote_peer_id) {
                                         info!(
                                             %connect_target,
                                             peer_id = %remote_peer_id,
-                                            "native relay (raw): received redirect — dispatching peers"
+                                            "native relay (raw): promoting shadow to primary"
                                         );
+                                        st.federation.relays.insert(
+                                            remote_peer_id.clone(),
+                                            RelayHandle {
+                                                outgoing_tx: cmd_tx.clone(),
+                                                node_name: remote_node_name.clone(),
+                                                connect_target: connect_target.to_string(),
+                                                channels: HashMap::new(),
+                                                mesh_connected: true,
+                                                is_bootstrap,
+                                                last_rtt_ms: None,
+                                            },
+                                        );
+                                        *current_peer_id = Some(remote_peer_id.clone());
                                     }
-                                    let _ = dispatch_mesh_message(
-                                        msg,
-                                        &remote_peer_id,
-                                        None,
-                                        &remote_mesh_key,
-                                        event_tx,
-                                    );
-
-                                    // Shadow promotion (same as WS path).
-                                    if current_peer_id.is_none() {
-                                        let mut st = state.write().await;
-                                        if !st.federation.relays.contains_key(&remote_peer_id) {
-                                            info!(
-                                                %connect_target,
-                                                peer_id = %remote_peer_id,
-                                                "native relay (raw): promoting shadow to primary"
-                                            );
-                                            st.federation.relays.insert(
-                                                remote_peer_id.clone(),
-                                                RelayHandle {
-                                                    outgoing_tx: cmd_tx.clone(),
-                                                    node_name: remote_node_name.clone(),
-                                                    connect_target: connect_target.to_string(),
-                                                    channels: HashMap::new(),
-                                                    mesh_connected: true,
-                                                    is_bootstrap,
-                                                    last_rtt_ms: None,
-                                                },
-                                            );
-                                            *current_peer_id = Some(remote_peer_id.clone());
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        %connect_target,
-                                        peer_id = %remote_peer_id,
-                                        error = %e,
-                                        "native relay (raw): failed to parse message"
-                                    );
                                 }
                             }
+                            Err(e) => {
+                                let preview: String = text.chars().take(200).collect();
+                                warn!(
+                                    %connect_target,
+                                    peer_id = %remote_peer_id,
+                                    error = %e,
+                                    len = text.len(),
+                                    preview = %preview,
+                                    "native relay (raw): failed to parse message"
+                                );
+                            }
                         }
-                        incoming_line.clear();
+                    }
+                    None => {
+                        // Reader task exited without sending an error.
+                        info!(%connect_target, peer_id = %remote_peer_id,
+                            "native relay (raw): reader task closed");
+                        break NativeLoopOutcome::Reconnect;
                     }
                 }
             }
@@ -3930,10 +3946,8 @@ async fn native_raw_loop(
                 match cmd {
                     Some(RelayCommand::SendMesh(mesh_msg)) => {
                         if let Ok(json) = mesh_msg.to_json() {
-                            if writer.write_all(json.as_bytes()).await.is_err()
-                                || writer.write_all(b"\n").await.is_err()
-                            {
-                                return NativeLoopOutcome::Reconnect;
+                            if wire::write_mesh_frame(&mut writer, json.as_bytes()).await.is_err() {
+                                break NativeLoopOutcome::Reconnect;
                             }
                         }
                     }
@@ -3944,38 +3958,41 @@ async fn native_raw_loop(
                         };
                         let msg = MeshMessage::Hello(hello);
                         if let Ok(j) = msg.to_json() {
-                            if writer.write_all(j.as_bytes()).await.is_err()
-                                || writer.write_all(b"\n").await.is_err()
-                            {
-                                return NativeLoopOutcome::Reconnect;
+                            if wire::write_mesh_frame(&mut writer, j.as_bytes()).await.is_err() {
+                                break NativeLoopOutcome::Reconnect;
                             }
                         }
                     }
                     Some(RelayCommand::Shutdown) => {
                         info!(%connect_target, peer_id = %remote_peer_id,
                             "native relay (raw): shutdown requested");
-                        return NativeLoopOutcome::Shutdown;
+                        break NativeLoopOutcome::Shutdown;
                     }
                     Some(RelayCommand::Reconnect) => {
                         info!(%connect_target, peer_id = %remote_peer_id,
                             "native relay (raw): reconnect requested");
-                        return NativeLoopOutcome::Reconnect;
+                        break NativeLoopOutcome::Reconnect;
                     }
                     Some(_) => {}
                     None => {
-                        return NativeLoopOutcome::Shutdown;
+                        break NativeLoopOutcome::Shutdown;
                     }
                 }
             }
 
-            // Keepalive — write an empty line so remote knows we're alive.
+            // Keepalive — zero-length frame.
             _ = keepalive.tick() => {
-                if writer.write_all(b"\n").await.is_err() {
-                    return NativeLoopOutcome::Reconnect;
+                if wire::write_mesh_keepalive(&mut writer).await.is_err() {
+                    break NativeLoopOutcome::Reconnect;
                 }
             }
         }
-    }
+    };
+
+    // Stop the reader task — it may be blocked on read_mesh_frame.
+    reader_task.abort();
+
+    outcome
 }
 
 /// Backoff drain for the native relay task.
