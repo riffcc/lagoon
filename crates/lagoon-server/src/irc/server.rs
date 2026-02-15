@@ -350,6 +350,10 @@ pub struct MeshState {
     /// processor in `refresh_ygg_metrics_embedded()`. Used by the sync
     /// `build_mesh_snapshot()` method (can't call async `.peers()`).
     pub ygg_peer_count: u32,
+    /// Debounce timestamp for `announce_hello_to_all_relays()`. Prevents
+    /// flooding: SPIRAL instability (reconverge, merge, collision) can trigger
+    /// broadcasts at >30 Hz. 5 s minimum interval between broadcasts.
+    pub last_hello_broadcast: Option<std::time::Instant>,
 }
 
 impl MeshState {
@@ -381,6 +385,7 @@ impl MeshState {
             our_vdf_hash_snapshot: None,
             ygg_peered_uris: HashSet::new(),
             ygg_peer_count: 0,
+            last_hello_broadcast: None,
         }
     }
 }

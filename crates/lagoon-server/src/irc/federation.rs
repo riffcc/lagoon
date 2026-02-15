@@ -1567,6 +1567,7 @@ pub fn spawn_event_processor(
                                     port: peer_port,
                                     tls: peer_tls,
                                     want: None,
+                                    dial_host: None,
                                 });
                             let tc_arc = Arc::new(tc_with_peer);
 
@@ -1580,6 +1581,20 @@ pub fn spawn_event_processor(
                         }
                     }
 
+                    // ── Connection ceremony: first HELLO only ────────────
+                    // Gate the full ceremony (response HELLO, PEERS dump, gossip
+                    // catch-up, VDF challenge) on first contact. Re-HELLOs from
+                    // announce_hello_to_all_relays() update state (known_peers,
+                    // SPIRAL topology — handled above) but must NOT trigger the
+                    // ceremony again. Without this gate:
+                    //   A announces → B echoes HELLO → A echoes back → infinite
+                    //   ping-pong, each echo also sending PEERS + LATENCY_HAVE +
+                    //   CONNECTION_HAVE + SPORE + VdfProofReq = network flood.
+                    let first_hello = st.federation.relays.get(&remote_host)
+                        .map(|r| !r.mesh_connected)
+                        .unwrap_or(true);
+
+                    if first_hello {
                     // ── Juggler: send response HELLO after merge ────────────
                     // Built AFTER evaluate_spiral_merge + reconverge, so it
                     // carries correct spiral_index AND assigned_slot reflecting
@@ -1744,6 +1759,8 @@ pub fn spawn_event_processor(
                             MeshMessage::VdfProofReq,
                         ));
                     }
+
+                    } // end first_hello gate
 
                     // Dedup is automatic: relays are keyed by peer_id. If both an
                     // inbound and outbound connection exist to the same peer, the
@@ -2035,6 +2052,7 @@ pub fn spawn_event_processor(
                                     port,
                                     tls,
                                     want: None,
+                                    dial_host: None,
                                 },
                             );
                             let tc_arc = Arc::new(tc_with_peer);
@@ -5555,7 +5573,22 @@ fn persist_spiral_position(st: &mut super::server::ServerState, slot: u64) {
 }
 
 /// Re-send MESH HELLO to all connected relays (after position change).
+///
+/// Debounced: skips if < 5 s since the last broadcast. SPIRAL instability
+/// (reconverge, merge, collision) can trigger this at >30 Hz without the
+/// guard, flooding the mesh with HELLOs that each trigger VdfProofReq +
+/// PEERS processing on every remote. Position changes are persisted to disk
+/// immediately — the broadcast can safely be delayed.
 fn announce_hello_to_all_relays(st: &mut super::server::ServerState) {
+    const DEBOUNCE_SECS: u64 = 5;
+    let now = std::time::Instant::now();
+    if let Some(last) = st.mesh.last_hello_broadcast {
+        if now.duration_since(last) < std::time::Duration::from_secs(DEBOUNCE_SECS) {
+            return;
+        }
+    }
+    st.mesh.last_hello_broadcast = Some(now);
+
     let hello_json = serde_json::to_string(&build_hello_payload(st)).unwrap_or_default();
     for relay in st.federation.relays.values() {
         let _ = relay.outgoing_tx.send(RelayCommand::MeshHello {

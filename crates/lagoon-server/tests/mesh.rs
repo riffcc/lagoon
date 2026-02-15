@@ -509,6 +509,7 @@ fn tls_peer_entry_struct() {
         port: 443,
         tls: true,
         want: None,
+        dial_host: None,
     };
     assert!(tls_peer.tls);
     assert_eq!(tls_peer.port, 443);
@@ -519,6 +520,7 @@ fn tls_peer_entry_struct() {
         port: 6667,
         tls: false,
         want: None,
+        dial_host: None,
     };
     assert!(!plain_peer.tls);
     assert_eq!(plain_peer.port, 6667);
@@ -539,6 +541,7 @@ fn transport_config_peer_operations() {
             port: 443,
             tls: true,
             want: None,
+            dial_host: None,
         },
     );
 
@@ -550,6 +553,7 @@ fn transport_config_peer_operations() {
             port: 6667,
             tls: false,
             want: None,
+            dial_host: None,
         },
     );
 
@@ -561,6 +565,7 @@ fn transport_config_peer_operations() {
             port: 6667,
             tls: false,
             want: None,
+            dial_host: None,
         },
     );
 
@@ -593,15 +598,15 @@ fn mesh_peers_keys_work_with_peer_entry() {
     let mut config = TransportConfig::new();
     config.peers.insert(
         "lon.lagun.co".into(),
-        PeerEntry { yggdrasil_addr: None, port: 443, tls: true, want: None },
+        PeerEntry { yggdrasil_addr: None, port: 443, tls: true, want: None, dial_host: None },
     );
     config.peers.insert(
         "nyc.lagun.co".into(),
-        PeerEntry { yggdrasil_addr: None, port: 443, tls: true, want: None },
+        PeerEntry { yggdrasil_addr: None, port: 443, tls: true, want: None, dial_host: None },
     );
     config.peers.insert(
         "aus.lagun.co".into(),
-        PeerEntry { yggdrasil_addr: None, port: 443, tls: true, want: None },
+        PeerEntry { yggdrasil_addr: None, port: 443, tls: true, want: None, dial_host: None },
     );
 
     let hosts: Vec<&String> = config.peers.keys().collect();
@@ -1462,6 +1467,7 @@ fn transport_ygg_overlay_priority_with_ygg_addr() {
             port: 443,
             tls: true,
             want: None,
+            dial_host: None,
         },
     );
     // With ygg_node AND ygg_addr → overlay wins over TLS.
@@ -1480,6 +1486,7 @@ fn transport_tls_ws_when_bootstrap_no_ygg() {
             port: 443,
             tls: true,
             want: None,
+            dial_host: None,
         },
     );
     // Bootstrap peer: no ygg_addr → TLS WebSocket.
@@ -1519,6 +1526,7 @@ fn transport_peer_table_ygg_addr_enables_overlay() {
             port: 443,
             tls: false,
             want: None,
+            dial_host: None,
         },
     );
     let mode = transport::select_transport_inner("per", &peers, true);

@@ -837,19 +837,59 @@ pub fn detect_yggdrasil_addr() -> Option<Ipv6Addr> {
 /// Reads `/proc/net/if_inet6` directly (no dependency on `ip` or `iproute2`).
 pub fn detect_underlay_addr() -> Option<IpAddr> {
     // Collect all candidate addresses, then pick the best one.
-    // Priority: ULA (fc00::/7, private network) > global unicast > IPv4.
+    // Priority: private IPv4 (RFC1918) > ULA IPv6 > global IPv6.
     //
-    // ULA addresses (fd00::/8 in practice) are private-network addresses
-    // that are directly reachable between co-located machines. This is the
-    // IPv6 equivalent of RFC1918 (10.x, 172.16.x, 192.168.x). Provider-
-    // agnostic: works on any network with private IPv6 addressing.
+    // Private IPv4 is preferred because it is universally reachable on LAN
+    // networks. ULA IPv6 (fd00::/8) can come from Docker bridges, WireGuard
+    // tunnels, or other isolated virtual networks that aren't reachable from
+    // peer machines. Global IPv6 may also be unreachable if the LAN lacks
+    // IPv6 routing. On providers like Fly.io where fdaa:: is the correct
+    // address, there is typically no RFC1918 IPv4, so ULA naturally wins.
+    let mut private_ipv4: Option<IpAddr> = None;
     let mut ula_addr: Option<Ipv6Addr> = None;
     let mut global_addr: Option<Ipv6Addr> = None;
 
+    // First pass: collect IPv4 candidates from hostname -I.
+    if let Ok(output) = std::process::Command::new("hostname")
+        .args(["-I"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for token in stdout.split_whitespace() {
+            if let Ok(IpAddr::V4(v4)) = token.parse::<IpAddr>() {
+                if !v4.is_loopback() && (v4.is_private() || v4.is_link_local()) {
+                    private_ipv4 = Some(IpAddr::V4(v4));
+                    break;
+                }
+            }
+        }
+    }
+
+    // If we found a private IPv4, prefer it (most universally reachable).
+    if private_ipv4.is_some() {
+        return private_ipv4;
+    }
+
+    // Second pass: scan IPv6 from /proc/net/if_inet6, skipping virtual interfaces.
+    // Format: <hex_addr> <index> <prefix_len> <scope> <flags> <device_name>
     if let Ok(content) = std::fs::read_to_string("/proc/net/if_inet6") {
         for line in content.lines() {
-            let hex = line.split_whitespace().next().unwrap_or("");
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let hex = fields.first().copied().unwrap_or("");
+            let dev = fields.get(5).copied().unwrap_or("");
             if hex.len() != 32 {
+                continue;
+            }
+            // Skip virtual/bridge/tunnel interfaces — their addresses are
+            // typically isolated networks not reachable from peer machines.
+            if dev.starts_with("br-")
+                || dev.starts_with("docker")
+                || dev.starts_with("veth")
+                || dev.starts_with("virbr")
+                || dev.starts_with("tun")
+                || dev.starts_with("tap")
+                || dev.starts_with("wg")
+            {
                 continue;
             }
             // Skip Yggdrasil (02xx, 03xx), loopback (::1), link-local (fe80::).
@@ -884,7 +924,7 @@ pub fn detect_underlay_addr() -> Option<IpAddr> {
         return Some(IpAddr::V6(addr));
     }
 
-    // Fallback: try first non-loopback IPv4 from /proc/net/fib_trie or interfaces.
+    // Final fallback: any non-loopback IPv4 from hostname -I.
     if let Ok(output) = std::process::Command::new("hostname")
         .args(["-I"])
         .output()
