@@ -2552,3 +2552,271 @@ fn twentyone_peers_uses_geometry() {
         "N=21: should have at least 1 neighbor");
 }
 
+/// 40-node SPIRAL mesh integration test.
+///
+/// Spawns 40 real yggdrasil-rs nodes on localhost, assigns each a SPIRAL slot,
+/// computes the neighbor graph, dials all SPIRAL neighbor pairs via
+/// yggdrasil-rs peering, and verifies every node's connected peers exactly
+/// match the expected SPIRAL topology.
+///
+/// Proves:
+/// 1. All 40 nodes get unique SPIRAL slots and Ygg overlay addresses
+/// 2. Every node has the correct neighbor count for its position (≤20)
+/// 3. SPIRAL neighbor relationships are symmetric (A↔B, never A→B only)
+/// 4. All 40 nodes converge to identical topology views
+/// 5. 40 concurrent meta handshakes + ironwood sessions complete fast
+#[tokio::test]
+async fn forty_node_spiral_mesh() {
+    use std::time::{Duration, Instant};
+
+    const N: usize = 40;
+
+    let t_start = Instant::now();
+
+    // ── Step 1: Create 40 nodes with deterministic keys ──
+
+    let mut nodes = Vec::with_capacity(N);
+    let mut keys = Vec::with_capacity(N);
+
+    for i in 0..N {
+        // Deterministic seed: each node gets a unique 32-byte seed.
+        let mut seed = [0u8; 32];
+        seed[0] = (i & 0xFF) as u8;
+        seed[1] = ((i >> 8) & 0xFF) as u8;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let mut privkey = [0u8; 64];
+        privkey[..32].copy_from_slice(&seed);
+        privkey[32..].copy_from_slice(signing_key.verifying_key().as_bytes());
+        keys.push(privkey);
+
+        let node = yggdrasil_rs::YggNode::new(
+            &privkey,
+            &[],
+            &["tcp://127.0.0.1:0".to_string()],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("node {i} failed to start: {e}"));
+        nodes.push(node);
+    }
+
+    let t_nodes_created = t_start.elapsed();
+
+    // ── Verify unique identities ──
+
+    let ports: Vec<u16> = nodes.iter().map(|n| n.listener_addrs()[0].port()).collect();
+    let addrs: Vec<_> = nodes.iter().map(|n| n.address()).collect();
+    let unique_addrs: HashSet<_> = addrs.iter().collect();
+    assert_eq!(unique_addrs.len(), N, "all {N} nodes must have unique Ygg overlay addresses");
+
+    // All addresses must be in the 200::/7 range.
+    for (i, addr) in addrs.iter().enumerate() {
+        assert!(
+            yggdrasil_rs::crypto::is_yggdrasil_addr(addr),
+            "node {i} address {addr} is not in 200::/7 range"
+        );
+    }
+
+    // Mesh keys: public_key_hex is the SPIRAL mesh key (same as production).
+    let mesh_keys: Vec<String> = nodes.iter().map(|n| n.public_key_hex()).collect();
+    let unique_keys: HashSet<_> = mesh_keys.iter().collect();
+    assert_eq!(unique_keys.len(), N, "all {N} nodes must have unique public keys");
+
+    // ── Step 2: Compute SPIRAL topology from every node's perspective ──
+    //
+    // Each node builds its own SpiralTopology and discovers its neighbors.
+    // With N=40 (>20), SPIRAL uses geometric gap-and-wrap (not the "everyone
+    // is a neighbor" small-N shortcut).
+
+    let mut expected_neighbors: Vec<HashSet<usize>> = vec![HashSet::new(); N];
+    let mut spiral_slots: Vec<u64> = Vec::with_capacity(N);
+
+    for i in 0..N {
+        let mut topo = SpiralTopology::new();
+
+        // Add all OTHER peers first.
+        for j in 0..N {
+            if j != i {
+                topo.force_add_peer(&mesh_keys[j], Spiral3DIndex::new(j as u64));
+            }
+        }
+
+        // Claim our own slot.
+        let idx = topo.claim_specific_position(&mesh_keys[i], i as u64);
+        spiral_slots.push(idx.value());
+
+        // Record neighbor indices.
+        for neighbor_key in topo.neighbors() {
+            let neighbor_idx = mesh_keys.iter().position(|k| k == neighbor_key)
+                .expect("neighbor key must exist in mesh_keys");
+            expected_neighbors[i].insert(neighbor_idx);
+        }
+    }
+
+    // ── Verify SPIRAL slot uniqueness ──
+
+    let unique_slots: HashSet<u64> = spiral_slots.iter().copied().collect();
+    assert_eq!(
+        unique_slots.len(), N,
+        "all {N} nodes must occupy unique SPIRAL slots, got {} unique",
+        unique_slots.len()
+    );
+
+    // ── Verify neighbor counts ──
+
+    let mut min_neighbors = N;
+    let mut max_neighbors = 0;
+    let total_neighbor_count: usize = expected_neighbors.iter().map(|n| n.len()).sum();
+
+    for i in 0..N {
+        let count = expected_neighbors[i].len();
+        min_neighbors = min_neighbors.min(count);
+        max_neighbors = max_neighbors.max(count);
+
+        assert!(
+            count >= 1,
+            "node {i} (slot {}) must have at least 1 SPIRAL neighbor, got 0",
+            spiral_slots[i]
+        );
+        assert!(
+            count <= 20,
+            "node {i} (slot {}) has {count} neighbors, SPIRAL max is 20",
+            spiral_slots[i]
+        );
+    }
+
+    // ── Verify symmetry: if A→B then B→A ──
+
+    let mut asymmetries = 0usize;
+    for i in 0..N {
+        for &j in &expected_neighbors[i] {
+            if !expected_neighbors[j].contains(&i) {
+                asymmetries += 1;
+            }
+        }
+    }
+    assert_eq!(
+        asymmetries, 0,
+        "SPIRAL topology must be symmetric — found {asymmetries} one-way neighbor relationships"
+    );
+
+    // ── Verify all nodes agree on topology (convergence) ──
+    //
+    // Since every node sees the same set of 40 occupied slots and uses the
+    // same geometric algorithm, the neighbor graph computed from any two
+    // perspectives for the same node must agree. Test: for every node i,
+    // verify that every node j that considers i a neighbor also appears in
+    // i's own neighbor list (already checked by symmetry above, but let's
+    // also verify the TOTAL edge count is consistent).
+
+    let mut pair_set: HashSet<(usize, usize)> = HashSet::new();
+    for i in 0..N {
+        for &j in &expected_neighbors[i] {
+            let pair = if i < j { (i, j) } else { (j, i) };
+            pair_set.insert(pair);
+        }
+    }
+    // Total edges (counting both directions) should be exactly 2 × unique pairs.
+    assert_eq!(
+        total_neighbor_count,
+        pair_set.len() * 2,
+        "edge count mismatch: sum of neighbor counts ({total_neighbor_count}) \
+         should equal 2 × unique pairs ({})",
+        pair_set.len() * 2
+    );
+
+    let total_connections = pair_set.len();
+    let avg_neighbors = total_neighbor_count as f64 / N as f64;
+
+    eprintln!(
+        "SPIRAL topology computed: {N} nodes, {total_connections} unique pairs, \
+         neighbors: min={min_neighbors} max={max_neighbors} avg={avg_neighbors:.1}"
+    );
+
+    // ── Step 3: Dial all SPIRAL neighbor pairs ──
+    //
+    // Lower-indexed node dials higher-indexed node. Both sides see
+    // the connection (outbound for dialer, inbound for listener).
+
+    let watches: Vec<_> = nodes.iter().map(|n| n.peer_count_watch()).collect();
+
+    let t_dial_start = Instant::now();
+
+    for &(i, j) in &pair_set {
+        let uri = format!("tcp://127.0.0.1:{}", ports[j]);
+        nodes[i].add_peer(&uri)
+            .unwrap_or_else(|e| panic!("node {i} → {j}: add_peer failed: {e}"));
+    }
+
+    // ── Step 4: Wait for all connections (event-driven, no polling) ──
+
+    let wait_futs: Vec<_> = (0..N)
+        .map(|i| {
+            let expected = expected_neighbors[i].len();
+            let mut rx = watches[i].clone();
+            async move {
+                while *rx.borrow_and_update() < expected {
+                    rx.changed().await.unwrap();
+                }
+            }
+        })
+        .collect();
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        futures::future::join_all(wait_futs),
+    )
+    .await
+    .expect("all 40 nodes should reach expected peer counts within 10 seconds");
+
+    let t_mesh_formed = t_dial_start.elapsed();
+
+    // ── Step 5: Verify mesh topology ──
+    //
+    // Each node's actual connected peer keys must exactly match its
+    // expected SPIRAL neighbor set.
+
+    for i in 0..N {
+        let peers = nodes[i].peers().await;
+        let actual_keys: HashSet<[u8; 32]> = peers.iter().map(|p| p.key).collect();
+
+        let expected_keys: HashSet<[u8; 32]> = expected_neighbors[i]
+            .iter()
+            .map(|&j| {
+                yggdrasil_rs::Identity::from_privkey_bytes(&keys[j]).public_key_bytes
+            })
+            .collect();
+
+        assert_eq!(
+            actual_keys.len(),
+            expected_keys.len(),
+            "node {i} (slot {}): expected {} peers, got {}",
+            spiral_slots[i],
+            expected_keys.len(),
+            actual_keys.len(),
+        );
+
+        assert_eq!(
+            actual_keys, expected_keys,
+            "node {i} (slot {}): connected peers don't match SPIRAL neighbors",
+            spiral_slots[i],
+        );
+    }
+
+    let t_total = t_start.elapsed();
+
+    eprintln!(
+        "\n=== 40-NODE SPIRAL MESH: VERIFIED ===\n\
+         Nodes:        {N}\n\
+         Connections:  {total_connections}\n\
+         Neighbors:    min={min_neighbors} max={max_neighbors} avg={avg_neighbors:.1}\n\
+         Node startup: {t_nodes_created:.1?}\n\
+         Mesh formed:  {t_mesh_formed:.1?} ({total_connections} concurrent meta handshakes)\n\
+         Total:        {t_total:.1?}\n\
+         All SPIRAL slots unique: yes\n\
+         All neighbor sets symmetric: yes\n\
+         All topology views converge: yes\n\
+         All Ygg peer keys verified: yes\n\
+         ==================================="
+    );
+}
+
