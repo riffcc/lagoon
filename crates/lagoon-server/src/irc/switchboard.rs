@@ -455,6 +455,8 @@ async fn raw_mesh_handler(
     let remote_mesh_key: Option<String> = Some(remote_peer_id.clone());
     let mut last_ping = Instant::now();
     let ping_interval = Duration::from_secs(30);
+    // PoL challenge timing — nonce → when we sent it.
+    let mut pol_pending: std::collections::HashMap<u64, Instant> = std::collections::HashMap::new();
 
     // Spawn reader task — owns the BufReader, never cancelled mid-read.
     let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Result<Option<String>, String>>();
@@ -488,6 +490,26 @@ async fn raw_mesh_handler(
                     Some(Ok(None)) => {} // keepalive — ignore
                     Some(Ok(Some(text))) => {
                         match MeshMessage::from_json(&text) {
+                            Ok(MeshMessage::PolChallenge { nonce }) => {
+                                // Fast path — respond immediately, no dispatch.
+                                let response = MeshMessage::PolResponse { nonce };
+                                if let Ok(json) = response.to_json() {
+                                    if wire::write_mesh_frame(&mut writer, json.as_bytes()).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            Ok(MeshMessage::PolResponse { nonce }) => {
+                                // Complete timing — relay-local, no dispatch.
+                                if let Some(sent_at) = pol_pending.remove(&nonce) {
+                                    let rtt_us = sent_at.elapsed().as_micros() as u64;
+                                    let _ = event_tx.send(RelayEvent::PolCompleted {
+                                        remote_host: remote_peer_id.clone(),
+                                        rtt_us,
+                                        mesh_key: remote_mesh_key.clone(),
+                                    });
+                                }
+                            }
                             Ok(msg) => {
                                 let _ = dispatch_mesh_message(
                                     msg,
@@ -522,6 +544,10 @@ async fn raw_mesh_handler(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(RelayCommand::SendMesh(mesh_msg)) => {
+                        // Record timing for outgoing PoL challenges.
+                        if let MeshMessage::PolChallenge { nonce } = &mesh_msg {
+                            pol_pending.insert(*nonce, Instant::now());
+                        }
                         if let Ok(json) = mesh_msg.to_json() {
                             if wire::write_mesh_frame(&mut writer, json.as_bytes()).await.is_err() { break; }
                         }

@@ -55,6 +55,10 @@ pub struct PeerEntry {
     /// via the anycast switchboard. Used by `dial_missing_spiral_neighbors` to
     /// reach peers through the anycast entry point without Ygg overlay routing.
     pub want: Option<String>,
+    /// Override hostname for the switchboard TCP dial. When set, this IP/host
+    /// is used instead of `remote_host` or `yggdrasil_addr`. Used for underlay
+    /// addresses (LAN IPs) that are directly reachable without Ygg overlay routing.
+    pub dial_host: Option<String>,
 }
 
 /// Federation transport configuration.
@@ -421,8 +425,16 @@ pub async fn connect_native(
     if port == SWITCHBOARD_PORT && !tls {
         let our_pid = from_peer_id.unwrap_or("");
         let want = peer.and_then(|p| p.want.as_deref()).unwrap_or("any");
-        info!(remote_host, want, "transport: native mesh via switchboard half-dial");
-        match connect_switchboard(remote_host, our_pid, want).await? {
+        // Dial target priority:
+        // 1. dial_host override (underlay LAN IP — works without Ygg overlay)
+        // 2. yggdrasil_addr (overlay — needs functioning Ygg mesh)
+        // 3. remote_host (hostname — needs DNS/hosts resolution)
+        let dial_host = peer
+            .and_then(|p| p.dial_host.as_deref().map(|s| s.to_string())
+                .or_else(|| p.yggdrasil_addr.map(|a| a.to_string())))
+            .unwrap_or_else(|| remote_host.to_string());
+        info!(remote_host, %dial_host, want, "transport: native mesh via switchboard half-dial");
+        match connect_switchboard(&dial_host, our_pid, want).await? {
             SwitchboardOutcome::Ready(ns) => return Ok(ns),
             SwitchboardOutcome::DirectRedirect { target_peer_id, ygg_addr } => {
                 // Switchboard told us the target is at a different underlay
@@ -670,7 +682,7 @@ pub async fn connect_switchboard(
 ///
 /// Returns the bracketed address for IPv6, or the bare host for IPv4.
 /// Falls back to returning the input as-is if parsing fails.
-fn extract_host_from_uri(uri: &str) -> String {
+pub fn extract_host_from_uri(uri: &str) -> String {
     // Format: tcp://[host]:port or tcp://host:port
     let stripped = uri
         .strip_prefix("tcp://")
@@ -917,6 +929,7 @@ fn parse_peer_entry(entry: &str) -> Option<(String, PeerEntry)> {
                 port,
                 tls,
                 want: None,
+                dial_host: None,
             },
         ))
     } else {
@@ -929,6 +942,7 @@ fn parse_peer_entry(entry: &str) -> Option<(String, PeerEntry)> {
                 port,
                 tls,
                 want: None,
+                dial_host: None,
             },
         ))
     }
@@ -1052,6 +1066,7 @@ mod tests {
                 port: DEFAULT_PORT,
                 tls: false,
                 want: None,
+                dial_host: None,
             },
         );
 
@@ -1085,6 +1100,7 @@ mod tests {
                 port: DEFAULT_PORT,
                 tls: false,
                 want: None,
+                dial_host: None,
             },
         );
 
@@ -1186,6 +1202,7 @@ mod tests {
                 port: DEFAULT_PORT,
                 tls: false,
                 want: None,
+                dial_host: None,
             },
         );
         let mode = select_transport_inner("per.lagun.co", &peers, true);
@@ -1203,6 +1220,7 @@ mod tests {
                 port: 443,
                 tls: true,
                 want: None,
+                dial_host: None,
             },
         );
         // No ygg_node → falls through to TLS WS.
@@ -1226,6 +1244,7 @@ mod tests {
                 port: 443,
                 tls: true,
                 want: None,
+                dial_host: None,
             },
         );
         // ygg_node exists but peer has no ygg_addr → TLS WS.
@@ -1249,6 +1268,7 @@ mod tests {
                 port: 6667,
                 tls: false,
                 want: None,
+                dial_host: None,
             },
         );
         let mode = select_transport_inner("sanctuary.lon.riff.cc", &peers, false);
@@ -1285,6 +1305,7 @@ mod tests {
                 port: 443,
                 tls: true, // would be TLS WS, but Ygg overlay wins
                 want: None,
+                dial_host: None,
             },
         );
         let mode = select_transport_inner("lon.lagun.co", &peers, true);

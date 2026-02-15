@@ -163,6 +163,18 @@ pub enum MeshMessage {
     /// the peers and NOT reconnect to this hub.
     #[serde(rename = "redirect")]
     Redirect { peers: Vec<MeshPeerInfo> },
+
+    /// PoL challenge — initiates latency measurement to a neighbor.
+    /// The receiver must immediately respond with PolResponse carrying the same nonce.
+    /// RTT is measured between sending this and receiving the response.
+    /// The resulting proof is Ed25519-signed and VDF-anchored (Citadel PoLP).
+    #[serde(rename = "pol_challenge")]
+    PolChallenge { nonce: u64 },
+
+    /// PoL response — echoes the nonce from a PolChallenge.
+    /// Must be sent as fast as possible (no routing through event loop).
+    #[serde(rename = "pol_response")]
+    PolResponse { nonce: u64 },
 }
 
 impl MeshMessage {
@@ -852,6 +864,48 @@ mod tests {
                 }
             }
             other => panic!("expected Cvdf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pol_challenge_round_trip() {
+        let msg = MeshMessage::PolChallenge { nonce: 0xDEADBEEF_CAFEBABE };
+        let json = msg.to_json().unwrap();
+        assert!(json.contains(r#""type":"pol_challenge""#));
+        assert!(json.contains(r#""nonce""#));
+        let decoded = MeshMessage::from_json(&json).unwrap();
+        match decoded {
+            MeshMessage::PolChallenge { nonce } => {
+                assert_eq!(nonce, 0xDEADBEEF_CAFEBABE);
+            }
+            other => panic!("expected PolChallenge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pol_response_round_trip() {
+        let msg = MeshMessage::PolResponse { nonce: 42 };
+        let json = msg.to_json().unwrap();
+        assert!(json.contains(r#""type":"pol_response""#));
+        let decoded = MeshMessage::from_json(&json).unwrap();
+        match decoded {
+            MeshMessage::PolResponse { nonce } => assert_eq!(nonce, 42),
+            other => panic!("expected PolResponse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pol_challenge_response_nonce_matches() {
+        let nonce = 123456789;
+        let challenge = MeshMessage::PolChallenge { nonce };
+        let response = MeshMessage::PolResponse { nonce };
+        let cj = challenge.to_json().unwrap();
+        let rj = response.to_json().unwrap();
+        match (MeshMessage::from_json(&cj).unwrap(), MeshMessage::from_json(&rj).unwrap()) {
+            (MeshMessage::PolChallenge { nonce: cn }, MeshMessage::PolResponse { nonce: rn }) => {
+                assert_eq!(cn, rn);
+            }
+            _ => panic!("unexpected types"),
         }
     }
 

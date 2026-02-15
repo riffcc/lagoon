@@ -24,9 +24,6 @@ use super::transport::{self, TransportConfig};
 use super::wire::{MeshMessage, HelloPayload};
 use base64::Engine as _;
 
-/// Maximum disconnected peers retained per SITE_NAME before dedup eviction.
-const MAX_DISCONNECTED_PER_SITE: usize = 5;
-
 /// Build the Yggdrasil underlay peer URI for APE (Anycast Peer Entry).
 ///
 /// Strategy: prefer the **underlay address** derived from the relay's TCP peer
@@ -259,6 +256,12 @@ pub fn dispatch_mesh_message(
             });
             None
         }
+        // PolChallenge is handled inline by the relay loop for minimal latency.
+        // If it reaches dispatch, it's a no-op (e.g., unexpected path).
+        MeshMessage::PolChallenge { .. } => None,
+        // PolResponse is NOT handled inline — we don't have timing context here.
+        // The relay loop handles it directly for timing precision.
+        MeshMessage::PolResponse { .. } => None,
     }
 }
 
@@ -367,8 +370,6 @@ pub fn dial_missing_spiral_neighbors(
         };
 
         let node_name = peer.node_name.clone();
-        let port = peer.port;
-        let tls = peer.tls;
 
         // Add a direct Ygg underlay link for SPIRAL neighbors — but only once.
         // After the first successful add (or "already configured" error), record
@@ -452,12 +453,21 @@ pub fn dial_missing_spiral_neighbors(
 
         // Choose route: Ygg overlay if available, otherwise anycast switchboard.
         let (connect_key, peer_entry) = if peer_ygg_addr.is_some() {
-            // Ygg overlay — use node_name as connect key, overlay routes via mesh.
+            // Ygg overlay — dial the peer's switchboard directly.
+            // Port MUST be SWITCHBOARD_PORT (9443) — SPIRAL neighbors use the
+            // switchboard protocol, not IRC. peer.port is the IRC listen port
+            // (6667 etc.) which connect_native rejects as PlainTcp.
+            //
+            // Prefer underlay address (LAN IP like 10.7.1.37) over Ygg overlay
+            // address (200:xxxx::). Underlay works immediately; overlay only
+            // works when the Ygg mesh is fully established with peering.
+            let underlay_host = peer_uri.map(|u| transport::extract_host_from_uri(u));
             (node_name.clone(), transport::PeerEntry {
                 yggdrasil_addr: peer_ygg_addr,
-                port,
-                tls,
+                port: transport::SWITCHBOARD_PORT,
+                tls: false,
                 want: None,
+                dial_host: underlay_host,
             })
         } else {
             // Anycast switchboard — dial the entry point, request this specific peer.
@@ -473,6 +483,7 @@ pub fn dial_missing_spiral_neighbors(
                 port: transport::SWITCHBOARD_PORT,
                 tls: false,
                 want: Some(format!("peer:{}", neighbor_mkey)),
+                dial_host: None,
             })
         };
 
@@ -502,52 +513,6 @@ pub fn dial_missing_spiral_neighbors(
             false,
         );
     }
-}
-
-/// Evict excess disconnected peers per SITE_NAME, keeping the most recently
-/// seen ones up to `MAX_DISCONNECTED_PER_SITE`. Returns evicted mesh keys.
-fn dedup_peers_per_site(
-    mesh: &mut super::server::MeshState,
-    our_mesh_key: &str,
-) -> Vec<String> {
-    // Group disconnected mesh keys by site_name.
-    let mut by_site: HashMap<String, Vec<(String, u64)>> = HashMap::new();
-    for (mkey, peer) in mesh.known_peers.iter() {
-        if mkey == our_mesh_key {
-            continue;
-        }
-        let connected = mesh.connections.get(mkey).copied()
-            == Some(MeshConnectionState::Connected);
-        if connected {
-            continue;
-        }
-        by_site
-            .entry(peer.site_name.clone())
-            .or_default()
-            .push((mkey.clone(), peer.last_seen));
-    }
-
-    let mut evicted = Vec::new();
-    for (_site, mut peers) in by_site {
-        if peers.len() <= MAX_DISCONNECTED_PER_SITE {
-            continue;
-        }
-        // Sort by last_seen descending — keep the freshest.
-        peers.sort_by(|a, b| b.1.cmp(&a.1));
-        for (mkey, _) in peers.into_iter().skip(MAX_DISCONNECTED_PER_SITE) {
-            if let Some(peer) = mesh.known_peers.remove(&mkey) {
-                info!(
-                    mesh_key = %mkey,
-                    site_name = %peer.site_name,
-                    last_seen = peer.last_seen,
-                    "mesh: evicting excess disconnected peer for site dedup"
-                );
-                mesh.spiral.remove_peer(&mkey);
-            }
-            evicted.push(mkey);
-        }
-    }
-    evicted
 }
 
 /// Check if a nick belongs to relay infrastructure.
@@ -768,6 +733,13 @@ pub enum RelayEvent {
         /// Mesh key from HELLO — O(1) lookup into known_peers.
         mesh_key: Option<String>,
     },
+    /// PoL challenge-response completed — relay task measured the RTT.
+    /// The main event loop creates a signed LatencyProof from this.
+    PolCompleted {
+        remote_host: String,
+        rtt_us: u64,
+        mesh_key: Option<String>,
+    },
     /// Received MESH LATENCY_HAVE — remote peer's latency proof SPORE.
     LatencyHaveList {
         remote_host: String,
@@ -958,6 +930,21 @@ pub fn spawn_event_processor(
         );
         // Skip the first immediate tick — spawn_mesh_connector handles initial connect.
         bootstrap_retry_interval.tick().await;
+
+        // PoL challenge: send latency measurement challenges to all connected relays.
+        // 10s interval — generates Ed25519-signed LatencyProofs via challenge/response.
+        let mut pol_challenge_interval = tokio::time::interval(
+            std::time::Duration::from_secs(10),
+        );
+        pol_challenge_interval.set_missed_tick_behavior(
+            tokio::time::MissedTickBehavior::Skip,
+        );
+        pol_challenge_interval.tick().await;
+        // Nonce counter for PoL challenges (monotonically increasing).
+        let mut pol_nonce_counter: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
 
         // Latency swap: periodic deterministic swap round for topology optimization.
         // Every node computes the same swap decisions from shared PoLP latency data.
@@ -1521,12 +1508,6 @@ pub fn spawn_event_processor(
                         }
                     }
 
-                    // Per-site dedup: cap disconnected peers per SITE_NAME.
-                    let site_evicted = dedup_peers_per_site(&mut st.mesh, &our_pid);
-                    if !site_evicted.is_empty() {
-                        st.notify_topology_change();
-                    }
-
                     // Ghost cleanup is no longer needed — relays are keyed by peer_id.
                     // If a relay task reconnects via anycast and reaches a different
                     // node, relay_task_native removes the old relay (keyed by old
@@ -1604,28 +1585,26 @@ pub fn spawn_event_processor(
                     // carries correct spiral_index AND assigned_slot reflecting
                     // ALL previous merges processed by the federation loop.
                     //
-                    // Eager slot registration: when we assign a slot to an
-                    // unclaimed joiner, register them at that slot NOW so the
-                    // next joiner (queued behind this one) gets a different slot.
-                    // Without this, two joiners processed back-to-back both get
-                    // assigned_slot=1 (thundering herd on slots).
+                    // Concierge slot: computed ONLY here, not in build_hello_payload.
+                    // build_hello_payload is called for announcements, outbound
+                    // connections, and re-sends — computing assigned_slot there
+                    // created phantom pending reservations that pushed real
+                    // assignments to slot 654+.
                     {
-                        let our_hello = build_wire_hello(&mut st);
+                        let mut our_hello = build_wire_hello(&mut st);
+
+                        // Concierge: if remote is unclaimed, assign them a slot.
                         if !spiral_changed && spiral_index.is_none() {
-                            if let Some(slot) = our_hello.assigned_slot {
+                            if let Some(slot) = compute_concierge_slot(&mut st) {
+                                our_hello.assigned_slot = Some(slot);
                                 st.mesh.spiral.add_peer(
                                     &mkey,
                                     citadel_topology::Spiral3DIndex::new(slot),
                                 );
-                                // Update known_peers so PEERS gossip carries the
-                                // assignment and the next build_hello_payload sees
-                                // this slot as occupied.
                                 if let Some(peer) = st.mesh.known_peers.get_mut(&mkey) {
                                     peer.spiral_index = Some(slot);
                                 }
-                                // Clear pending reservation — the real registration
-                                // supersedes the tentative reservation from
-                                // build_hello_payload.
+                                // Real registration supersedes pending reservation.
                                 st.mesh.pending_assigned_slots.remove(&slot);
                                 info!(
                                     slot,
@@ -1946,22 +1925,6 @@ pub fn spawn_event_processor(
                     // Concierge claiming happens in HELLO (assigned_slot), not here.
                     // If we're still unclaimed after processing MESH PEERS, the
                     // concierge was broken — we'll reconnect to a working one.
-
-                    // Per-site dedup BEFORE re-gossip — prevents evict/re-discover loops
-                    // where evicted peers get re-gossiped, re-inserted, evicted again.
-                    let our_pid = st.lens.peer_id.clone();
-                    let site_evicted = dedup_peers_per_site(&mut st.mesh, &our_pid);
-                    if !site_evicted.is_empty() {
-                        changed = true;
-                        // Remove evicted peers from newly_discovered so we don't
-                        // re-gossip entries that were just evicted.
-                        let evicted_pids: HashSet<String> = site_evicted.iter().cloned().collect();
-                        newly_discovered.retain(|p| {
-                            !evicted_pids.contains(&p.peer_id)
-                        });
-                        // Also remove from new_peer_servers (matched by mesh_key).
-                        new_peer_servers.retain(|(mkey, _, _, _, _)| !evicted_pids.contains(mkey));
-                    }
 
                     // Multi-hop gossip: re-broadcast newly discovered peers to
                     // all connected relays except the source. Only includes peers
@@ -2393,6 +2356,100 @@ pub fn spawn_event_processor(
                             let pruned = st.mesh.proof_store.prune_stale(now_ms);
                             if pruned > 0 {
                                 tracing::info!(pruned, "polp: pruned stale proofs");
+                            }
+                        }
+                    }
+
+                    st.notify_topology_change();
+                }
+
+                RelayEvent::PolCompleted { remote_host, rtt_us, mesh_key } => {
+                    let mut st = state.write().await;
+
+                    let rtt_ms = rtt_us as f64 / 1000.0;
+
+                    // Store on relay handle for direct lookup.
+                    if let Some(relay) = st.federation.relays.get_mut(&remote_host) {
+                        relay.last_rtt_ms = Some(rtt_ms);
+                    }
+
+                    if let Some(peer_id) = mesh_key {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+
+                        let our_pid = st.lens.peer_id.clone();
+                        let edge = super::proof_store::ProofStore::edge_key(
+                            &our_pid, &peer_id,
+                        );
+
+                        // Create a real Ed25519-signed LatencyProof from citadel-lens.
+                        let signing_key = ed25519_dalek::SigningKey::from_bytes(
+                            &st.lens.secret_seed,
+                        );
+                        let our_pubkey = signing_key.verifying_key().to_bytes();
+                        let remote_pubkey = hex::decode(&st.mesh.known_peers
+                            .get(&peer_id)
+                            .map(|p| p.public_key_hex.clone())
+                            .unwrap_or_default())
+                            .ok()
+                            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                            .unwrap_or([0u8; 32]);
+
+                        // VDF height and output for proof anchoring.
+                        let (vdf_height, vdf_output) = st.mesh.vdf_state_rx
+                            .as_ref()
+                            .map(|rx| {
+                                let vdf = rx.borrow();
+                                (vdf.total_steps, vdf.current_hash)
+                            })
+                            .unwrap_or((0, [0u8; 32]));
+
+                        let latency_proof = citadel_lens::proof_of_latency::LatencyProof::new(
+                            our_pubkey,
+                            remote_pubkey,
+                            rtt_us,
+                            vdf_height,
+                            vdf_output,
+                            &signing_key,
+                        );
+
+                        let proof_bytes = bincode::serialize(&latency_proof)
+                            .unwrap_or_default();
+
+                        let entry = super::proof_store::ProofStore::make_entry(
+                            edge, rtt_ms, now_ms, proof_bytes,
+                        );
+
+                        if st.mesh.proof_store.insert(entry) {
+                            tracing::info!(
+                                remote_host,
+                                rtt_us,
+                                rtt_ms,
+                                vdf_height,
+                                proofs = st.mesh.proof_store.len(),
+                                "pol: Ed25519-signed proof inserted",
+                            );
+
+                            // Proof was new/updated — trigger gossip to SPIRAL neighbors.
+                            let spore_bytes = bincode::serialize(
+                                st.mesh.proof_store.spore(),
+                            ).unwrap_or_default();
+                            let actions = st.mesh.latency_gossip
+                                .on_proof_updated(now_ms, &spore_bytes);
+                            if !actions.is_empty() {
+                                tracing::info!(
+                                    count = actions.len(),
+                                    "pol: sending LATENCY_HAVE to SPIRAL neighbors",
+                                );
+                            }
+                            execute_latency_gossip_actions(&st, actions);
+
+                            // Event-driven prune (no polling).
+                            let pruned = st.mesh.proof_store.prune_stale(now_ms);
+                            if pruned > 0 {
+                                tracing::info!(pruned, "pol: pruned stale proofs");
                             }
                         }
                     }
@@ -2889,6 +2946,23 @@ pub fn spawn_event_processor(
                         Arc::clone(&tc),
                         state.clone(),
                         true,
+                    );
+                }
+            }
+
+            // PoL challenge round: send PolChallenge to every connected relay.
+            // Relay tasks record timing; PolResponse creates Ed25519 LatencyProof.
+            _ = pol_challenge_interval.tick() => {
+                let st = state.read().await;
+                let relay_count = st.federation.relays.len();
+                if relay_count == 0 { continue; }
+                for (_peer_id, relay) in st.federation.relays.iter() {
+                    if !relay.mesh_connected { continue; }
+                    pol_nonce_counter += 1;
+                    let _ = relay.outgoing_tx.send(
+                        RelayCommand::SendMesh(
+                            MeshMessage::PolChallenge { nonce: pol_nonce_counter },
+                        ),
                     );
                 }
             }
@@ -3618,6 +3692,8 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     keepalive.tick().await; // skip first immediate tick
     let mut last_ping_sent = tokio::time::Instant::now();
+    // PoL challenge timing — nonce → when we sent it.
+    let mut pol_pending: HashMap<u64, std::time::Instant> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -3626,6 +3702,26 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
                 match ws_msg {
                     Some(Ok(TungsMsg::Text(text))) => {
                         match MeshMessage::from_json(&text) {
+                            Ok(MeshMessage::PolChallenge { nonce }) => {
+                                // Fast path — respond immediately, no dispatch.
+                                let response = MeshMessage::PolResponse { nonce };
+                                if let Ok(json) = response.to_json() {
+                                    if ws_tx.send(TungsMsg::Text(json.into())).await.is_err() {
+                                        return NativeLoopOutcome::Reconnect;
+                                    }
+                                }
+                            }
+                            Ok(MeshMessage::PolResponse { nonce }) => {
+                                // Complete timing — relay-local, no dispatch.
+                                if let Some(sent_at) = pol_pending.remove(&nonce) {
+                                    let rtt_us = sent_at.elapsed().as_micros() as u64;
+                                    let _ = event_tx.send(RelayEvent::PolCompleted {
+                                        remote_host: remote_peer_id.clone(),
+                                        rtt_us,
+                                        mesh_key: remote_mesh_key.clone(),
+                                    });
+                                }
+                            }
                             Ok(msg) => {
                                 // Redirect = informational peer list. Dispatch
                                 // for discovery but do NOT kill the connection.
@@ -3713,6 +3809,10 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(RelayCommand::SendMesh(mesh_msg)) => {
+                        // Record timing for outgoing PoL challenges.
+                        if let MeshMessage::PolChallenge { nonce } = &mesh_msg {
+                            pol_pending.insert(*nonce, std::time::Instant::now());
+                        }
                         if let Ok(json) = mesh_msg.to_json() {
                             if ws_tx.send(TungsMsg::Text(json.into())).await.is_err() {
                                 return NativeLoopOutcome::Reconnect;
@@ -3949,6 +4049,8 @@ async fn native_raw_loop(
     let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     keepalive.tick().await; // skip first immediate tick
+    // PoL challenge timing — nonce → when we sent it.
+    let mut pol_pending: HashMap<u64, std::time::Instant> = HashMap::new();
 
     let outcome = loop {
         tokio::select! {
@@ -3963,6 +4065,26 @@ async fn native_raw_loop(
                     Some(Ok(None)) => {} // keepalive
                     Some(Ok(Some(text))) => {
                         match MeshMessage::from_json(&text) {
+                            Ok(MeshMessage::PolChallenge { nonce }) => {
+                                // Fast path — respond immediately, no dispatch.
+                                let response = MeshMessage::PolResponse { nonce };
+                                if let Ok(json) = response.to_json() {
+                                    if wire::write_mesh_frame(&mut writer, json.as_bytes()).await.is_err() {
+                                        break NativeLoopOutcome::Reconnect;
+                                    }
+                                }
+                            }
+                            Ok(MeshMessage::PolResponse { nonce }) => {
+                                // Complete timing — relay-local, no dispatch.
+                                if let Some(sent_at) = pol_pending.remove(&nonce) {
+                                    let rtt_us = sent_at.elapsed().as_micros() as u64;
+                                    let _ = event_tx.send(RelayEvent::PolCompleted {
+                                        remote_host: remote_peer_id.clone(),
+                                        rtt_us,
+                                        mesh_key: remote_mesh_key.clone(),
+                                    });
+                                }
+                            }
                             Ok(msg) => {
                                 if matches!(&msg, MeshMessage::Redirect { .. }) {
                                     info!(
@@ -4030,6 +4152,10 @@ async fn native_raw_loop(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(RelayCommand::SendMesh(mesh_msg)) => {
+                        // Record timing for outgoing PoL challenges.
+                        if let MeshMessage::PolChallenge { nonce } = &mesh_msg {
+                            pol_pending.insert(*nonce, std::time::Instant::now());
+                        }
                         if let Ok(json) = mesh_msg.to_json() {
                             if wire::write_mesh_frame(&mut writer, json.as_bytes()).await.is_err() {
                                 break NativeLoopOutcome::Reconnect;
@@ -5222,6 +5348,11 @@ fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
             st.mesh.spiral.remove_peer(evicted_key);
 
             // Cut the Ygg overlay connection — dead nodes don't get to stay peered.
+            // Also clear `ygg_peered_uris` so dial_missing_spiral_neighbors can
+            // re-add this peer when it comes back online.
+            if let Some(ref underlay) = peer.underlay_uri {
+                st.mesh.ygg_peered_uris.remove(underlay.as_str());
+            }
             if let Some(ref ygg) = st.transport_config.ygg_node {
                 if let Some(ref uri) = peer.ygg_peer_uri {
                     let ygg = ygg.clone();
@@ -5364,6 +5495,25 @@ fn reconverge_spiral(
     // Evict stale peers first — frees slots held by dead nodes.
     evict_stale_spiral_peers(st);
 
+    // Knowledge gate: if we're at slot N but our spiral occupied map has
+    // fewer than N entries, our topology view is incomplete — gossip hasn't
+    // propagated all assignments yet. Moving to a "lower empty" slot causes
+    // thundering herd: every node with incomplete knowledge independently
+    // moves to slot 1. Wait until we know about enough peers.
+    if let Some(our_idx) = st.mesh.spiral.our_index() {
+        let occupied_count = st.mesh.spiral.all_occupied().len() as u64;
+        if occupied_count < our_idx.value() {
+            tracing::debug!(
+                our_slot = our_idx.value(),
+                known_peers = occupied_count,
+                "SPIRAL reconverge: skipped — incomplete topology (need {} peers, have {})",
+                our_idx.value(),
+                occupied_count,
+            );
+            return false;
+        }
+    }
+
     // Self-only convergence: check if there's a lower slot available.
     // Each node moves only ITSELF. Remote peers decide for themselves
     // when they receive gossip. Never repack remote peers locally —
@@ -5494,38 +5644,13 @@ fn build_hello_payload(st: &mut super::server::ServerState) -> MeshHelloPayload 
             (Some(status.height), Some(status.weight), Some(status.tip_hex), Some(status.genesis_hex))
         }).unwrap_or((None, None, None, None));
 
-    // Concierge: if we're established (have a SPIRAL slot), compute the
-    // first empty slot so joiners can take it from our HELLO immediately.
-    // One integer. O(1). Scales to millions.
-    //
-    // Eagerly reserves the slot in pending_assigned_slots so two
-    // concurrent outbound Hellos get different slots. The event
-    // processor clears the pending entry when it does the real
-    // registration (Lean: concierge_eager_registration).
-    let assigned_slot = if st.mesh.spiral.is_claimed() {
-        // Clean up expired pending reservations (>30s old).
-        let now = std::time::Instant::now();
-        st.mesh.pending_assigned_slots.retain(|_, ts| {
-            now.duration_since(*ts) < std::time::Duration::from_secs(30)
-        });
-
-        // Find first unoccupied AND non-pending slot index.
-        let occupied = st.mesh.spiral.all_occupied();
-        let mut slot = 0u64;
-        loop {
-            let slot_occupied = occupied.iter().any(|(_, idx)| idx.value() == slot);
-            let slot_pending = st.mesh.pending_assigned_slots.contains_key(&slot);
-            if !slot_occupied && !slot_pending {
-                break;
-            }
-            slot += 1;
-        }
-        // Reserve this slot so the next build_hello_payload call skips it.
-        st.mesh.pending_assigned_slots.insert(slot, now);
-        Some(slot)
-    } else {
-        None
-    };
+    // Concierge slot assignment is NOT done here. build_hello_payload is
+    // called for announcements, outbound connections, re-sends — only ONE
+    // call site (the inbound HELLO response) needs assigned_slot. Computing
+    // it here created phantom pending_assigned_slots reservations that pushed
+    // real assignments to slot 654+ (thundering herd on pending slots).
+    // See: compute_concierge_slot() called at the response HELLO site.
+    let assigned_slot = None;
 
     MeshHelloPayload {
         peer_id: st.lens.peer_id.clone(),
@@ -5549,6 +5674,39 @@ fn build_hello_payload(st: &mut super::server::ServerState) -> MeshHelloPayload 
         cluster_vdf_work,
         assigned_slot,
     }
+}
+
+/// Concierge: compute the first empty SPIRAL slot for an unclaimed joiner.
+///
+/// ONLY called at the inbound HELLO response site when the remote peer has
+/// no spiral_index (unclaimed joiner). Reserves the slot in
+/// `pending_assigned_slots` so back-to-back joiners get different slots.
+///
+/// This was previously inlined in `build_hello_payload()`, which caused
+/// phantom reservations on every HELLO (announcements, re-sends, outbound
+/// connections) — pushing real assignments to slot 654+.
+fn compute_concierge_slot(st: &mut super::server::ServerState) -> Option<u64> {
+    if !st.mesh.spiral.is_claimed() {
+        return None;
+    }
+
+    let now = std::time::Instant::now();
+    st.mesh.pending_assigned_slots.retain(|_, ts| {
+        now.duration_since(*ts) < std::time::Duration::from_secs(30)
+    });
+
+    let occupied = st.mesh.spiral.all_occupied();
+    let mut slot = 0u64;
+    loop {
+        let slot_occupied = occupied.iter().any(|(_, idx)| idx.value() == slot);
+        let slot_pending = st.mesh.pending_assigned_slots.contains_key(&slot);
+        if !slot_occupied && !slot_pending {
+            break;
+        }
+        slot += 1;
+    }
+    st.mesh.pending_assigned_slots.insert(slot, now);
+    Some(slot)
 }
 
 /// Spawn the mesh connector — proactively connects to all LAGOON_PEERS
@@ -5636,6 +5794,12 @@ fn mesh_message_to_irc(msg: &MeshMessage) -> Message {
         MeshMessage::Cvdf { data } => ("CVDF".into(), data.clone()),
         MeshMessage::Redirect { peers } => {
             ("REDIRECT".into(), serde_json::to_string(peers).unwrap_or_default())
+        }
+        MeshMessage::PolChallenge { nonce } => {
+            ("POL_CHALLENGE".into(), nonce.to_string())
+        }
+        MeshMessage::PolResponse { nonce } => {
+            ("POL_RESPONSE".into(), nonce.to_string())
         }
     };
     let mut params = vec![sub];
