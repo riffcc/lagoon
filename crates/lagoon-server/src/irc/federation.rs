@@ -33,22 +33,48 @@ const MAX_DISCONNECTED_PER_SITE: usize = 5;
 /// address (confirmed-different node via MESH HELLO peer_id verification)
 /// over the overlay address from `ygg_peer_uri`.
 ///
-/// Why: The overlay address (`tcp://[200:xxxx::]:9443`) only works if we're
-/// already ON the Ygg overlay.  For a fresh node bootstrapping via anycast,
-/// we're NOT on the overlay yet.  But the relay already has a TCP connection
-/// to a confirmed-different node — use that IP as the underlay Ygg peer.
+/// Derive a Ygg underlay peer URI from the relay's TCP peer address.
 ///
-/// Returns `None` if neither source is available.
+/// The relay already has a TCP connection to a confirmed-different node.
+/// That IP is a real underlay address (fdaa:: on Fly, LAN IP on bare metal).
+///
+/// NEVER falls back to overlay addresses (200:xxxx::). If we don't have
+/// a relay_peer_addr, we don't peer — we wait until one arrives.
+///
+/// Returns `None` if no relay_peer_addr is available.
 pub fn ape_peer_uri(
     relay_peer_addr: Option<SocketAddr>,
-    ygg_peer_uri: Option<&str>,
 ) -> Option<String> {
-    // First try: underlay address from relay TCP peer (confirmed-different node).
-    let underlay_uri = relay_peer_addr.map(|addr| {
+    relay_peer_addr.map(|addr| {
         format!("tcp://[{}]:9443", addr.ip())
-    });
+    })
+}
 
-    underlay_uri.or_else(|| ygg_peer_uri.map(|s| s.to_string()))
+/// Check that a peer URI is a real underlay address, NOT an Ygg overlay.
+///
+/// Ygg overlay addresses start with 02xx or 03xx (200:/300: in IPv6 notation).
+/// Peering with an overlay address tunnels Ygg through Ygg — double
+/// encapsulation, 1s+ latency, dies when the underlying path changes.
+fn is_underlay_uri(uri: &str) -> bool {
+    // Extract the address from tcp://[addr]:port format.
+    if let Some(start) = uri.find('[') {
+        if let Some(end) = uri.find(']') {
+            let addr_str = &uri[start + 1..end];
+            if let Ok(addr) = addr_str.parse::<std::net::Ipv6Addr>() {
+                let first_byte = addr.octets()[0];
+                // 0x02, 0x03 = Ygg overlay (200:/300:)
+                if first_byte == 0x02 || first_byte == 0x03 {
+                    warn!(
+                        uri,
+                        "BLOCKED: refusing to peer Ygg with overlay address — \
+                         would tunnel Ygg through Ygg"
+                    );
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Dispatch a received `MeshMessage` into the appropriate `RelayEvent`.
@@ -332,7 +358,15 @@ pub fn dial_missing_spiral_neighbors(
         // Add a direct Ygg underlay link for SPIRAL neighbors — but only once.
         // After the first successful add (or "already configured" error), record
         // the URI so we don't spam add_peer on every cycle.
-        let peer_uri = peer.underlay_uri.as_ref().or(peer.ygg_peer_uri.as_ref());
+        //
+        // CRITICAL: ONLY use confirmed underlay addresses. NEVER fall back to
+        // ygg_peer_uri — that may be an overlay address (tcp://[200:xxxx::]:9443).
+        // Peering with an overlay address tunnels Ygg through Ygg: double
+        // encapsulation, 1s+ latency, dies when the anycast path changes.
+        // If we don't have a real underlay address, we wait until gossip
+        // delivers one.
+        let peer_uri = peer.underlay_uri.as_ref()
+            .filter(|uri| is_underlay_uri(uri));
         if let Some(ref uri) = peer_uri {
             if !st.mesh.ygg_peered_uris.contains(uri.as_str()) {
                 if let Some(ref ygg) = ygg_node {
@@ -1315,9 +1349,16 @@ pub fn spawn_event_processor(
                         .connections
                         .insert(mkey.clone(), MeshConnectionState::Connected);
 
-                    // APE: dynamically peer with this node's Yggdrasil overlay.
+                    // APE: dynamically peer with this node's Yggdrasil underlay.
+                    //
+                    // CRITICAL: ONLY use confirmed underlay addresses. The
+                    // relay_peer_addr (TCP peer of the switchboard connection)
+                    // is a real underlay IP. ygg_peer_uri from the HELLO may
+                    // be an overlay address — NEVER pass it to add_peer.
                     if let Some(ref ygg) = st.transport_config.ygg_node {
-                        if let Some(uri) = ape_peer_uri(relay_peer_addr, ygg_peer_uri.as_deref()) {
+                        if let Some(uri) = ape_peer_uri(relay_peer_addr)
+                            .filter(|u| is_underlay_uri(u))
+                        {
                             if !st.mesh.ygg_peered_uris.contains(uri.as_str()) {
                                 match ygg.add_peer(&uri) {
                                     Ok(()) => {
@@ -1792,13 +1833,17 @@ pub fn spawn_event_processor(
                                 // Propagate network addresses from gossip.
                                 // Critical for Ygg underlay peering — without these,
                                 // dial_missing_spiral_neighbors can't establish direct links.
-                                if existing.underlay_uri.is_none() && peer.underlay_uri.is_some() {
+                                // ALWAYS overwrite if the incoming data is newer (last_seen
+                                // guard above). After a rolling deploy, pods get new Ygg
+                                // keypairs → new overlay addresses. Stale addresses must
+                                // be replaced, not preserved.
+                                if peer.underlay_uri.is_some() {
                                     existing.underlay_uri = peer.underlay_uri.clone();
                                 }
-                                if existing.ygg_peer_uri.is_none() && peer.ygg_peer_uri.is_some() {
+                                if peer.ygg_peer_uri.is_some() {
                                     existing.ygg_peer_uri = peer.ygg_peer_uri.clone();
                                 }
-                                if existing.yggdrasil_addr.is_none() && peer.yggdrasil_addr.is_some() {
+                                if peer.yggdrasil_addr.is_some() {
                                     existing.yggdrasil_addr = peer.yggdrasil_addr.clone();
                                 }
                                 // SPIRAL slot: update known_peers record if changed.
