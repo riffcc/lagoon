@@ -1,6 +1,7 @@
 target/
 crates/lagoon-web/web/node_modules/
 crates/lagoon-web/web/dist/
+crates/yggbridge/
 .git/
 deploy/
 *.md
