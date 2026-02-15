@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock};
 use futures::SinkExt;
 use serde::Serialize;
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, broadcast, mpsc, watch, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::codec::Framed;
@@ -311,15 +311,20 @@ pub struct MeshState {
     /// None until the node has peers and initializes the chain.
     pub cvdf_service: Option<citadel_lens::service::CvdfService<super::cvdf_transport::LagoonCvdfTransport>>,
     /// True when the last bootstrap attempt self-connected. When set, the
-    /// bootstrap retry stops dialing — we ARE the anycast endpoint, so
-    /// re-dialing will always reach ourselves. Cleared when a real inbound
-    /// connection arrives from a different peer_id.
-    pub bootstrap_self_connected: bool,
     /// Our cluster's total VDF work — cached when building HELLO payloads.
     /// This is the value we SEND in our HELLO. Used in merge evaluation so
     /// we compare two independently-computed values (ours vs theirs from HELLO)
     /// instead of recomputing ours (which would include the remote's credit).
     pub our_cluster_vdf_work: f64,
+    /// Switchboard listener control channel. Send `Pause` before dialing
+    /// anycast (drops the listening socket so the kernel RSTs self-routed
+    /// SYNs) and `Resume` after.
+    pub switchboard_ctl: Option<mpsc::UnboundedSender<super::switchboard::SwitchboardCtl>>,
+    /// Timestamp when we last changed SPIRAL position via concierge assignment,
+    /// VDF race, collision resolution, or reslot. reconverge_spiral skips
+    /// within the grace window to prevent it from undoing the assignment before
+    /// gossip propagates the full topology.
+    pub spiral_settled_at: Option<std::time::Instant>,
 }
 
 impl MeshState {
@@ -343,8 +348,9 @@ impl MeshState {
             connection_store: super::connection_store::ConnectionStore::new(120_000), // 120s TTL
             connection_gossip: super::connection_gossip::ConnectionGossip::new(10_000), // 10s sync interval
             cvdf_service: None,
-            bootstrap_self_connected: false,
             our_cluster_vdf_work: 0.0,
+            switchboard_ctl: None,
+            spiral_settled_at: None,
         }
     }
 }
@@ -514,14 +520,6 @@ pub struct ServerState {
     pub full_telemetry: bool,
     /// User profile CRDT store — local cache + mesh query support.
     pub profile_store: ProfileStore,
-    /// Beacon control — turns the HTTP listener on/off for "flashlight" bootstrap.
-    /// When bootstrap self-connects, the next retry disables the listener so anycast
-    /// routes the outbound dial to a DIFFERENT machine. None when not running with
-    /// an embedded web gateway.
-    pub beacon_tx: Option<watch::Sender<bool>>,
-    /// Beacon acknowledgement — accept loop notifies after listener drop so the
-    /// bootstrap retry knows it's safe to dial.
-    pub beacon_ack: Option<Arc<Notify>>,
 }
 
 /// Handle to send messages to a connected client.
@@ -578,8 +576,6 @@ impl ServerState {
                 .map(|v| v != "0")
                 .unwrap_or(true), // ON by default
             profile_store,
-            beacon_tx: None,
-            beacon_ack: None,
         }
     }
 
@@ -1000,7 +996,8 @@ pub async fn start(
             .unwrap_or(9443);
         let switchboard_addr: std::net::SocketAddr =
             ([0, 0, 0, 0, 0, 0, 0, 0], switchboard_port).into();
-        super::switchboard::start_switchboard(switchboard_addr, Arc::clone(&state)).await;
+        let switchboard_ctl = super::switchboard::start_switchboard(switchboard_addr, Arc::clone(&state)).await;
+        state.write().await.mesh.switchboard_ctl = switchboard_ctl;
     }
 
     // Bind all listeners first, so we fail fast on port conflicts.
@@ -3291,6 +3288,8 @@ async fn handle_command(
                             cvdf_genesis_hex: Option<String>,
                             #[serde(default)]
                             cluster_vdf_work: Option<f64>,
+                            #[serde(default)]
+                            assigned_slot: Option<u64>,
                         }
                         if let Ok(hello) = serde_json::from_str::<HelloPayload>(json) {
                             // Use node_name from HELLO if present, else derive from server_name.
@@ -3330,6 +3329,7 @@ async fn handle_command(
                                     cvdf_tip_hex: hello.cvdf_tip_hex,
                                     cvdf_genesis_hex: hello.cvdf_genesis_hex,
                                     cluster_vdf_work: hello.cluster_vdf_work,
+                                    assigned_slot: hello.assigned_slot,
                                 },
                             );
 
@@ -3366,6 +3366,21 @@ async fn handle_command(
                                 std::net::IpAddr::V4(v4) => format!("tcp://{v4}:9443"),
                             });
 
+                            // Concierge: if we're established, compute first empty
+                            // slot so the joiner can take it from our HELLO.
+                            let our_assigned_slot: Option<u64> = if st.mesh.spiral.is_claimed() {
+                                let occupied = st.mesh.spiral.all_occupied();
+                                let mut slot = 0u64;
+                                loop {
+                                    if !occupied.iter().any(|(_, idx)| idx.value() == slot) {
+                                        break Some(slot);
+                                    }
+                                    slot += 1;
+                                }
+                            } else {
+                                None
+                            };
+
                             let our_hello = serde_json::json!({
                                 "peer_id": st.lens.peer_id,
                                 "server_name": st.lens.server_name,
@@ -3381,6 +3396,7 @@ async fn handle_command(
                                 "ygg_peer_uri": our_ygg_peer_uri,
                                 "site_name": st.lens.site_name,
                                 "node_name": st.lens.node_name,
+                                "assigned_slot": our_assigned_slot,
                             });
 
                             // Collect peer list for MESH PEERS exchange.

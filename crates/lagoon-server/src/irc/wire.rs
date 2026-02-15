@@ -59,6 +59,12 @@ pub struct HelloPayload {
     /// Used for SPIRAL merge negotiation — cluster with more work wins.
     #[serde(default)]
     pub cluster_vdf_work: Option<f64>,
+    /// Concierge slot assignment — the first empty slot in the sender's
+    /// SPIRAL topology. Included when the sender is an established node
+    /// (has a claimed SPIRAL slot). The joiner takes this slot immediately.
+    /// One integer. O(1). Scales to millions of nodes.
+    #[serde(default)]
+    pub assigned_slot: Option<u64>,
 }
 
 /// Native mesh protocol message — the sole on-the-wire type.
@@ -202,7 +208,7 @@ pub enum SwitchboardMessage {
         want: String,
     },
 
-    /// Responder IS the requested target — proceed with WebSocket upgrade.
+    /// Responder IS the requested target — proceed with raw TCP mesh session.
     #[serde(rename = "peer_ready")]
     PeerReady { peer_id: String },
 
@@ -262,6 +268,7 @@ mod tests {
             cvdf_tip_hex: Some("aabbccdd".into()),
             cvdf_genesis_hex: Some("11223344".into()),
             cluster_vdf_work: Some(1000.5),
+            assigned_slot: Some(3),
         });
 
         let json = msg.to_json().unwrap();
@@ -281,6 +288,7 @@ mod tests {
                 assert_eq!(h.cvdf_tip_hex.as_deref(), Some("aabbccdd"));
                 assert_eq!(h.cvdf_genesis_hex.as_deref(), Some("11223344"));
                 assert_eq!(h.cluster_vdf_work, Some(1000.5));
+                assert_eq!(h.assigned_slot, Some(3));
             }
             other => panic!("expected Hello, got {other:?}"),
         }
@@ -298,6 +306,7 @@ mod tests {
                 assert_eq!(h.site_name, "");
                 assert_eq!(h.node_name, "");
                 assert_eq!(h.cluster_vdf_work, None);
+                assert_eq!(h.assigned_slot, None);
             }
             other => panic!("expected Hello, got {other:?}"),
         }

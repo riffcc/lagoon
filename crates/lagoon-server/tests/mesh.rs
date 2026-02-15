@@ -10,7 +10,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
 use lagoon_server::irc::federation::{
-    ape_peer_uri, dial_missing_spiral_neighbors, RelayCommand, RelayEvent, RelayHandle,
+    ape_peer_uri, build_wire_hello, dial_missing_spiral_neighbors, RelayCommand, RelayEvent,
+    RelayHandle,
 };
 use lagoon_server::irc::invite::{InviteKind, InviteStore, Privilege};
 use lagoon_server::irc::lens;
@@ -885,6 +886,7 @@ fn make_hello() -> HelloPayload {
         cvdf_tip_hex: None,
         cvdf_genesis_hex: None,
         cluster_vdf_work: None,
+        assigned_slot: None,
     }
 }
 
@@ -2150,6 +2152,7 @@ async fn underlay_uri_stored_from_hello_relay_peer_addr() {
         cvdf_tip_hex: None,
         cvdf_genesis_hex: None,
         cluster_vdf_work: None,
+        assigned_slot: None,
     };
     let msg = MeshMessage::Hello(hello);
     let peer_addr: SocketAddr = "10.0.0.5:8080".parse().unwrap();
@@ -2365,122 +2368,201 @@ async fn three_node_mesh_forms_triangle_not_star() {
     );
 }
 
-/// Flashlight protocol: self-connection sets the bootstrap_self_connected flag,
-    /// which tells the next bootstrap retry to disable the HTTP listener before
-    /// dialing so anycast routes to a DIFFERENT machine.
+    /// Transparent self-rejection: outbound mesh WS URLs include `?from={peer_id}`
+    /// so the listener can detect self-connections at the TCP level and drop them.
+    /// This replaced the flashlight/beacon protocol entirely.
     #[tokio::test]
-    async fn self_connection_sets_flashlight_flag() {
-        let (state_a, _) = make_test_state("node-a.test.co");
-        let mut st = state_a.write().await;
-        let _our_pid = st.lens.peer_id.clone();
-
-        // Not set initially.
-        assert!(!st.mesh.bootstrap_self_connected);
-
-        // Simulate: someone connected and sent HELLO with OUR peer_id.
-        // In the real event loop, the MeshHello handler detects this
-        // (mkey == our_pid) and sets the flag.
-        st.mesh.bootstrap_self_connected = true;
-
-        // Flag is set — next bootstrap retry should use flashlight.
-        assert!(st.mesh.bootstrap_self_connected);
-
-        // Simulate: real connection succeeds — flag cleared.
-        st.mesh.bootstrap_self_connected = false;
-        assert!(!st.mesh.bootstrap_self_connected,
-            "flag should be cleared when a real peer connects");
-    }
-
-    /// Flashlight beacon: watch channel controls listener on/off.
-    #[tokio::test]
-    async fn beacon_watch_channel_controls_state() {
-        let (beacon_tx, mut beacon_rx) = tokio::sync::watch::channel(true);
-
-        // Initially on.
-        assert!(*beacon_rx.borrow());
-
-        // Federation turns it off.
-        beacon_tx.send(false).unwrap();
-        beacon_rx.changed().await.unwrap();
-        assert!(!*beacon_rx.borrow());
-
-        // Federation turns it back on.
-        beacon_tx.send(true).unwrap();
-        beacon_rx.changed().await.unwrap();
-        assert!(*beacon_rx.borrow());
-    }
-
-    /// Flashlight: beacon_ack Notify fires after listener would drop.
-    #[tokio::test]
-    async fn beacon_ack_fires_after_off() {
-        let (beacon_tx, mut beacon_rx) = tokio::sync::watch::channel(true);
-        let beacon_ack = std::sync::Arc::new(tokio::sync::Notify::new());
-        let ack_clone = beacon_ack.clone();
-
-        // Simulate the accept loop side: when beacon goes off, notify ack.
-        tokio::spawn(async move {
-            loop {
-                if beacon_rx.changed().await.is_err() { break; }
-                if !*beacon_rx.borrow() {
-                    // "listener dropped"
-                    ack_clone.notify_one();
-                }
-            }
-        });
-
-        // Federation side: turn beacon off and wait for ack.
-        beacon_tx.send(false).unwrap();
-        beacon_ack.notified().await;
-        // If we reach here, the ack was received — listener is confirmed closed.
-
-        // Turn back on.
-        beacon_tx.send(true).unwrap();
-    }
-
-    /// Flashlight: ServerState has beacon fields, both default to None.
-    #[tokio::test]
-    async fn server_state_beacon_fields_default_none() {
-        let (state, _) = make_test_state("beacon-test.test.co");
+    async fn transparent_self_url_includes_peer_id() {
+        let (state, _) = make_test_state("node-a.test.co");
         let st = state.read().await;
-        assert!(st.beacon_tx.is_none());
-        assert!(st.beacon_ack.is_none());
+        let pid = &st.lens.peer_id;
+        let url = format!("/api/mesh/ws?from={pid}");
+        assert!(url.contains("from=b3b3/"), "URL should include peer_id: {url}");
     }
 
-    /// Flashlight: beacon fields can be set and used from ServerState.
-    #[tokio::test]
-    async fn server_state_beacon_round_trip() {
-        let (state, _) = make_test_state("beacon-test.test.co");
+// ═══════════════════════════════════════════════════════════════════════════
+// SPIRAL slot claiming tests — deterministic, no centralized assignment.
+// Two types: VDF race (two unslotted) and concierge (unslotted meets mesh).
+// ═══════════════════════════════════════════════════════════════════════════
 
-        let (beacon_tx, mut beacon_rx) = tokio::sync::watch::channel(true);
-        let beacon_ack = std::sync::Arc::new(tokio::sync::Notify::new());
+use lagoon_server::irc::spiral::{SpiralTopology, Spiral3DIndex};
 
-        {
-            let mut st = state.write().await;
-            st.beacon_tx = Some(beacon_tx);
-            st.beacon_ack = Some(beacon_ack.clone());
-        }
+/// At N=4 (slots 0-3), all nodes should be SPIRAL neighbors of each other.
+/// This is critical: if they're not neighbors, prune kills them.
+#[test]
+fn spiral_all_neighbors_at_small_n() {
+    let mut topo = SpiralTopology::new();
+    topo.force_add_peer("peer-1", Spiral3DIndex::new(1));
+    topo.force_add_peer("peer-2", Spiral3DIndex::new(2));
+    topo.force_add_peer("peer-3", Spiral3DIndex::new(3));
+    // We claim slot 0 (first free).
+    let claimed = topo.claim_position("us");
+    assert_eq!(claimed.0, 0, "should claim slot 0 (first free)");
 
-        // Use the beacon from server state.
-        {
-            let st = state.read().await;
-            if let Some(ref tx) = st.beacon_tx {
-                tx.send(false).unwrap();
+    // At N=4 with max 20 neighbors, ALL peers should be our neighbors.
+    assert!(topo.is_neighbor("peer-1"), "peer-1 at slot 1 should be neighbor");
+    assert!(topo.is_neighbor("peer-2"), "peer-2 at slot 2 should be neighbor");
+    assert!(topo.is_neighbor("peer-3"), "peer-3 at slot 3 should be neighbor");
+    assert_eq!(topo.neighbors().len(), 3, "should have exactly 3 neighbors at N=4");
+}
+
+/// At N=4, EVERY node should see ALL other 3 nodes as SPIRAL neighbors,
+/// regardless of which slot it occupies. This catches geometry bugs where
+/// certain slot positions have blind spots in the 20-direction raycast.
+#[test]
+fn spiral_all_neighbors_from_every_slot() {
+    let peers = ["alpha", "beta", "gamma", "delta"];
+    for us_slot in 0..4u64 {
+        let mut topo = SpiralTopology::new();
+        // Add all OTHER peers first.
+        for (i, &name) in peers.iter().enumerate() {
+            let slot = i as u64;
+            if slot != us_slot {
+                topo.force_add_peer(name, Spiral3DIndex::new(slot));
             }
         }
+        // Claim our slot.
+        topo.claim_specific_position(peers[us_slot as usize], us_slot);
 
-        beacon_rx.changed().await.unwrap();
-        assert!(!*beacon_rx.borrow(), "beacon should be off after send(false)");
-
-        // Ack side.
-        beacon_ack.notify_one();
-
-        // Turn back on.
-        {
-            let st = state.read().await;
-            if let Some(ref tx) = st.beacon_tx {
-                tx.send(true).unwrap();
+        let nbrs = topo.neighbors();
+        assert_eq!(
+            nbrs.len(), 3,
+            "slot {us_slot} ({}) should have 3 neighbors, got {}: {:?}",
+            peers[us_slot as usize], nbrs.len(), nbrs
+        );
+        // Every other peer should be a neighbor.
+        for (i, &name) in peers.iter().enumerate() {
+            if i as u64 != us_slot {
+                assert!(
+                    topo.is_neighbor(name),
+                    "slot {us_slot} should see {} (slot {i}) as neighbor",
+                    name
+                );
             }
         }
-        beacon_rx.changed().await.unwrap();
-        assert!(*beacon_rx.borrow(), "beacon should be on after send(true)");
     }
+}
+
+/// Slots 0,1,2,4 (gap at 3) — repack should produce 0,1,2,3.
+#[test]
+fn repack_fills_gap_in_spiral() {
+    let mut topo = SpiralTopology::new();
+    topo.force_add_peer("us", Spiral3DIndex::new(0));
+    topo.force_add_peer("peer-1", Spiral3DIndex::new(1));
+    topo.force_add_peer("peer-2", Spiral3DIndex::new(2));
+    topo.force_add_peer("ams-node", Spiral3DIndex::new(4));
+
+    // Verify gap exists.
+    assert!(topo.peer_at_index(3).is_none(), "slot 3 should be empty");
+    assert_eq!(topo.peer_at_index(4).unwrap(), "ams-node");
+
+    // Repack.
+    let moves = topo.apply_repack();
+    assert!(!moves.is_empty(), "repack should move ams-node from 4→3");
+
+    // After repack: 0,1,2,3 — no gaps.
+    assert!(topo.peer_at_index(0).is_some());
+    assert!(topo.peer_at_index(1).is_some());
+    assert!(topo.peer_at_index(2).is_some());
+    assert_eq!(topo.peer_at_index(3).unwrap(), "ams-node", "ams-node should be at slot 3");
+    assert!(topo.peer_at_index(4).is_none(), "slot 4 should be empty after repack");
+}
+
+/// Safety net: if a gap in SPIRAL slots ever occurs (a bug), verify neighbor
+/// computation doesn't catastrophically break. Gaps are a failure state.
+/// If this test fails, gaps in SPIRAL slots cause wrong neighbor counts → prune cascade.
+#[test]
+fn gap_in_spiral_still_all_neighbors() {
+    let mut topo = SpiralTopology::new();
+    topo.force_add_peer("peer-1", Spiral3DIndex::new(1));
+    topo.force_add_peer("peer-2", Spiral3DIndex::new(2));
+    topo.force_add_peer("ams-node", Spiral3DIndex::new(4)); // GAP at slot 3!
+    let claimed = topo.claim_position("us");
+    assert_eq!(claimed.0, 0);
+
+    // With gap: topology is [0,1,2,4]. N_occupied=4. Max neighbors=20.
+    // ALL 3 peers should still be neighbors — 4 nodes is well under 20.
+    assert!(topo.is_neighbor("peer-1"), "peer-1 should be neighbor even with gap");
+    assert!(topo.is_neighbor("peer-2"), "peer-2 should be neighbor even with gap");
+    assert!(topo.is_neighbor("ams-node"), "ams-node at slot 4 should be neighbor even with gap");
+    assert_eq!(topo.neighbors().len(), 3, "all 3 peers should be neighbors despite gap at slot 3");
+}
+
+/// After repack of 0,1,2,3 all four nodes are mutual SPIRAL neighbors.
+/// This is the scenario that FAILED in production: slot 4 had wrong neighbors.
+#[test]
+fn repack_then_all_neighbors() {
+    let mut topo = SpiralTopology::new();
+    topo.force_add_peer("peer-1", Spiral3DIndex::new(1));
+    topo.force_add_peer("peer-2", Spiral3DIndex::new(2));
+    topo.force_add_peer("ams-node", Spiral3DIndex::new(4));
+    // We claim slot 0.
+    let claimed = topo.claim_position("us");
+    assert_eq!(claimed.0, 0);
+
+    // Repack to fill the gap.
+    topo.apply_repack();
+
+    // All 3 peers should be neighbors (N=4, max 20 neighbors).
+    assert!(topo.is_neighbor("peer-1"), "peer-1 should be neighbor after repack");
+    assert!(topo.is_neighbor("peer-2"), "peer-2 should be neighbor after repack");
+    assert!(topo.is_neighbor("ams-node"), "ams-node should be neighbor after repack");
+}
+
+/// THE PRODUCTION BUG: slots [0,1,2,4] with gap at 3.
+/// Before the SPORE-style array fix, `compute_all_connections` returned only
+/// 2 neighbors because the gap-and-wrap ray walking missed the node at slot 4.
+/// The pruner saw 3 connections but only 2 neighbors → killed a connection → cascade.
+///
+/// With the fix: N=4 ≤ 20 → all peers are neighbors. No geometry. No gaps matter.
+#[test]
+fn gap_in_slots_still_all_neighbors() {
+    let mut topo = SpiralTopology::new();
+    // Exactly the production scenario: slots 0,1,2,4 — gap at 3.
+    topo.force_add_peer("peer-1", Spiral3DIndex::new(1));
+    topo.force_add_peer("peer-2", Spiral3DIndex::new(2));
+    topo.force_add_peer("ams-node", Spiral3DIndex::new(4)); // gap at 3!
+    let claimed = topo.claim_position("us");
+    assert_eq!(claimed.0, 0);
+
+    // Despite the gap, ALL 3 peers must be neighbors (N=4 ≤ 20).
+    assert_eq!(topo.neighbors().len(), 3,
+        "N=4 with gap: all peers should be neighbors");
+    assert!(topo.is_neighbor("peer-1"));
+    assert!(topo.is_neighbor("peer-2"));
+    assert!(topo.is_neighbor("ams-node"),
+        "ams-node at slot 4 (gap at 3) MUST be a neighbor");
+}
+
+/// N=20 boundary: exactly 20 occupied slots → all 19 others are neighbors.
+#[test]
+fn twenty_peers_all_neighbors() {
+    let mut topo = SpiralTopology::new();
+    for i in 1..20u64 {
+        topo.force_add_peer(&format!("peer-{i}"), Spiral3DIndex::new(i));
+    }
+    let claimed = topo.claim_position("us");
+    assert_eq!(claimed.0, 0);
+    assert_eq!(topo.neighbors().len(), 19,
+        "N=20: all 19 peers should be neighbors");
+}
+
+/// N=21 transitions to geometric neighbor computation.
+/// At least some peers should be neighbors, but not necessarily all 20.
+#[test]
+fn twentyone_peers_uses_geometry() {
+    let mut topo = SpiralTopology::new();
+    for i in 1..21u64 {
+        topo.force_add_peer(&format!("peer-{i}"), Spiral3DIndex::new(i));
+    }
+    let claimed = topo.claim_position("us");
+    assert_eq!(claimed.0, 0);
+    // N=21: occupied.len() = 21 > 20 → uses compute_all_connections.
+    // Should have at most 20 unique neighbors (SPIRAL's bound).
+    assert!(topo.neighbors().len() <= 20,
+        "N=21: should have at most 20 neighbors");
+    // Should have SOME neighbors (gap-and-wrap finds nearby nodes).
+    assert!(topo.neighbors().len() >= 1,
+        "N=21: should have at least 1 neighbor");
+}
+

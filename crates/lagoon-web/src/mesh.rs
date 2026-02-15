@@ -1,10 +1,19 @@
 //! Native mesh WebSocket handler — JSON over WebSocket, no IRC.
 //!
 //! Accepts inbound mesh connections on `/api/mesh/ws`. Remote nodes send
-//! `MeshMessage` JSON text frames. First message must be `Hello`. We respond
-//! with our Hello, create a `RelayHandle`, dispatch the remote Hello (which
-//! triggers the event processor to send Peers/LatencyHave/GossipSpore back
-//! through the relay handle), and enter the bidirectional message loop.
+//! `MeshMessage` JSON text frames. First message must be `Hello`.
+//!
+//! **Juggler architecture:** mesh.rs is many arms (concurrent I/O), the
+//! federation loop is the single brain (sequential state).
+//!
+//! 1. Read remote Hello (pure I/O — many arms accept concurrently)
+//! 2. Create RelayHandle (plumbing — gives federation loop a send channel)
+//! 3. Dispatch MeshHello event (hand the ball to the brain)
+//! 4. Enter bidirectional message loop (forward commands from brain to WS)
+//!
+//! The federation loop processes each Hello in order. Each merge sees the
+//! result of all previous merges. Response Hello (with correct assigned_slot)
+//! comes back through the relay handle's `outgoing_tx`.
 //!
 //! Single-layer handler: WS → `dispatch_mesh_message()` → `event_tx`.
 
@@ -23,7 +32,7 @@ use tracing::{info, warn};
 use lagoon_server::irc::federation::{
     build_wire_hello, dispatch_mesh_message, RelayCommand, RelayEvent, RelayHandle,
 };
-use lagoon_server::irc::server::MeshConnectionState;
+
 use lagoon_server::irc::wire::{HelloPayload, MeshMessage};
 
 use crate::state::AppState;
@@ -122,49 +131,26 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
         }
     }
 
-    // Send our Hello.
-    let our_hello = {
-        let mut st = irc_state.write().await;
-        build_wire_hello(&mut st)
-    };
-    let our_hello_msg = MeshMessage::Hello(our_hello);
-    if let Ok(json) = our_hello_msg.to_json() {
-        if ws_tx.send(Message::Text(json.into())).await.is_err() {
-            return;
-        }
-    }
+    // Response HELLO is NOT sent here. The federation loop builds and sends
+    // it AFTER processing the remote's HELLO (evaluate_spiral_merge), so
+    // the response carries correct spiral_index and assigned_slot reflecting
+    // ALL previous merges. mesh.rs is just plumbing — accept, read, dispatch.
 
-    // ── Phase 1.5: Redirect if we already have a relay to this peer ──────
+    // ── Phase 1.5: Handle existing relay to this peer ─────────────────
     //
-    // If we're already connected (keyed by peer_id), this is a duplicate
-    // dial. Send them our known peers and close.
+    // If we already have a relay keyed by this peer_id, the new inbound
+    // connection replaces it. The old relay's cmd_rx will see its sender
+    // dropped and clean up naturally. This is correct: a fresh connection
+    // is proof the remote is alive NOW; the old one may be stale.
     {
         let st = irc_state.read().await;
         if st.federation.relays.contains_key(&remote_peer_id) {
-            let our_pid = st.lens.peer_id.clone();
-            let redirect_peers: Vec<lagoon_server::irc::server::MeshPeerInfo> =
-                st.mesh.known_peers.iter()
-                    .filter(|(mkey, _)| {
-                        *mkey == &our_pid
-                            || st.mesh.connections.get(*mkey).copied()
-                                == Some(MeshConnectionState::Connected)
-                    })
-                    .map(|(_, p)| p.clone())
-                    .collect();
-            drop(st);
-
             info!(
                 peer_id = %remote_peer_id,
-                redirect_peers = redirect_peers.len(),
-                "mesh ws: duplicate connection — redirecting to known peers"
+                "mesh ws: replacing existing relay with fresh inbound connection"
             );
-            let redirect_msg = MeshMessage::Redirect { peers: redirect_peers };
-            if let Ok(json) = redirect_msg.to_json() {
-                let _ = ws_tx.send(Message::Text(json.into())).await;
-            }
-            let _ = ws_tx.send(Message::Close(None)).await;
-            return;
         }
+        drop(st);
     }
 
     // ── Phase 2: Create relay handle BEFORE dispatching Hello ─────────────
@@ -188,7 +174,7 @@ async fn handle_mesh_ws(ws: WebSocket, state: AppState) {
                 node_name: remote_node_name.clone(),
                 connect_target: String::new(), // inbound — no connect target
                 channels: HashMap::new(),
-                mesh_connected: true,
+                mesh_connected: false, // NOT ready yet — set true after federation loop sends response HELLO
                 is_bootstrap: false,
                 last_rtt_ms: None,
             },

@@ -395,20 +395,24 @@ pub async fn connect(
 }
 
 // ---------------------------------------------------------------------------
-// Native WebSocket connection (JSON MeshMessages, no IRC framing)
+// Native mesh connection (JSON MeshMessages, no IRC framing)
 // ---------------------------------------------------------------------------
 
-/// Raw WebSocket stream for the native mesh relay — NOT wrapped in IRC framing.
+/// Connection stream for the native mesh relay — NOT wrapped in IRC framing.
 ///
 /// The relay_task_native() uses these directly for JSON MeshMessage exchange.
-/// Generic over the underlying transport (Ygg overlay or TLS).
+/// Generic over the underlying transport (Ygg overlay, TLS, or raw TCP).
 pub enum NativeWs {
     /// Ygg overlay: `ws://[200:xxxx]:8080/api/mesh/ws`, encrypted by Ygg.
     Ygg(tokio_tungstenite::WebSocketStream<yggbridge::YggStream>),
     /// TLS WebSocket: `wss://host:port/api/mesh/ws`, internet path.
     Tls(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>),
-    /// Switchboard: raw TCP WebSocket after half-dial PeerReady or splice.
-    Switchboard(tokio_tungstenite::WebSocketStream<TcpStream>),
+    /// Switchboard: raw TCP with JSON lines (no WebSocket). After half-dial
+    /// PeerReady, mesh messages flow as newline-delimited JSON.
+    Switchboard {
+        reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: tokio::net::tcp::OwnedWriteHalf,
+    },
 }
 
 /// Connect to a remote peer's native mesh WebSocket endpoint (`/api/mesh/ws`).
@@ -424,15 +428,23 @@ pub enum NativeWs {
 pub async fn connect_native(
     remote_host: &str,
     config: &TransportConfig,
+    from_peer_id: Option<&str>,
 ) -> io::Result<NativeWs> {
     let peer = config.peers.get(remote_host);
     let port = peer.map(|p| p.port).unwrap_or(DEFAULT_PORT);
     let tls = peer.map(|p| p.tls).unwrap_or(false);
     let ygg_addr = peer.and_then(|p| p.yggdrasil_addr);
 
+    // Mesh WS path — includes `from` param so the listener can detect
+    // self-connections and drop them at the TCP level (transparent self).
+    let ws_path = match from_peer_id {
+        Some(pid) => format!("/api/mesh/ws?from={pid}"),
+        None => "/api/mesh/ws".to_string(),
+    };
+
     // Priority 1: Ygg overlay WebSocket.
     if let (Some(ygg_node), Some(ygg_v6)) = (&config.ygg_node, ygg_addr) {
-        let url = format!("ws://[{ygg_v6}]:{WEB_GATEWAY_PORT}/api/mesh/ws");
+        let url = format!("ws://[{ygg_v6}]:{WEB_GATEWAY_PORT}{ws_path}");
         info!(remote_host, %url, "transport: native mesh via Ygg overlay");
         let stream = ygg_node
             .dial(ygg_v6, WEB_GATEWAY_PORT)
@@ -445,12 +457,57 @@ pub async fn connect_native(
         return Ok(NativeWs::Ygg(ws_stream));
     }
 
-    // Priority 2: TLS WebSocket.
+    // Priority 2: Switchboard half-dial (port 9443, raw TCP JSON lines).
+    //
+    // Raw TCP anycast — bypasses Fly's HTTP proxy entirely. No WebSocket.
+    // The switchboard handles self-rejection at the TCP level: if the peeked
+    // bytes contain our peer_id, it goes silent. Client times out (3s), gets
+    // SelfDetected, redials anycast → different machine answers.
+    if port == SWITCHBOARD_PORT && !tls {
+        let our_pid = from_peer_id.unwrap_or("");
+        info!(remote_host, "transport: native mesh via switchboard half-dial");
+        match connect_switchboard(remote_host, our_pid, "any").await? {
+            SwitchboardOutcome::Ready(ns) => return Ok(ns),
+            SwitchboardOutcome::DirectRedirect { target_peer_id, ygg_addr } => {
+                // Switchboard told us the target is at a different underlay
+                // address. Dial that address directly via TCP switchboard,
+                // asking for the specific peer. The ygg_addr field here is
+                // actually the underlay URI (e.g. tcp://[fdaa::]:9443).
+                let host = extract_host_from_uri(&ygg_addr);
+                info!(%target_peer_id, %host,
+                    "transport: redirect — dialing target underlay directly");
+                let want = format!("peer:{target_peer_id}");
+                match connect_switchboard(&host, our_pid, &want).await? {
+                    SwitchboardOutcome::Ready(ns) => return Ok(ns),
+                    SwitchboardOutcome::SelfDetected => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            "switchboard: self-connection detected (anycast routed to self)",
+                        ));
+                    }
+                    SwitchboardOutcome::DirectRedirect { .. } => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            "switchboard: double redirect (target not found at underlay)",
+                        ));
+                    }
+                }
+            }
+            SwitchboardOutcome::SelfDetected => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "switchboard: self-connection detected (anycast routed to self)",
+                ));
+            }
+        }
+    }
+
+    // Priority 3: TLS WebSocket.
     if tls {
         let url = if remote_host.contains(':') {
-            format!("wss://[{remote_host}]:{port}/api/mesh/ws")
+            format!("wss://[{remote_host}]:{port}{ws_path}")
         } else {
-            format!("wss://{remote_host}:{port}/api/mesh/ws")
+            format!("wss://{remote_host}:{port}{ws_path}")
         };
         info!(remote_host, %url, "transport: native mesh via TLS WebSocket");
         let (ws_stream, _response) = tokio_tungstenite::connect_async(&url)
@@ -460,10 +517,10 @@ pub async fn connect_native(
         return Ok(NativeWs::Tls(ws_stream));
     }
 
-    // PlainTcp — not supported for native mesh mode.
+    // PlainTcp — not supported for native mesh mode (requires WebSocket or switchboard).
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        format!("native mesh requires WebSocket transport (peer {remote_host} is PlainTcp)"),
+        format!("native mesh requires WebSocket or switchboard transport (peer {remote_host} is PlainTcp)"),
     ))
 }
 
@@ -483,20 +540,25 @@ pub enum SwitchboardOutcome {
         target_peer_id: String,
         ygg_addr: String,
     },
+    /// Anycast routed to self — the switchboard went silent (or we detected
+    /// our own peer_id in the handshake). Caller retries immediately with
+    /// no backoff — the next dial through anycast hits a different machine.
+    SelfDetected,
 }
 
 /// Switchboard port — the default port for half-dial connections.
 const SWITCHBOARD_PORT: u16 = 9443;
 
-/// Client-side half-dial protocol.
+/// Client-side half-dial protocol (raw TCP JSON lines, no WebSocket).
 ///
 /// 1. TCP connect to `addr:9443`
-/// 2. Send `PeerRequest` with our peer_id and what we want
-/// 3. Read `SwitchboardHello` (responder identifies first)
+/// 2. Send `PeerRequest` FIRST (so the switchboard's peek can detect protocol + self)
+/// 3. Read `SwitchboardHello` (responder identifies itself)
 /// 4. Read response: `PeerReady` or `PeerRedirect`
-/// 5. If `PeerReady` → WebSocket upgrade → return `Ready(NativeWs::Switchboard)`
+/// 5. If `PeerReady` → return `Ready(NativeWs::Switchboard)` — raw TCP continues
 /// 6. If `PeerRedirect` with "direct" → return `DirectRedirect`
-/// 7. If `PeerRedirect` with "splice" → WebSocket upgrade → return `Ready`
+/// 7. Self-connection → caught by switchboard at peek (our peer_id in PeerRequest
+///    bytes → silence, no response) or by us at step 3 (responder_peer_id == ours).
 pub async fn connect_switchboard(
     addr: &str,
     our_peer_id: &str,
@@ -505,27 +567,51 @@ pub async fn connect_switchboard(
     use super::wire::SwitchboardMessage;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    let target = format!("{addr}:{SWITCHBOARD_PORT}");
+    // IPv6 addresses need brackets in socket addresses.
+    let target = if addr.contains(':') && !addr.starts_with('[') {
+        format!("[{addr}]:{SWITCHBOARD_PORT}")
+    } else {
+        format!("{addr}:{SWITCHBOARD_PORT}")
+    };
     info!(%target, want, "switchboard client: dialing");
 
     let stream = TcpStream::connect(&target).await?;
     set_tcp_keepalive(&stream)?;
 
-    let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = BufReader::new(reader);
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
 
-    // Step 1: Read the responder's SwitchboardHello.
+    // Step 1: Send PeerRequest FIRST.
+    //
+    // The switchboard peeks at the first bytes. If it sees our peer_id
+    // (self-connection via anycast), it goes silent — doesn't respond.
+    // If not, it sees `{` (JSON) and routes to the half-dial handler.
+    let request = SwitchboardMessage::PeerRequest {
+        my_peer_id: our_peer_id.to_string(),
+        want: want.to_string(),
+    };
+    let request_line = request.to_line()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    write_half.write_all(request_line.as_bytes()).await?;
+
+    // Step 2: Read the responder's SwitchboardHello.
+    //
+    // Short timeout: on the same anycast network, switchboard response is
+    // sub-millisecond. If nothing comes in 3s, the responder detected a
+    // self-connection and went silent. Return SelfDetected so the caller
+    // retries immediately — the next dial through anycast hits a different
+    // machine.
     let mut line = String::new();
     let timeout = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
+        std::time::Duration::from_secs(3),
         reader.read_line(&mut line),
     );
     match timeout.await {
         Ok(Ok(0)) | Err(_) => {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "switchboard client: no SwitchboardHello received",
-            ));
+            // No response or timeout → server went silent (self-connection).
+            // Another machine on the anycast address will answer next time.
+            info!("switchboard client: no response — likely self-connection via anycast");
+            return Ok(SwitchboardOutcome::SelfDetected);
         }
         Ok(Err(e)) => return Err(e),
         Ok(Ok(_)) => {}
@@ -548,14 +634,12 @@ pub async fn connect_switchboard(
         "switchboard client: received SwitchboardHello"
     );
 
-    // Step 2: Send our PeerRequest.
-    let request = SwitchboardMessage::PeerRequest {
-        my_peer_id: our_peer_id.to_string(),
-        want: want.to_string(),
-    };
-    let request_line = request.to_line()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    writer.write_all(request_line.as_bytes()).await?;
+    // Protocol-level self-detection (backup — transparent self should have
+    // caught this at the peek level before we get here).
+    if responder_peer_id == our_peer_id {
+        info!("switchboard client: self-connection detected (anycast routed to self)");
+        return Ok(SwitchboardOutcome::SelfDetected);
+    }
 
     // Step 3: Read response.
     let mut response_line = String::new();
@@ -581,19 +665,13 @@ pub async fn connect_switchboard(
         SwitchboardMessage::PeerReady { peer_id } => {
             info!(
                 %peer_id,
-                "switchboard client: PeerReady — upgrading to WebSocket"
+                "switchboard client: PeerReady — raw TCP mesh session"
             );
 
-            // Reunite the split stream for WebSocket upgrade.
-            let stream = reader.into_inner().unsplit(writer);
-
-            // WebSocket upgrade on the raw TCP stream.
-            let url = format!("ws://{addr}:{SWITCHBOARD_PORT}/api/mesh/ws");
-            let (ws, _) = tokio_tungstenite::client_async(&url, stream)
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
-
-            Ok(SwitchboardOutcome::Ready(NativeWs::Switchboard(ws)))
+            // Return the raw TCP stream for JSON-lines mesh messaging.
+            // No WebSocket upgrade — the stream continues with newline-delimited
+            // MeshMessage JSON.
+            Ok(SwitchboardOutcome::Ready(NativeWs::Switchboard { reader, writer: write_half }))
         }
 
         SwitchboardMessage::PeerRedirect { target_peer_id, method, ygg_addr } => {
@@ -613,21 +691,6 @@ pub async fn connect_switchboard(
                         ygg_addr: ygg,
                     })
                 }
-                "splice" => {
-                    info!(
-                        %target_peer_id,
-                        "switchboard client: splice redirect — upgrading to WebSocket"
-                    );
-
-                    // The switchboard is proxying bytes. WebSocket upgrade on our TCP.
-                    let stream = reader.into_inner().unsplit(writer);
-                    let url = format!("ws://{addr}:{SWITCHBOARD_PORT}/api/mesh/ws");
-                    let (ws, _) = tokio_tungstenite::client_async(&url, stream)
-                        .await
-                        .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
-
-                    Ok(SwitchboardOutcome::Ready(NativeWs::Switchboard(ws)))
-                }
                 other => {
                     Err(io::Error::new(
                         io::ErrorKind::Unsupported,
@@ -644,6 +707,31 @@ pub async fn connect_switchboard(
             ))
         }
     }
+}
+
+/// Extract the host (IP) from a Ygg peer URI like `tcp://[fdaa::1]:9443`.
+///
+/// Returns the bracketed address for IPv6, or the bare host for IPv4.
+/// Falls back to returning the input as-is if parsing fails.
+fn extract_host_from_uri(uri: &str) -> String {
+    // Format: tcp://[host]:port or tcp://host:port
+    let stripped = uri
+        .strip_prefix("tcp://")
+        .unwrap_or(uri);
+    if stripped.starts_with('[') {
+        // IPv6: [addr]:port → addr
+        if let Some(bracket_end) = stripped.find(']') {
+            return stripped[1..bracket_end].to_string();
+        }
+    }
+    // IPv4 or plain: host:port → host
+    if let Some(colon) = stripped.rfind(':') {
+        let host = &stripped[..colon];
+        if !host.is_empty() {
+            return host.to_string();
+        }
+    }
+    stripped.to_string()
 }
 
 /// Apply aggressive TCP keepalive for fast dead peer detection.
@@ -924,13 +1012,12 @@ fn parse_host_port(s: &str) -> (String, u16, bool) {
 
 /// Build transport configuration from environment and local system state.
 ///
-/// Reads `LAGOON_URL` for the WebSocket federation endpoint (CDN/reverse proxy).
-/// `LAGOON_PEERS` is for Yggdrasil underlay peering — handled by init_yggdrasil().
+/// Reads `LAGOON_PEERS` for mesh federation endpoints (comma-separated).
 ///
-/// Supported LAGOON_URL formats (comma-separated):
+/// Supported formats:
 /// - `host.example.com` — WebSocket TLS on port 443
 /// - `host:443` — explicit port, TLS auto-detected from port 443
-/// - `host:6667` — plain TCP (legacy)
+/// - `host:6667` — plain TCP (LAN)
 pub fn build_config() -> TransportConfig {
     let mut config = TransportConfig::new();
 
@@ -940,18 +1027,18 @@ pub fn build_config() -> TransportConfig {
         info!("transport: Yggdrasil connectivity detected (TUN/system)");
     }
 
-    // LAGOON_URL = WebSocket federation endpoint(s).
-    if let Ok(url_str) = std::env::var("LAGOON_URL") {
-        for entry in url_str.split(',') {
+    // LAGOON_PEERS = mesh federation endpoints.
+    if let Ok(peers_str) = std::env::var("LAGOON_PEERS") {
+        for entry in peers_str.split(',') {
             let entry = entry.trim();
             if entry.is_empty() {
                 continue;
             }
             if let Some((host, peer_entry)) = parse_peer_entry(entry) {
                 if peer_entry.tls {
-                    info!(host, port = peer_entry.port, "transport: federation endpoint (TLS)");
+                    info!(host, port = peer_entry.port, "transport: peer (TLS)");
                 } else {
-                    info!(host, port = peer_entry.port, "transport: federation endpoint (plain)");
+                    info!(host, port = peer_entry.port, "transport: peer");
                 }
                 config.peers.insert(host, peer_entry);
             }

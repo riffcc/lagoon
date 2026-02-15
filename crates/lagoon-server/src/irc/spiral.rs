@@ -23,6 +23,32 @@ pub fn hex_to_world(coord: HexCoord) -> [f64; 3] {
     [x, y, z]
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Convergence types — deterministic, conflict-free, parallel-safe
+// ═══════════════════════════════════════════════════════════════════════
+
+/// A single move during deterministic repack.
+///
+/// The node at `from_index` moves to `to_index` to fill a hole.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepackMove {
+    pub peer_id: String,
+    pub from_index: Spiral3DIndex,
+    pub to_index: Spiral3DIndex,
+}
+
+/// A swap decision: two peers should exchange SPIRAL slots.
+///
+/// Both peers benefit from the exchange (lower neighbor latency).
+/// The caller executes the swap atomically via temporary swap slots.
+#[derive(Debug, Clone)]
+pub struct SwapDecision {
+    pub peer_a: String,
+    pub peer_b: String,
+    /// Combined latency improvement (positive = beneficial).
+    pub improvement: f64,
+}
+
 /// SPIRAL topology state for this node's mesh.
 ///
 /// All string keys are mesh keys (`"{site_name}/{node_name}"`), the globally
@@ -83,6 +109,41 @@ impl SpiralTopology {
         self.our_coord = Some(coord);
         self.our_mesh_key = Some(our_mesh_key.to_string());
         self.occupied.insert(coord, our_mesh_key.to_string());
+        self.peer_positions.insert(our_mesh_key.to_string(), (idx, coord));
+        self.recompute_neighbors();
+        idx
+    }
+
+    /// Claim a SPECIFIC slot as our own position.
+    ///
+    /// Like `claim_position` but takes a target slot instead of auto-picking.
+    /// Used when a cluster node assigns us a slot via HELLO — we trust
+    /// the assignment and claim exactly that slot. Sets all internal state
+    /// (`our_index`, `our_coord`, `our_mesh_key`) and recomputes neighbors.
+    pub fn claim_specific_position(&mut self, our_mesh_key: &str, slot: u64) -> Spiral3DIndex {
+        // Clean up old self entry if re-claiming after a move.
+        if let Some(old_coord) = self.our_coord {
+            if self.occupied.get(&old_coord).map(|s| s.as_str()) == Some(our_mesh_key) {
+                self.occupied.remove(&old_coord);
+            }
+        }
+
+        let idx = Spiral3DIndex::new(slot);
+        let coord = spiral3d_to_coord(idx);
+
+        // If someone else is at this slot, evict them.
+        if let Some(existing) = self.occupied.get(&coord) {
+            if existing != our_mesh_key {
+                let evicted = existing.clone();
+                self.peer_positions.remove(&evicted);
+            }
+        }
+
+        self.our_index = Some(idx);
+        self.our_coord = Some(coord);
+        self.our_mesh_key = Some(our_mesh_key.to_string());
+        self.occupied.insert(coord, our_mesh_key.to_string());
+        self.peer_positions.insert(our_mesh_key.to_string(), (idx, coord));
         self.recompute_neighbors();
         idx
     }
@@ -127,6 +188,7 @@ impl SpiralTopology {
         self.our_coord = Some(coord);
         self.our_mesh_key = Some(our_mesh_key.to_string());
         self.occupied.insert(coord, our_mesh_key.to_string());
+        self.peer_positions.insert(our_mesh_key.to_string(), (index, coord));
         self.recompute_neighbors();
     }
 
@@ -233,20 +295,41 @@ impl SpiralTopology {
         }
     }
 
-    /// Recompute our 20-neighbor set from current occupancy via gap-and-wrap.
+    /// Recompute our neighbor set from current occupancy.
+    ///
+    /// SPIRAL has 20 direction vectors → max 20 unique neighbors.
+    /// When N ≤ 20, the occupied slot array IS the neighbor list — every peer
+    /// is every other peer's neighbor. No geometry needed. This is the
+    /// SPORE-style array: the stored topology IS the connectivity graph.
+    ///
+    /// When N > 20, gap-and-wrap selects the 20 geometrically nearest
+    /// neighbors from the shared topology.
     fn recompute_neighbors(&mut self) {
         self.neighbors.clear();
 
-        let Some(our_coord) = self.our_coord else {
+        if self.our_coord.is_none() {
             return;
-        };
+        }
 
+        // N ≤ 20: every peer is a neighbor. The slot array IS the topology.
+        // SPIRAL's 20-neighbor bound means at small N, all peers fit within
+        // the neighbor set. No geometric ray-walking needed.
+        if self.occupied.len() <= 20 {
+            for mesh_key in self.occupied.values() {
+                if self.our_mesh_key.as_deref() != Some(mesh_key.as_str()) {
+                    self.neighbors.insert(mesh_key.clone());
+                }
+            }
+            return;
+        }
+
+        // N > 20: use geometric gap-and-wrap to select the 20 nearest neighbors.
+        let our_coord = self.our_coord.unwrap();
         let occupied_set: HashSet<HexCoord> = self.occupied.keys().copied().collect();
         let connections = compute_all_connections(&occupied_set, our_coord);
 
         for conn in connections {
             if let Some(mesh_key) = self.occupied.get(&conn.target) {
-                // Don't include ourselves as a neighbor.
                 if self.our_mesh_key.as_deref() != Some(mesh_key.as_str()) {
                     self.neighbors.insert(mesh_key.clone());
                 }
@@ -344,6 +427,373 @@ impl SpiralTopology {
             .collect();
         slots.sort_by_key(|(idx, _)| *idx);
         slots
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Layer 1: Deterministic Repack
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// All occupied slots as `(peer_id, index)` pairs, including self.
+    /// Sorted by slot index ascending.
+    pub fn all_occupied(&self) -> Vec<(String, Spiral3DIndex)> {
+        // Self is now included in peer_positions (set by claim_position,
+        // claim_specific_position, and set_position), so no need to add
+        // our_* separately.
+        let mut result: Vec<(String, Spiral3DIndex)> = self
+            .peer_positions
+            .iter()
+            .map(|(k, (idx, _))| (k.clone(), *idx))
+            .collect();
+        result.sort_by_key(|(_, idx)| idx.value());
+        result
+    }
+
+    /// Compute deterministic repack moves to fill holes in `[0..N)`.
+    ///
+    /// Single-pass, O(N), conflict-free. Every node independently computes
+    /// the same result from the same topology state.
+    ///
+    /// Algorithm:
+    ///   1. `N` = number of occupied slots
+    ///   2. `holes` = slots in `[0..N)` that are unoccupied
+    ///   3. `movers` = peers at slots `>= N`, sorted ascending by slot
+    ///   4. `mover[i]` → `hole[i]`
+    pub fn compute_repack_moves(&self) -> Vec<RepackMove> {
+        let all = self.all_occupied();
+        let n = all.len();
+        if n == 0 {
+            return vec![];
+        }
+
+        let occupied_indices: HashSet<u64> =
+            all.iter().map(|(_, idx)| idx.value()).collect();
+
+        let holes: Vec<u64> = (0..n as u64)
+            .filter(|s| !occupied_indices.contains(s))
+            .collect();
+
+        if holes.is_empty() {
+            return vec![];
+        }
+
+        let mut movers: Vec<(String, Spiral3DIndex)> = all
+            .into_iter()
+            .filter(|(_, idx)| idx.value() >= n as u64)
+            .collect();
+        movers.sort_by_key(|(_, idx)| idx.value());
+
+        movers
+            .into_iter()
+            .zip(holes)
+            .map(|((peer_id, from_idx), to_slot)| RepackMove {
+                peer_id,
+                from_index: from_idx,
+                to_index: Spiral3DIndex::new(to_slot),
+            })
+            .collect()
+    }
+
+    /// Apply deterministic repack: fill holes in `[0..N)`.
+    ///
+    /// Modifies the topology in place. Returns the moves applied.
+    pub fn apply_repack(&mut self) -> Vec<RepackMove> {
+        let moves = self.compute_repack_moves();
+        for mv in &moves {
+            if self.our_mesh_key.as_deref() == Some(&mv.peer_id) {
+                self.remove_peer(&mv.peer_id);
+                self.set_position(&mv.peer_id, mv.to_index);
+            } else {
+                self.remove_peer(&mv.peer_id);
+                self.add_peer(&mv.peer_id, mv.to_index);
+            }
+        }
+        moves
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Layer 2: Zipper Merge
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Merge peers from another topology (loser) into this one (winner).
+    ///
+    /// Shared peers keep OUR slot assignment (winner privilege).
+    /// Loser-only peers are assigned sequential slots after our max slot,
+    /// then repack fills any holes.
+    ///
+    /// Returns the repack moves applied.
+    pub fn merge_from(&mut self, loser_peers: &[(String, Spiral3DIndex)]) -> Vec<RepackMove> {
+        let max_slot = self
+            .all_occupied()
+            .iter()
+            .map(|(_, idx)| idx.value())
+            .max()
+            .unwrap_or(0);
+
+        let mut next_slot = max_slot + 1;
+
+        // Sort loser peers deterministically by peer_id.
+        let mut loser_sorted: Vec<_> = loser_peers.to_vec();
+        loser_sorted.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (peer_id, _) in &loser_sorted {
+            // Skip if we already know this peer (shared node).
+            if self.peer_positions.contains_key(peer_id.as_str()) {
+                continue;
+            }
+            if self.our_mesh_key.as_deref() == Some(peer_id.as_str()) {
+                continue;
+            }
+            self.add_peer(peer_id, Spiral3DIndex::new(next_slot));
+            next_slot += 1;
+        }
+
+        self.apply_repack()
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Layer 3: Latency Swap
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Swap two peers' SPIRAL positions atomically.
+    ///
+    /// Handles the case where one peer is "us" (stored in `our_*` fields).
+    /// Returns `true` if the swap succeeded.
+    pub fn apply_swap(&mut self, peer_a: &str, peer_b: &str) -> bool {
+        let is_us_a = self.our_mesh_key.as_deref() == Some(peer_a);
+        let is_us_b = self.our_mesh_key.as_deref() == Some(peer_b);
+
+        let pos_a = if is_us_a {
+            self.our_index.zip(self.our_coord)
+        } else {
+            self.peer_positions
+                .get(peer_a)
+                .map(|&(idx, coord)| (idx, coord))
+        };
+
+        let pos_b = if is_us_b {
+            self.our_index.zip(self.our_coord)
+        } else {
+            self.peer_positions
+                .get(peer_b)
+                .map(|&(idx, coord)| (idx, coord))
+        };
+
+        let (idx_a, coord_a) = match pos_a {
+            Some(p) => p,
+            None => return false,
+        };
+        let (idx_b, coord_b) = match pos_b {
+            Some(p) => p,
+            None => return false,
+        };
+
+        // Update occupied map: swap occupants.
+        self.occupied.insert(coord_a, peer_b.to_string());
+        self.occupied.insert(coord_b, peer_a.to_string());
+
+        // Update position tracking.
+        if is_us_a {
+            self.our_index = Some(idx_b);
+            self.our_coord = Some(coord_b);
+            self.peer_positions
+                .insert(peer_b.to_string(), (idx_a, coord_a));
+        } else if is_us_b {
+            self.our_index = Some(idx_a);
+            self.our_coord = Some(coord_a);
+            self.peer_positions
+                .insert(peer_a.to_string(), (idx_b, coord_b));
+        } else {
+            self.peer_positions
+                .insert(peer_a.to_string(), (idx_b, coord_b));
+            self.peer_positions
+                .insert(peer_b.to_string(), (idx_a, coord_a));
+        }
+
+        self.recompute_neighbors();
+        true
+    }
+
+    /// Compute one global deterministic swap round.
+    ///
+    /// Examines all SPIRAL neighbor edges as potential swaps. For each edge,
+    /// evaluates whether swapping the two occupants would reduce their combined
+    /// neighbor latency. Accepts swaps greedily (highest improvement first)
+    /// with sequential re-verification against a virtual state.
+    ///
+    /// `latency_fn(peer_a, peer_b)` returns the measured latency between two
+    /// peers (from PoLP gossip). This is the same data every node has.
+    ///
+    /// Properties:
+    ///   - **Deterministic**: same topology + latency data → same decisions
+    ///   - **Monotonic**: each accepted swap is re-verified in current virtual state
+    ///   - **Multi-swap**: typically accepts many swaps per round
+    ///   - **Conflict-free**: no slot is swapped twice in one round
+    pub fn compute_swap_round<F>(&self, latency_fn: F) -> Vec<SwapDecision>
+    where
+        F: Fn(&str, &str) -> f64,
+    {
+        let all = self.all_occupied();
+        if all.len() < 2 {
+            return vec![];
+        }
+
+        // Build lookups.
+        let occupied_set: HashSet<HexCoord> = self.occupied.keys().copied().collect();
+
+        // slot → coord
+        let slot_coord: HashMap<u64, HexCoord> = all
+            .iter()
+            .map(|(_, idx)| (idx.value(), spiral3d_to_coord(*idx)))
+            .collect();
+
+        // coord → slot
+        let coord_slot: HashMap<HexCoord, u64> = slot_coord
+            .iter()
+            .map(|(s, c)| (*c, *s))
+            .collect();
+
+        // Virtual state: slot → peer_id (mutated during acceptance).
+        let mut vstate: HashMap<u64, String> = all
+            .iter()
+            .map(|(pid, idx)| (idx.value(), pid.clone()))
+            .collect();
+
+        // Precompute neighbor slots for each occupied slot.
+        let mut slot_nbrs: HashMap<u64, Vec<u64>> = HashMap::new();
+        for &(_, idx) in &all {
+            let coord = spiral3d_to_coord(idx);
+            let conns = compute_all_connections(&occupied_set, coord);
+            let mut nbr_slots: Vec<u64> = conns
+                .iter()
+                .filter_map(|c| coord_slot.get(&c.target).copied())
+                .filter(|&s| s != idx.value())
+                .collect();
+            nbr_slots.sort();
+            nbr_slots.dedup();
+            slot_nbrs.insert(idx.value(), nbr_slots);
+        }
+
+        // Helper: total neighbor latency for a peer at a given slot.
+        let nbr_latency = |peer: &str, slot: u64, vs: &HashMap<u64, String>| -> f64 {
+            slot_nbrs
+                .get(&slot)
+                .map(|nbrs| {
+                    nbrs.iter()
+                        .filter_map(|ns| vs.get(ns))
+                        .map(|np| latency_fn(peer, np))
+                        .sum::<f64>()
+                })
+                .unwrap_or(0.0)
+        };
+
+        // Enumerate neighbor edges (smaller slot first for dedup).
+        let mut edges: Vec<(u64, u64)> = Vec::new();
+        for (&slot, nbrs) in &slot_nbrs {
+            for &ns in nbrs {
+                if slot < ns {
+                    edges.push((slot, ns));
+                }
+            }
+        }
+        edges.sort();
+        edges.dedup();
+
+        // ── Phase 1: Evaluate each edge as a potential swap ──────────
+
+        let mut candidates: Vec<(f64, (String, String), u64, u64)> = Vec::new();
+
+        for &(sa, sb) in &edges {
+            let pa = match vstate.get(&sa) {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+            let pb = match vstate.get(&sb) {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+
+            let la = nbr_latency(&pa, sa, &vstate);
+            let lb = nbr_latency(&pb, sb, &vstate);
+
+            // Tentative swap for evaluation.
+            vstate.insert(sa, pb.clone());
+            vstate.insert(sb, pa.clone());
+            let la_s = nbr_latency(&pb, sa, &vstate); // pb now at sa
+            let lb_s = nbr_latency(&pa, sb, &vstate); // pa now at sb
+            vstate.insert(sa, pa.clone());
+            vstate.insert(sb, pb.clone());
+
+            let improvement = (la + lb) - (la_s + lb_s);
+            if improvement > 0.001 {
+                // pa moves from sa → sb: new latency = lb_s, old = la
+                // pb moves from sb → sa: new latency = la_s, old = lb
+                if lb_s <= la + 0.001 && la_s <= lb + 0.001 {
+                    let tie = if pa < pb {
+                        (pa, pb)
+                    } else {
+                        (pb, pa)
+                    };
+                    candidates.push((improvement, tie, sa, sb));
+                }
+            }
+        }
+
+        // ── Phase 2: Sort — improvement DESC, deterministic tiebreak ─
+
+        candidates.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+
+        // ── Phase 3: Sequential re-verified acceptance ───────────────
+
+        let mut used: HashSet<u64> = HashSet::new();
+        let mut decisions: Vec<SwapDecision> = Vec::new();
+
+        for (_, _, sa, sb) in &candidates {
+            if used.contains(sa) || used.contains(sb) {
+                continue;
+            }
+
+            let pa = match vstate.get(sa) {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+            let pb = match vstate.get(sb) {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+
+            // Re-verify in CURRENT virtual state.
+            let la = nbr_latency(&pa, *sa, &vstate);
+            let lb = nbr_latency(&pb, *sb, &vstate);
+
+            vstate.insert(*sa, pb.clone());
+            vstate.insert(*sb, pa.clone());
+            let la_s = nbr_latency(&pb, *sa, &vstate);
+            let lb_s = nbr_latency(&pa, *sb, &vstate);
+
+            let before = la + lb;
+            let after = la_s + lb_s;
+
+            if after < before - 0.001 && lb_s <= la + 0.001 && la_s <= lb + 0.001 {
+                // Accept — keep swap in virtual state.
+                used.insert(*sa);
+                used.insert(*sb);
+                decisions.push(SwapDecision {
+                    peer_a: pa,
+                    peer_b: pb,
+                    improvement: before - after,
+                });
+            } else {
+                // Reject — restore virtual state.
+                vstate.insert(*sa, pa);
+                vstate.insert(*sb, pb);
+            }
+        }
+
+        decisions
     }
 }
 
@@ -787,16 +1237,15 @@ mod tests {
         }
     }
 
-    /// Helper: verify no ghost slots — occupied count == peer_positions + self.
+    /// Helper: verify no ghost slots — occupied count == peer_positions count.
     fn assert_no_ghosts(topo: &SpiralTopology, context: &str) {
         let slots = topo.occupied_slots();
-        // occupied_slots() iterates peer_positions (excludes self).
-        // occupied_count() counts occupied map (includes self).
-        let self_offset = if topo.is_claimed() { 1 } else { 0 };
+        // occupied_slots() iterates peer_positions (now includes self).
+        // occupied_count() counts occupied map (also includes self).
         assert_eq!(
-            slots.len() + self_offset,
+            slots.len(),
             topo.occupied_count(),
-            "{context}: occupied_slots ({}) + self ({self_offset}) != occupied_count ({}) — ghost slots detected",
+            "{context}: occupied_slots ({}) != occupied_count ({}) — ghost slots detected",
             slots.len(), topo.occupied_count()
         );
         // Every slot's occupant must be consistent.
@@ -1447,5 +1896,577 @@ mod tests {
             assert_no_ghosts(topo, &format!("triple_merge: {key}"));
         }
         assert_bidirectional(&final_all, "double_split_merge");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Three-layer convergence tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // ── Layer 1: Deterministic Repack ────────────────────────────────────
+
+    #[test]
+    fn repack_fills_holes_single_pass() {
+        // 10 nodes, kill 3 at slots 2, 5, 8 → repack fills holes.
+        let mut topo = SpiralTopology::new();
+        topo.claim_position("us");
+        for i in 1..10u64 {
+            topo.add_peer(&format!("peer-{i}"), Spiral3DIndex::new(i));
+        }
+        assert_eq!(topo.occupied_count(), 10);
+
+        // Kill slots 2, 5, 8.
+        topo.remove_peer("peer-2");
+        topo.remove_peer("peer-5");
+        topo.remove_peer("peer-8");
+        assert_eq!(topo.occupied_count(), 7);
+
+        // Occupied = {0,1,3,4,6,7,9}. N=7.
+        // Holes in [0..7) = {2, 5}. Movers (>=7) = {7, 9}.
+        // 2 movers fill 2 holes.
+        let moves = topo.compute_repack_moves();
+        assert_eq!(moves.len(), 2, "2 holes in [0..7) → 2 moves");
+
+        // Apply.
+        let applied = topo.apply_repack();
+        // After first compute_repack_moves was called, the topology hasn't
+        // changed yet. apply_repack computes fresh moves and applies them.
+        assert_eq!(applied.len(), 2);
+        assert_packed(&topo, 7, "repack_basic");
+        assert_no_ghosts(&topo, "repack_basic");
+    }
+
+    #[test]
+    fn repack_idempotent() {
+        // Already packed → zero moves.
+        let mut topo = SpiralTopology::new();
+        topo.claim_position("us");
+        for i in 1..5u64 {
+            topo.add_peer(&format!("peer-{i}"), Spiral3DIndex::new(i));
+        }
+        let moves = topo.compute_repack_moves();
+        assert!(moves.is_empty(), "Already packed → no moves");
+
+        let applied = topo.apply_repack();
+        assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn repack_all_nodes_agree() {
+        // N nodes independently compute the same repack from the same view.
+        let nodes = build_consistent_mesh(20);
+
+        // Kill 5 nodes.
+        let dead: HashSet<String> = vec![
+            "node-003", "node-007", "node-011", "node-015", "node-019",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        // Each surviving node computes repack independently.
+        let mut reference_moves: Option<Vec<(String, u64, u64)>> = None;
+
+        for (key, topo) in &nodes {
+            if dead.contains(key) {
+                continue;
+            }
+            // Build this node's view (missing the dead).
+            let mut view = SpiralTopology::new();
+            for (pk, pt) in &nodes {
+                if dead.contains(pk) || pk == key {
+                    continue;
+                }
+                view.add_peer(pk, pt.our_index().unwrap());
+            }
+            view.set_position(key, topo.our_index().unwrap());
+
+            // Remove dead from view.
+            for d in &dead {
+                view.remove_peer(d);
+            }
+
+            let moves: Vec<(String, u64, u64)> = view
+                .compute_repack_moves()
+                .iter()
+                .map(|m| (m.peer_id.clone(), m.from_index.value(), m.to_index.value()))
+                .collect();
+
+            if let Some(ref prev) = reference_moves {
+                assert_eq!(&moves, prev, "{key} disagrees on repack moves");
+            } else {
+                reference_moves = Some(moves);
+            }
+        }
+    }
+
+    #[test]
+    fn repack_scale_100() {
+        // 100 nodes, kill 30, repack in one pass.
+        let mut topo = SpiralTopology::new();
+        topo.claim_position("us");
+        for i in 1..100u64 {
+            topo.add_peer(&format!("p-{i:03}"), Spiral3DIndex::new(i));
+        }
+
+        // Kill every 3rd peer.
+        for i in (3..100u64).step_by(3) {
+            topo.remove_peer(&format!("p-{i:03}"));
+        }
+
+        let remaining = topo.occupied_count();
+        let applied = topo.apply_repack();
+        assert!(!applied.is_empty());
+        assert_packed(&topo, remaining, "repack_scale_100");
+        assert_no_ghosts(&topo, "repack_scale_100");
+
+        // Idempotent after repack.
+        let moves2 = topo.compute_repack_moves();
+        assert!(moves2.is_empty(), "Should be idempotent after repack");
+    }
+
+    // ── Layer 2: Zipper Merge ────────────────────────────────────────────
+
+    #[test]
+    fn zipper_merge_disjoint() {
+        // Two disjoint 5-node groups merge.
+        let mut winner = SpiralTopology::new();
+        winner.claim_position("w-0");
+        for i in 1..5u64 {
+            winner.add_peer(&format!("w-{i}"), Spiral3DIndex::new(i));
+        }
+        assert_packed(&winner, 5, "winner_pre");
+
+        let loser_peers: Vec<(String, Spiral3DIndex)> = (0..5)
+            .map(|i| (format!("l-{i}"), Spiral3DIndex::new(i)))
+            .collect();
+
+        winner.merge_from(&loser_peers);
+        assert_packed(&winner, 10, "disjoint_merge");
+        assert_no_ghosts(&winner, "disjoint_merge");
+
+        // Winner keeps original slots.
+        assert_eq!(winner.peer_at_index(0), Some("w-0"));
+        assert_eq!(winner.peer_at_index(1), Some("w-1"));
+        assert_eq!(winner.peer_at_index(4), Some("w-4"));
+    }
+
+    #[test]
+    fn zipper_merge_overlapping() {
+        // Winner has peers 0-9, loser has peers 5-14.
+        // Shared: 5-9. Loser-only: 10-14.
+        let mut winner = SpiralTopology::new();
+        winner.claim_position("p-00");
+        for i in 1..10u64 {
+            winner.add_peer(&format!("p-{i:02}"), Spiral3DIndex::new(i));
+        }
+
+        let loser_peers: Vec<(String, Spiral3DIndex)> = (5..15)
+            .map(|i| (format!("p-{i:02}"), Spiral3DIndex::new(i - 5)))
+            .collect();
+
+        winner.merge_from(&loser_peers);
+
+        // Should have 15 unique peers now.
+        assert_eq!(winner.occupied_count(), 15);
+        assert_packed(&winner, 15, "overlap_merge");
+        assert_no_ghosts(&winner, "overlap_merge");
+
+        // Winner's original assignments preserved.
+        for i in 0..10u64 {
+            assert_eq!(
+                winner.peer_at_index(i),
+                Some(format!("p-{i:02}")).as_deref(),
+                "Winner slot {i} should be preserved"
+            );
+        }
+    }
+
+    #[test]
+    fn zipper_merge_full_overlap() {
+        // A = B (same peers, same slots). Merge should be no-op.
+        let mut topo = SpiralTopology::new();
+        topo.claim_position("p-0");
+        for i in 1..8u64 {
+            topo.add_peer(&format!("p-{i}"), Spiral3DIndex::new(i));
+        }
+
+        let loser_peers: Vec<(String, Spiral3DIndex)> = (0..8)
+            .map(|i| (format!("p-{i}"), Spiral3DIndex::new(i)))
+            .collect();
+
+        let moves = topo.merge_from(&loser_peers);
+        assert!(moves.is_empty(), "Full overlap should produce no moves");
+        assert_eq!(topo.occupied_count(), 8);
+        assert_packed(&topo, 8, "full_overlap_merge");
+    }
+
+    #[test]
+    fn zipper_merge_asymmetric() {
+        // Large (50) + tiny (3), 1 shared peer.
+        let mut winner = SpiralTopology::new();
+        winner.claim_position("w-00");
+        for i in 1..50u64 {
+            winner.add_peer(&format!("w-{i:02}"), Spiral3DIndex::new(i));
+        }
+
+        // Loser has w-49 (shared) + 2 unique.
+        let loser_peers = vec![
+            ("w-49".to_string(), Spiral3DIndex::new(0)),
+            ("tiny-a".to_string(), Spiral3DIndex::new(1)),
+            ("tiny-b".to_string(), Spiral3DIndex::new(2)),
+        ];
+
+        winner.merge_from(&loser_peers);
+        assert_eq!(winner.occupied_count(), 52);
+        assert_packed(&winner, 52, "asymmetric_merge");
+        assert_no_ghosts(&winner, "asymmetric_merge");
+
+        // Winner's slots preserved.
+        assert_eq!(winner.peer_at_index(0), Some("w-00"));
+        assert_eq!(winner.peer_at_index(49), Some("w-49"));
+    }
+
+    // ── Layer 3: Latency Swap ────────────────────────────────────────────
+
+    /// Test helper: build a topology with geographic positions.
+    /// Returns (topology, position_map) where position_map maps peer_id → (x, y).
+    fn build_geographic_mesh(
+        clusters: &[(&str, f64, f64, usize)], // (prefix, center_x, center_y, count)
+    ) -> (SpiralTopology, HashMap<String, (f64, f64)>) {
+        let mut positions: HashMap<String, (f64, f64)> = HashMap::new();
+        let mut all_peers: Vec<(String, Spiral3DIndex)> = Vec::new();
+        let mut slot = 0u64;
+
+        // Simple deterministic "random" scatter.
+        let mut rng_state: u64 = 0xCAFEBABE;
+        let mut next_f64 = || -> f64 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng_state >> 33) as f64) / (u32::MAX as f64) * 2.0 - 1.0
+        };
+
+        for &(prefix, cx, cy, count) in clusters {
+            for i in 0..count {
+                let key = format!("{prefix}-{i:02}");
+                let x = cx + next_f64() * 10.0;
+                let y = cy + next_f64() * 10.0;
+                positions.insert(key.clone(), (x, y));
+                all_peers.push((key, Spiral3DIndex::new(slot)));
+                slot += 1;
+            }
+        }
+
+        // Shuffle slot assignments deterministically (simulate random initial placement).
+        // Use a simple Fisher-Yates with our LCG.
+        let mut indices: Vec<Spiral3DIndex> = (0..all_peers.len() as u64)
+            .map(Spiral3DIndex::new)
+            .collect();
+        for i in (1..indices.len()).rev() {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let j = (rng_state >> 33) as usize % (i + 1);
+            indices.swap(i, j);
+        }
+        for (peer, idx) in all_peers.iter_mut().zip(indices.iter()) {
+            peer.1 = *idx;
+        }
+
+        // Build topology: first peer claims, rest are added.
+        let mut topo = SpiralTopology::new();
+        topo.set_position(&all_peers[0].0, all_peers[0].1);
+        for (key, idx) in &all_peers[1..] {
+            topo.add_peer(key, *idx);
+        }
+
+        (topo, positions)
+    }
+
+    /// Euclidean distance as latency, given a position map.
+    fn euclidean_latency(
+        positions: &HashMap<String, (f64, f64)>,
+        a: &str,
+        b: &str,
+    ) -> f64 {
+        let &(ax, ay) = positions.get(a).unwrap_or(&(0.0, 0.0));
+        let &(bx, by) = positions.get(b).unwrap_or(&(0.0, 0.0));
+        ((ax - bx).powi(2) + (ay - by).powi(2)).sqrt()
+    }
+
+    /// Compute total network latency (sum over all neighbor edges, each once).
+    fn total_latency(topo: &SpiralTopology, positions: &HashMap<String, (f64, f64)>) -> f64 {
+        let all = topo.all_occupied();
+        let occupied_set: HashSet<HexCoord> = all
+            .iter()
+            .map(|(_, idx)| spiral3d_to_coord(*idx))
+            .collect();
+
+        let coord_to_key: HashMap<HexCoord, &str> = all
+            .iter()
+            .map(|(k, idx)| (spiral3d_to_coord(*idx), k.as_str()))
+            .collect();
+
+        let mut total = 0.0;
+        let mut counted: HashSet<(u64, u64)> = HashSet::new();
+
+        for (key, idx) in &all {
+            let coord = spiral3d_to_coord(*idx);
+            let conns = compute_all_connections(&occupied_set, coord);
+            for c in &conns {
+                if let Some(&nbr_key) = coord_to_key.get(&c.target) {
+                    if nbr_key == key.as_str() {
+                        continue;
+                    }
+                    let edge = if idx.value() < topo.peer_index(nbr_key).unwrap_or(Spiral3DIndex::ORIGIN).value() {
+                        (idx.value(), topo.peer_index(nbr_key).unwrap_or(Spiral3DIndex::ORIGIN).value())
+                    } else {
+                        (topo.peer_index(nbr_key).unwrap_or(Spiral3DIndex::ORIGIN).value(), idx.value())
+                    };
+                    if counted.insert(edge) {
+                        total += euclidean_latency(positions, key, nbr_key);
+                    }
+                }
+            }
+        }
+
+        total
+    }
+
+    #[test]
+    fn swap_round_deterministic() {
+        // Two independent computations from the same state yield identical results.
+        let (topo, positions) = build_geographic_mesh(&[
+            ("london", 0.0, 0.0, 10),
+            ("tokyo", 100.0, 0.0, 10),
+        ]);
+
+        let lat = |a: &str, b: &str| euclidean_latency(&positions, a, b);
+
+        let decisions_1 = topo.compute_swap_round(&lat);
+        let decisions_2 = topo.compute_swap_round(&lat);
+
+        assert_eq!(decisions_1.len(), decisions_2.len(), "Same number of swaps");
+        for (d1, d2) in decisions_1.iter().zip(decisions_2.iter()) {
+            assert_eq!(d1.peer_a, d2.peer_a);
+            assert_eq!(d1.peer_b, d2.peer_b);
+            assert!(
+                (d1.improvement - d2.improvement).abs() < 0.001,
+                "Improvement should match"
+            );
+        }
+    }
+
+    #[test]
+    fn swap_round_monotonic() {
+        // Multiple swap rounds: total latency must never increase.
+        let (mut topo, positions) = build_geographic_mesh(&[
+            ("london", 0.0, 0.0, 8),
+            ("tokyo", 100.0, 0.0, 8),
+            ("nyc", 50.0, 80.0, 8),
+        ]);
+
+        let lat = |a: &str, b: &str| euclidean_latency(&positions, a, b);
+        let mut prev_lat = total_latency(&topo, &positions);
+
+        for round in 0..20 {
+            let decisions = topo.compute_swap_round(&lat);
+            if decisions.is_empty() {
+                break;
+            }
+            for d in &decisions {
+                topo.apply_swap(&d.peer_a, &d.peer_b);
+            }
+            let new_lat = total_latency(&topo, &positions);
+            assert!(
+                new_lat <= prev_lat + 0.01,
+                "Round {round}: latency increased {prev_lat:.1} → {new_lat:.1}"
+            );
+            prev_lat = new_lat;
+        }
+    }
+
+    #[test]
+    fn swap_round_converges() {
+        // Swap rounds eventually stabilize (zero swaps).
+        let (mut topo, positions) = build_geographic_mesh(&[
+            ("london", 0.0, 0.0, 10),
+            ("tokyo", 100.0, 0.0, 10),
+        ]);
+
+        let lat = |a: &str, b: &str| euclidean_latency(&positions, a, b);
+        let initial_lat = total_latency(&topo, &positions);
+
+        let mut stable = false;
+        for _round in 0..30 {
+            let decisions = topo.compute_swap_round(&lat);
+            if decisions.is_empty() {
+                stable = true;
+                break;
+            }
+            for d in &decisions {
+                topo.apply_swap(&d.peer_a, &d.peer_b);
+            }
+        }
+        assert!(stable, "Should stabilize within 30 rounds");
+
+        let final_lat = total_latency(&topo, &positions);
+        assert!(
+            final_lat < initial_lat,
+            "Should improve: {initial_lat:.0} → {final_lat:.0}"
+        );
+    }
+
+    #[test]
+    fn swap_preserves_topology_invariants() {
+        // After swaps, topology remains packed with no ghosts.
+        let (mut topo, positions) = build_geographic_mesh(&[
+            ("lon", 0.0, 0.0, 8),
+            ("tok", 100.0, 0.0, 8),
+        ]);
+
+        let n = topo.occupied_count();
+        let lat = |a: &str, b: &str| euclidean_latency(&positions, a, b);
+
+        for _round in 0..10 {
+            let decisions = topo.compute_swap_round(&lat);
+            if decisions.is_empty() {
+                break;
+            }
+            for d in &decisions {
+                topo.apply_swap(&d.peer_a, &d.peer_b);
+            }
+            assert_eq!(topo.occupied_count(), n, "Occupied count must not change");
+            assert_packed(&topo, n, "post_swap");
+            assert_no_ghosts(&topo, "post_swap");
+        }
+    }
+
+    #[test]
+    fn apply_swap_with_self() {
+        // Swap where one peer is "us".
+        let mut topo = SpiralTopology::new();
+        topo.claim_position("us");
+        topo.add_peer("them", Spiral3DIndex::new(1));
+        topo.add_peer("other", Spiral3DIndex::new(2));
+
+        assert_eq!(topo.our_index().unwrap().value(), 0);
+        assert_eq!(topo.peer_index("them").unwrap().value(), 1);
+
+        let ok = topo.apply_swap("us", "them");
+        assert!(ok);
+        assert_eq!(topo.our_index().unwrap().value(), 1);
+        assert_eq!(topo.peer_index("them").unwrap().value(), 0);
+        assert_eq!(topo.occupied_count(), 3);
+        assert_no_ghosts(&topo, "swap_with_self");
+    }
+
+    #[test]
+    fn apply_swap_remote_peers() {
+        // Swap between two remote peers.
+        let mut topo = SpiralTopology::new();
+        topo.claim_position("us");
+        topo.add_peer("alice", Spiral3DIndex::new(1));
+        topo.add_peer("bob", Spiral3DIndex::new(2));
+
+        let ok = topo.apply_swap("alice", "bob");
+        assert!(ok);
+        assert_eq!(topo.peer_index("alice").unwrap().value(), 2);
+        assert_eq!(topo.peer_index("bob").unwrap().value(), 1);
+        assert_eq!(topo.occupied_count(), 3);
+        assert_no_ghosts(&topo, "swap_remote");
+    }
+
+    // ── Full pipeline: repack → swap → churn → repack → swap ─────────
+
+    #[test]
+    fn full_convergence_pipeline() {
+        // Start with geographic mesh, optimize, churn, re-optimize.
+        let (mut topo, mut positions) = build_geographic_mesh(&[
+            ("london", 0.0, 0.0, 10),
+            ("tokyo", 100.0, 0.0, 10),
+            ("nyc", 50.0, 80.0, 10),
+        ]);
+
+        let n = topo.occupied_count();
+        assert_eq!(n, 30);
+        assert_packed(&topo, 30, "pipeline_initial");
+
+        // Phase 1: Optimize.
+        let initial_lat = total_latency(&topo, &positions);
+        for _ in 0..20 {
+            let lat = |a: &str, b: &str| euclidean_latency(&positions, a, b);
+            let decisions = topo.compute_swap_round(lat);
+            if decisions.is_empty() {
+                break;
+            }
+            for d in &decisions {
+                topo.apply_swap(&d.peer_a, &d.peer_b);
+            }
+        }
+        let optimized_lat = total_latency(&topo, &positions);
+        assert!(optimized_lat < initial_lat, "Phase 1 should improve latency");
+
+        // Phase 2: Kill 10 nodes (simulate churn).
+        let all = topo.all_occupied();
+        let dead: Vec<String> = all
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i % 3 == 0)
+            .map(|(_, (k, _))| k.clone())
+            .collect();
+
+        for d in &dead {
+            topo.remove_peer(d);
+            positions.remove(d);
+        }
+
+        // Phase 3: Repack.
+        let repack_moves = topo.apply_repack();
+        let remaining = topo.occupied_count();
+        assert!(!repack_moves.is_empty(), "Should need repack after churn");
+        assert_packed(&topo, remaining, "pipeline_post_repack");
+        assert_no_ghosts(&topo, "pipeline_post_repack");
+
+        // Phase 4: Add 10 new nodes.
+        let max_slot = topo
+            .all_occupied()
+            .iter()
+            .map(|(_, idx)| idx.value())
+            .max()
+            .unwrap_or(0);
+
+        let mut rng_state: u64 = 0xDECAF;
+        let mut next_f64 = || -> f64 {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng_state >> 33) as f64) / (u32::MAX as f64) * 2.0 - 1.0
+        };
+
+        for i in 0..10u64 {
+            let key = format!("new-{i:02}");
+            let cluster = [(0.0, 0.0), (100.0, 0.0), (50.0, 80.0)][i as usize % 3];
+            let x = cluster.0 + next_f64() * 10.0;
+            let y = cluster.1 + next_f64() * 10.0;
+            positions.insert(key.clone(), (x, y));
+            topo.add_peer(&key, Spiral3DIndex::new(max_slot + 1 + i));
+        }
+
+        // Phase 5: Repack again (new nodes are at high slots).
+        topo.apply_repack();
+        let final_n = topo.occupied_count();
+        assert_packed(&topo, final_n, "pipeline_post_add_repack");
+
+        // Phase 6: Re-optimize with swaps.
+        let pre_opt_lat = total_latency(&topo, &positions);
+        for _ in 0..20 {
+            let lat = |a: &str, b: &str| euclidean_latency(&positions, a, b);
+            let decisions = topo.compute_swap_round(lat);
+            if decisions.is_empty() {
+                break;
+            }
+            for d in &decisions {
+                topo.apply_swap(&d.peer_a, &d.peer_b);
+            }
+        }
+        let final_lat = total_latency(&topo, &positions);
+        assert!(final_lat <= pre_opt_lat + 0.01, "Should not regress");
+        assert_packed(&topo, final_n, "pipeline_final");
+        assert_no_ghosts(&topo, "pipeline_final");
     }
 }

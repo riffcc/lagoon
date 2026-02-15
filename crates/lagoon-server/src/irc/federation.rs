@@ -99,6 +99,7 @@ pub fn dispatch_mesh_message(
                 cvdf_tip_hex: hello.cvdf_tip_hex.clone(),
                 cvdf_genesis_hex: hello.cvdf_genesis_hex.clone(),
                 cluster_vdf_work: hello.cluster_vdf_work,
+                assigned_slot: hello.assigned_slot,
             });
             Some(hello)
         }
@@ -616,6 +617,8 @@ pub enum RelayEvent {
         cvdf_genesis_hex: Option<String>,
         /// Total VDF work of this node's entire connected graph.
         cluster_vdf_work: Option<f64>,
+        /// Concierge slot assignment — first empty slot in sender's topology.
+        assigned_slot: Option<u64>,
     },
     /// Received MESH PEERS from a remote peer.
     MeshPeers {
@@ -861,6 +864,18 @@ pub fn spawn_event_processor(
         // Skip the first immediate tick — spawn_mesh_connector handles initial connect.
         bootstrap_retry_interval.tick().await;
 
+        // Latency swap: periodic deterministic swap round for topology optimization.
+        // Every node computes the same swap decisions from shared PoLP latency data.
+        // 30s matches the latency gossip sync window.
+        let mut latency_swap_interval = tokio::time::interval(
+            std::time::Duration::from_secs(30),
+        );
+        latency_swap_interval.set_missed_tick_behavior(
+            tokio::time::MissedTickBehavior::Skip,
+        );
+        // Skip first tick — let topology stabilize before optimizing.
+        latency_swap_interval.tick().await;
+
         loop {
         tokio::select! {
             Some(event) = event_rx.recv() => {
@@ -1068,17 +1083,6 @@ pub fn spawn_event_processor(
                         st.notify_topology_change();
                     }
 
-                    // Flashlight: if the beacon is off and we just lost our last
-                    // relay, turn it back on so the next bootstrap retry can run
-                    // (and so inbound connections can reach us).
-                    if st.federation.relays.is_empty() {
-                        if let Some(ref tx) = st.beacon_tx {
-                            if !*tx.borrow() {
-                                let _ = tx.send(true);
-                                info!("flashlight: beacon ON — relay disconnected, re-enabling listener");
-                            }
-                        }
-                    }
                 }
                 RelayEvent::Connected { local_channel } => {
                     let st = state.read().await;
@@ -1126,6 +1130,7 @@ pub fn spawn_event_processor(
                     cvdf_tip_hex,
                     cvdf_genesis_hex,
                     cluster_vdf_work,
+                    assigned_slot,
                 } => {
                     // Backfill node_name/site_name for old peers that don't send them.
                     let node_name = if node_name.is_empty() {
@@ -1179,15 +1184,14 @@ pub fn spawn_event_processor(
                         info!(
                             remote_host,
                             mesh_key = %mkey,
-                            "mesh: self-connection detected — shutting down relay, \
-                             next bootstrap retry will use flashlight protocol"
+                            "mesh: self-connection detected via HELLO — shutting down relay \
+                             (transparent self should have caught this earlier)"
                         );
                         // remote_host IS the peer_id now — relay is keyed by peer_id.
                         if let Some(relay) = st.federation.relays.remove(&remote_host) {
                             let _ = relay.outgoing_tx.send(RelayCommand::Shutdown);
                         }
                         st.mesh.connections.remove(&mkey);
-                        st.mesh.bootstrap_self_connected = true;
                         continue;
                     }
 
@@ -1298,6 +1302,8 @@ pub fn spawn_event_processor(
 
                     // SPIRAL merge protocol: negotiate topology with the remote peer.
                     // Compares cluster VDF work. Winner keeps topology, loser re-slots.
+                    // Concierge: if remote is established and we're not, assigned_slot
+                    // tells us which slot to take immediately. O(1). No waiting for PEERS.
                     let spiral_changed = evaluate_spiral_merge(
                         &mut st,
                         &mkey,
@@ -1306,18 +1312,24 @@ pub fn spawn_event_processor(
                         vdf_cumulative_credit,
                         remote_vdf_hash_for_merge.as_deref(),
                         already_in_clump,
+                        assigned_slot,
                         state.clone(),
                     );
 
+                    // Reconverge: repack fills gaps left by stale peers so the
+                    // neighbor set is correct BEFORE any prune decision runs.
+                    // SKIP if we just changed position (VDF race, concierge, or
+                    // reslot). Our position is correct by construction — reconverge
+                    // with incomplete topology would move us to a "lower" slot
+                    // that's actually occupied by peers we haven't heard about yet.
+                    if !spiral_changed {
+                        reconverge_spiral(&mut st, state.clone());
+                    }
                     // Always update SPIRAL neighbor set for gossip coordinators
                     // (remote may have been added even without our position changing).
                     update_spiral_neighbors(&mut st);
 
-                    if spiral_changed {
-                        // evaluate_spiral_merge already called dial + notify + prune
-                        // when it returned true, but we still need to handle the case
-                        // where remote was registered without us re-slotting.
-                    } else if spiral_index.is_some() {
+                    if !spiral_changed && spiral_index.is_some() {
                         // Remote registered at a slot — may be our new SPIRAL neighbor.
                         dial_missing_spiral_neighbors(&mut st, state.clone());
                     }
@@ -1366,94 +1378,14 @@ pub fn spawn_event_processor(
                     publish_connection_snapshot(&mut st);
                     st.notify_topology_change();
 
-                    // Flashlight: connected to a different node — beacon back on.
-                    if st.mesh.bootstrap_self_connected {
-                        st.mesh.bootstrap_self_connected = false;
-                        if let Some(ref tx) = st.beacon_tx {
-                            let _ = tx.send(true);
-                            info!("flashlight: beacon ON — connected to real peer");
-                        }
-                    }
-
-                    // VDF-based liveness eviction.  VDF IS the heartbeat.
-                    // If a peer's VDF step hasn't advanced in 10 seconds, it's dead.
-                    // Connection state is irrelevant — a dead node may still be
-                    // "Connected" at the Ygg overlay level.  VDF non-participation
-                    // is the ONLY authority on liveness.
-                    const VDF_DEAD_SECS: u64 = 10;
-                    // Gossip-learned peers (Known state) haven't had a
-                    // channel to prove VDF liveness — give them time to
-                    // be dialed before evicting.
-                    const GOSSIP_GRACE_SECS: u64 = 120;
+                    // VDF-based liveness eviction. 10s. One rule. No exceptions.
                     {
-                        let mut evicted = Vec::new();
-
-                        for (peer_mkey, peer) in &st.mesh.known_peers {
-                            if *peer_mkey == our_pid {
-                                continue;
-                            }
-                            // Only apply short VDF deadline to Connected peers.
-                            // Known/gossip-learned peers get a longer grace period.
-                            let is_connected = st.mesh.connections.get(peer_mkey).copied()
-                                == Some(MeshConnectionState::Connected);
-                            let deadline = if is_connected { VDF_DEAD_SECS } else { GOSSIP_GRACE_SECS };
-                            if peer.last_vdf_advance == 0 {
-                                if now.saturating_sub(peer.last_seen) < deadline {
-                                    continue;
-                                }
-                            } else if now.saturating_sub(peer.last_vdf_advance) < deadline {
-                                continue;
-                            }
-                            evicted.push(peer_mkey.clone());
-                        }
-
-                        for evicted_key in &evicted {
-                            if let Some(peer) = st.mesh.known_peers.remove(evicted_key) {
-                                info!(
-                                    mesh_key = %evicted_key,
-                                    server_name = %peer.server_name,
-                                    node_name = %peer.node_name,
-                                    vdf_step = ?peer.vdf_step,
-                                    last_vdf_advance = peer.last_vdf_advance,
-                                    dead_secs = VDF_DEAD_SECS,
-                                    "mesh: evicting dead peer — VDF not advancing"
-                                );
-                                st.mesh.connections.remove(evicted_key);
-                                st.mesh.spiral.remove_peer(evicted_key);
-
-                                // Cut the Ygg overlay connection — dead nodes don't
-                                // get to stay peered.
-                                if let Some(ref ygg) = st.transport_config.ygg_node {
-                                    if let Some(ref uri) = peer.ygg_peer_uri {
-                                        match ygg.remove_peer(uri) {
-                                            Ok(()) => info!(
-                                                uri,
-                                                node_name = %peer.node_name,
-                                                "APE: removed dead peer from Ygg overlay"
-                                            ),
-                                            Err(e) => tracing::debug!(
-                                                uri,
-                                                error = %e,
-                                                "APE: remove_peer failed (may already be gone)"
-                                            ),
-                                        }
-                                    }
-                                }
-
-                                // Shut down the relay task if one exists for this peer.
-                                if let Some(relay) = st.federation.relays.remove(evicted_key) {
-                                    let _ = relay.outgoing_tx.send(RelayCommand::Shutdown);
-                                }
-                            }
-                        }
-
+                        let evicted = evict_dead_peers(&mut st);
                         if !evicted.is_empty() {
-                            // SPIRAL convergence: dead peers freed slots.
                             reconverge_spiral(&mut st, state.clone());
                             let neighbors = st.mesh.spiral.neighbors().clone();
                             st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
                             st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
-                            // Eviction changes SPIRAL topology — dial new neighbors.
                             dial_missing_spiral_neighbors(&mut st, state.clone());
                             publish_connection_snapshot(&mut st);
                             st.notify_topology_change();
@@ -1534,6 +1466,51 @@ pub fn spawn_event_processor(
                                 state.clone(),
                                 false,
                             );
+                        }
+                    }
+
+                    // ── Juggler: send response HELLO after merge ────────────
+                    // Built AFTER evaluate_spiral_merge + reconverge, so it
+                    // carries correct spiral_index AND assigned_slot reflecting
+                    // ALL previous merges processed by the federation loop.
+                    //
+                    // Eager slot registration: when we assign a slot to an
+                    // unclaimed joiner, register them at that slot NOW so the
+                    // next joiner (queued behind this one) gets a different slot.
+                    // Without this, two joiners processed back-to-back both get
+                    // assigned_slot=1 (thundering herd on slots).
+                    {
+                        let our_hello = build_wire_hello(&mut st);
+                        if !spiral_changed && spiral_index.is_none() {
+                            if let Some(slot) = our_hello.assigned_slot {
+                                st.mesh.spiral.add_peer(
+                                    &mkey,
+                                    citadel_topology::Spiral3DIndex::new(slot),
+                                );
+                                // Update known_peers so PEERS gossip carries the
+                                // assignment and the next build_hello_payload sees
+                                // this slot as occupied.
+                                if let Some(peer) = st.mesh.known_peers.get_mut(&mkey) {
+                                    peer.spiral_index = Some(slot);
+                                }
+                                info!(
+                                    slot,
+                                    remote = %mkey,
+                                    "SPIRAL concierge: eagerly registered joiner at assigned slot"
+                                );
+                            }
+                        }
+                        if let Some(relay) = st.federation.relays.get_mut(&remote_host) {
+                            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(
+                                MeshMessage::Hello(our_hello),
+                            ));
+                            // Mark relay as Hello-exchanged. Broadcast patterns
+                            // (announce-to-all PEERS, gossip re-gossip) check this
+                            // flag. Without it, PEERS from a DIFFERENT peer's HELLO
+                            // processing leaks into this relay before the response
+                            // HELLO, causing the outbound side to see PEERS as the
+                            // first message → "first message must be Hello" → reconnect.
+                            relay.mesh_connected = true;
                         }
                     }
 
@@ -1678,6 +1655,9 @@ pub fn spawn_event_processor(
                     let mut new_peer_servers: Vec<(String, String, String, u16, bool)> = Vec::new();
                     let mut newly_discovered: Vec<MeshPeerInfo> = Vec::new();
 
+                    // Collect incoming peers with SPIRAL positions for batch merge.
+                    let mut incoming_spiral_peers: Vec<(String, citadel_topology::Spiral3DIndex)> = Vec::new();
+
                     for mut peer in peers {
                         // Backfill node_name/site_name for peers from old
                         // software that doesn't include these fields.
@@ -1702,37 +1682,12 @@ pub fn spawn_event_processor(
                             continue;
                         }
 
-                        // Register SPIRAL position from gossiped peer info.
+                        // Collect SPIRAL positions for batch merge (replaces one-by-one add).
                         if let Some(idx) = peer.spiral_index {
-                            let added = st.mesh.spiral.add_peer(
-                                &mkey,
+                            incoming_spiral_peers.push((
+                                mkey.clone(),
                                 citadel_topology::Spiral3DIndex::new(idx),
-                            );
-                            if !added {
-                                // Slot collision via gossip — use cumulative_credit for resolution.
-                                let our_pid = st.lens.peer_id.clone();
-                                let our_idx = st.lens.spiral_index;
-                                if our_idx == Some(idx) {
-                                    let our_credit = st.mesh.vdf_state_rx.as_ref()
-                                        .and_then(|rx| rx.borrow().resonance.as_ref()
-                                            .map(|r| r.cumulative_credit))
-                                        .unwrap_or(0.0);
-                                    let their_credit = peer.vdf_cumulative_credit.unwrap_or(0.0);
-                                    let our_vdf_h: Option<Vec<u8>> = st.mesh.vdf_state_rx.as_ref()
-                                        .map(|rx| rx.borrow().current_hash.to_vec());
-                                    let their_vdf_h: Option<Vec<u8>> = peer.vdf_hash.as_deref()
-                                        .and_then(|h| hex::decode(h).ok());
-                                    let we_yield = their_credit > our_credit
-                                        || (their_credit == our_credit && !vdf_tiebreak_wins(
-                                            &our_pid, &mkey,
-                                            our_vdf_h.as_deref(), their_vdf_h.as_deref(),
-                                        ));
-                                    if we_yield {
-                                        reslot_around_winner(&mut st, &mkey, idx, state.clone());
-                                        changed = true;
-                                    }
-                                }
-                            }
+                            ));
                         }
 
                         // Register with latency + connection gossip (mesh_key → node_name routing).
@@ -1794,22 +1749,127 @@ pub fn spawn_event_processor(
                                 if existing.yggdrasil_addr.is_none() && peer.yggdrasil_addr.is_some() {
                                     existing.yggdrasil_addr = peer.yggdrasil_addr.clone();
                                 }
-                                // SPIRAL slot: accept if new or changed (convergence re-slots).
+                                // SPIRAL slot: update known_peers record if changed.
+                                // Topology registration is handled by the universal
+                                // merge loop below — it does proper conflict resolution
+                                // instead of first-writer-wins add_peer.
                                 if peer.spiral_index.is_some() && existing.spiral_index != peer.spiral_index {
                                     existing.spiral_index = peer.spiral_index;
-                                    if let Some(idx) = peer.spiral_index {
-                                        // add_peer handles freeing the old occupied coord
-                                        // if this peer moved slots (ghost-slot fix).
-                                        st.mesh.spiral.add_peer(
-                                            &mkey,
-                                            citadel_topology::Spiral3DIndex::new(idx),
-                                        );
-                                    }
                                     changed = true;
                                 }
                             }
                         }
                     }
+
+                    // ── Universal partition merge ─────────────────────────
+                    // When ANY two meshes discover each other (direct HELLO,
+                    // bridge node, transitive gossip — doesn't matter HOW),
+                    // resolve ALL slot conflicts between the incoming peer set
+                    // and our current topology. Per-slot: higher VDF cumulative
+                    // credit wins. If we lose our own slot, reslot.
+                    if !incoming_spiral_peers.is_empty() {
+                        let our_pid = st.lens.peer_id.clone();
+                        let mut we_need_reslot = false;
+                        let mut reslot_winner_pid = String::new();
+                        let mut reslot_winner_slot = 0u64;
+
+                        for (incoming_pid, incoming_idx) in &incoming_spiral_peers {
+                            let slot = incoming_idx.value();
+
+                            // Who's currently at this slot in our topology?
+                            let current_occupant = st.mesh.spiral.peer_at_index(slot)
+                                .map(|s| s.to_string());
+
+                            match current_occupant {
+                                None => {
+                                    // Slot empty — incoming peer takes it.
+                                    st.mesh.spiral.add_peer(incoming_pid, *incoming_idx);
+                                    changed = true;
+                                }
+                                Some(ref existing) if existing == incoming_pid => {
+                                    // Same peer already there. No conflict.
+                                }
+                                Some(ref existing) => {
+                                    // CONFLICT: different peer claims same slot.
+                                    // Compare VDF cumulative credit. Winner keeps slot.
+                                    let incoming_credit = st.mesh.known_peers
+                                        .get(incoming_pid.as_str())
+                                        .and_then(|p| p.vdf_cumulative_credit)
+                                        .unwrap_or(0.0);
+                                    let existing_credit = if *existing == our_pid {
+                                        // Our own VDF credit (not from known_peers).
+                                        st.mesh.vdf_state_rx.as_ref()
+                                            .and_then(|rx| rx.borrow().resonance.as_ref()
+                                                .map(|r| r.cumulative_credit))
+                                            .unwrap_or(0.0)
+                                    } else {
+                                        st.mesh.known_peers.get(existing.as_str())
+                                            .and_then(|p| p.vdf_cumulative_credit)
+                                            .unwrap_or(0.0)
+                                    };
+
+                                    // Higher credit wins. Tiebreak: lower peer_id.
+                                    let incoming_wins = incoming_credit > existing_credit
+                                        || (incoming_credit == existing_credit
+                                            && *incoming_pid < *existing);
+
+                                    if incoming_wins {
+                                        // Incoming peer takes this slot.
+                                        st.mesh.spiral.force_add_peer(
+                                            incoming_pid, *incoming_idx,
+                                        );
+                                        changed = true;
+
+                                        info!(
+                                            slot,
+                                            incoming = %incoming_pid,
+                                            evicted = %existing,
+                                            incoming_credit,
+                                            existing_credit,
+                                            "SPIRAL merge: incoming peer wins slot conflict"
+                                        );
+
+                                        // If WE were evicted, schedule a reslot.
+                                        if *existing == our_pid {
+                                            we_need_reslot = true;
+                                            reslot_winner_pid = incoming_pid.clone();
+                                            reslot_winner_slot = slot;
+                                        }
+                                    } else {
+                                        // Existing occupant keeps slot.
+                                        // Don't add incoming peer at this slot —
+                                        // they'll learn to reslot from our gossip.
+                                        info!(
+                                            slot,
+                                            keeper = %existing,
+                                            challenger = %incoming_pid,
+                                            existing_credit,
+                                            incoming_credit,
+                                            "SPIRAL merge: existing peer keeps slot"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        // If we lost our slot, reslot into the first available hole.
+                        if we_need_reslot {
+                            info!(
+                                winner = %reslot_winner_pid,
+                                winner_slot = reslot_winner_slot,
+                                "SPIRAL merge: we lost our slot, reslotting"
+                            );
+                            reslot_around_winner(
+                                &mut st, &reslot_winner_pid,
+                                reslot_winner_slot, state.clone(),
+                            );
+                            changed = true;
+                        }
+                    }
+
+                    // Concierge claiming happens in HELLO (assigned_slot), not here.
+                    // If we're still unclaimed after processing MESH PEERS, the
+                    // concierge was broken — we'll reconnect to a working one.
 
                     // Per-site dedup BEFORE re-gossip — prevents evict/re-discover loops
                     // where evicted peers get re-gossiped, re-inserted, evicted again.
@@ -2650,85 +2710,14 @@ pub fn spawn_event_processor(
 
                 drop(st);
 
-                // VDF dead-peer sweep (same logic as the HELLO handler).
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                const VDF_DEAD_SECS: u64 = 10;
-                // Gossip-learned peers (Known state) haven't had a
-                // channel to prove VDF liveness — give them time to
-                // be dialed before evicting.
-                const GOSSIP_GRACE_SECS: u64 = 120;
-
+                // VDF dead-peer sweep. 10s. One rule. No exceptions.
                 let mut st = state.write().await;
-                let our_pid_w = st.lens.peer_id.clone();
-                let mut evicted = Vec::new();
-
-                for (peer_mkey, peer) in &st.mesh.known_peers {
-                    if *peer_mkey == our_pid_w {
-                        continue;
-                    }
-                    let is_connected = st.mesh.connections.get(peer_mkey).copied()
-                        == Some(MeshConnectionState::Connected);
-                    let deadline = if is_connected { VDF_DEAD_SECS } else { GOSSIP_GRACE_SECS };
-                    if peer.last_vdf_advance == 0 {
-                        if now.saturating_sub(peer.last_seen) < deadline {
-                            continue;
-                        }
-                    } else if now.saturating_sub(peer.last_vdf_advance) < deadline {
-                        continue;
-                    }
-                    evicted.push(peer_mkey.clone());
-                }
-
-                for evicted_key in &evicted {
-                    if let Some(peer) = st.mesh.known_peers.remove(evicted_key) {
-                        info!(
-                            mesh_key = %evicted_key,
-                            server_name = %peer.server_name,
-                            node_name = %peer.node_name,
-                            vdf_step = ?peer.vdf_step,
-                            last_vdf_advance = peer.last_vdf_advance,
-                            dead_secs = VDF_DEAD_SECS,
-                            "mesh: evicting dead peer — VDF not advancing"
-                        );
-                        st.mesh.connections.remove(evicted_key);
-                        st.mesh.spiral.remove_peer(evicted_key);
-
-                        if let Some(ref ygg) = st.transport_config.ygg_node {
-                            if let Some(ref uri) = peer.ygg_peer_uri {
-                                match ygg.remove_peer(uri) {
-                                    Ok(()) => info!(
-                                        uri,
-                                        node_name = %peer.node_name,
-                                        "APE: removed dead peer from Ygg overlay"
-                                    ),
-                                    Err(e) => tracing::debug!(
-                                        uri,
-                                        error = %e,
-                                        "APE: remove_peer failed (may already be gone)"
-                                    ),
-                                }
-                            }
-                        }
-
-                        // Relay is keyed by peer_id = evicted_key.
-                        if let Some(relay) = st.federation.relays.remove(evicted_key) {
-                            let _ = relay.outgoing_tx.send(RelayCommand::Shutdown);
-                        }
-                    }
-                }
-
+                let evicted = evict_dead_peers(&mut st);
                 if !evicted.is_empty() {
-                    // SPIRAL convergence: dead peers freed slots.
-                    // If any freed slot is lower than ours, move inward.
                     reconverge_spiral(&mut st, state.clone());
                     let neighbors = st.mesh.spiral.neighbors().clone();
                     st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
                     st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
-                    // Eviction changes SPIRAL topology — a neighbor slot may now
-                    // be occupied by a different peer we need to connect to.
                     dial_missing_spiral_neighbors(&mut st, state.clone());
                     publish_connection_snapshot(&mut st);
                     st.notify_topology_change();
@@ -2786,63 +2775,19 @@ pub fn spawn_event_processor(
                 }
             }
 
-            // Bootstrap retry: if we have no relay connections at all, re-attempt
-            // LAGOON_PEERS. This handles the case where we self-connected (only node
-            // or nearest to ourselves via anycast) and shut down the relay. We keep
-            // trying every 30s until we have real connections. Once connected, this
-            // arm is a no-op.
-            //
-            // FLASHLIGHT PROTOCOL: if the previous attempt self-connected, we disable
-            // the HTTP listener before dialing so anycast routes to a DIFFERENT machine.
-            // Like turning off your lighthouse to see if there are other lighthouses.
+            // Bootstrap retry: if we have no relay connections and no active
+            // dials, re-attempt LAGOON_PEERS. Self-connections are handled by
+            // transparent self-rejection at the TCP level — the listener drops
+            // connections from ourselves, so the proxy retries on another machine.
+            // No beacon toggling, no flashlight, no state machine. Just retry.
             _ = bootstrap_retry_interval.tick() => {
-                // Phase 1: check state, optionally disable beacon.
-                let (use_flashlight, beacon_ack) = {
-                    let st = state.read().await;
-                    if !st.federation.relays.is_empty() {
-                        continue;
-                    }
-                    let flash = st.mesh.bootstrap_self_connected
-                        && st.beacon_tx.is_some();
-                    let ack = st.beacon_ack.clone();
-                    if flash {
-                        if let Some(ref tx) = st.beacon_tx {
-                            let _ = tx.send(false);
-                        }
-                    }
-                    (flash, ack)
-                };
-                // read lock dropped
-
-                // Phase 2: wait for listener to close (deterministic, no polling).
-                if use_flashlight {
-                    if let Some(ref ack) = beacon_ack {
-                        info!("flashlight: beacon OFF — waiting for listener drop");
-                        ack.notified().await;
-                        info!("flashlight: listener confirmed closed — dialing anycast");
-                    }
-                }
-
-                // Phase 3: dial.
                 let st = state.read().await;
-                // Re-check — an inbound connection may have arrived while we waited,
-                // or a relay task is still in-flight (backoff between reconnects).
                 if !st.federation.relays.is_empty() || st.federation.active_dial_count > 0 {
-                    if use_flashlight {
-                        if let Some(ref tx) = st.beacon_tx {
-                            let _ = tx.send(true);
-                        }
-                    }
                     continue;
                 }
                 let tc = st.transport_config.clone();
                 let peers: Vec<String> = tc.peers.keys().cloned().collect();
                 if peers.is_empty() {
-                    if use_flashlight {
-                        if let Some(ref tx) = st.beacon_tx {
-                            let _ = tx.send(true);
-                        }
-                    }
                     continue;
                 }
                 let event_tx = st.federation_event_tx.clone();
@@ -2853,7 +2798,6 @@ pub fn spawn_event_processor(
                     }
                     info!(
                         peer = %peer_host,
-                        flashlight = use_flashlight,
                         "mesh: bootstrap retry — no connections, re-attempting"
                     );
                     spawn_native_relay(
@@ -2864,9 +2808,70 @@ pub fn spawn_event_processor(
                         true,
                     );
                 }
-                // Beacon stays OFF — will be turned ON by MeshHello handler
-                // when a real peer connects, or by Disconnected handler if
-                // the connection fails.
+            }
+
+            // Latency swap round: deterministic topology optimization.
+            // Every node independently computes the same swap decisions from
+            // shared PoLP latency data (proof_store). Swaps that improve
+            // combined neighbor latency are applied atomically.
+            _ = latency_swap_interval.tick() => {
+                let mut st = state.write().await;
+                if !st.mesh.spiral.is_claimed() || st.mesh.spiral.occupied_count() < 3 {
+                    continue;
+                }
+
+                // Build latency map from PoLP proof store.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let latency_map = st.mesh.proof_store.latency_map(now_ms);
+
+                if latency_map.is_empty() {
+                    continue;
+                }
+
+                // Compute deterministic swap round.
+                let decisions = st.mesh.spiral.compute_swap_round(|a, b| {
+                    // Canonical key: smaller peer_id first.
+                    let key = if a < b {
+                        (a.to_string(), b.to_string())
+                    } else {
+                        (b.to_string(), a.to_string())
+                    };
+                    latency_map.get(&key).copied().unwrap_or(100.0)
+                });
+
+                if decisions.is_empty() {
+                    continue;
+                }
+
+                // Apply all swaps.
+                let our_pid = st.lens.peer_id.clone();
+                let mut we_moved = false;
+                for swap in &decisions {
+                    st.mesh.spiral.apply_swap(&swap.peer_a, &swap.peer_b);
+                    if swap.peer_a == our_pid || swap.peer_b == our_pid {
+                        we_moved = true;
+                    }
+                }
+
+                info!(
+                    swaps = decisions.len(),
+                    we_moved,
+                    "SPIRAL latency swap: round complete"
+                );
+
+                if we_moved {
+                    if let Some(idx) = st.mesh.spiral.our_index().map(|i| i.value()) {
+                        persist_spiral_position(&mut st, idx);
+                    }
+                    announce_hello_to_all_relays(&mut st);
+                }
+                update_spiral_neighbors(&mut st);
+                dial_missing_spiral_neighbors(&mut st, state.clone());
+                st.notify_topology_change();
+                prune_non_spiral_relays(&mut st);
             }
 
             else => break,
@@ -3177,13 +3182,42 @@ async fn relay_task_native(
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
     let mut consecutive_failures: u32 = 0;
+    let mut self_hits: u32 = 0;
     let mut current_peer_id: Option<String> = None;
 
     'reconnect: loop {
         let connected_at = std::time::Instant::now();
 
-        let outcome = match transport::connect_native(&connect_target, &transport_config).await {
+        // Include our peer_id in the URL so the remote listener can detect
+        // self-connections at the TCP level (transparent self — drops without
+        // responding, causing the proxy to retry on another machine).
+        let (our_pid, switchboard_ctl) = {
+            let st = state.read().await;
+            let ctl = if is_bootstrap {
+                st.mesh.switchboard_ctl.clone()
+            } else {
+                None
+            };
+            (st.lens.peer_id.clone(), ctl)
+        };
+
+        // Pause switchboard before dialing anycast — drops the listening
+        // socket so the kernel RSTs self-routed SYNs. Fly routes to the
+        // next machine. Only needed for bootstrap (anycast) dials.
+        if let Some(ref ctl) = switchboard_ctl {
+            let _ = ctl.send(super::switchboard::SwitchboardCtl::Pause);
+        }
+
+        let connect_result = transport::connect_native(&connect_target, &transport_config, Some(&our_pid)).await;
+
+        // Resume switchboard — rebind the listener regardless of outcome.
+        if let Some(ref ctl) = switchboard_ctl {
+            let _ = ctl.send(super::switchboard::SwitchboardCtl::Resume);
+        }
+
+        let outcome = match connect_result {
             Ok(transport::NativeWs::Ygg(ws)) => {
+                self_hits = 0;
                 info!(%connect_target, "native relay: connected via Ygg overlay");
                 native_ws_loop(
                     ws, &connect_target, &cmd_tx, &mut cmd_rx, &event_tx,
@@ -3191,20 +3225,36 @@ async fn relay_task_native(
                 ).await
             }
             Ok(transport::NativeWs::Tls(ws)) => {
+                self_hits = 0;
                 info!(%connect_target, "native relay: connected via TLS WebSocket");
                 native_ws_loop(
                     ws, &connect_target, &cmd_tx, &mut cmd_rx, &event_tx,
                     &state, is_bootstrap, &mut current_peer_id,
                 ).await
             }
-            Ok(transport::NativeWs::Switchboard(ws)) => {
-                info!(%connect_target, "native relay: connected via switchboard half-dial");
-                native_ws_loop(
-                    ws, &connect_target, &cmd_tx, &mut cmd_rx, &event_tx,
+            Ok(transport::NativeWs::Switchboard { reader, writer }) => {
+                self_hits = 0;
+                info!(%connect_target, "native relay: connected via switchboard (raw TCP)");
+                native_raw_loop(
+                    reader, writer, &connect_target, &cmd_tx, &mut cmd_rx, &event_tx,
                     &state, is_bootstrap, &mut current_peer_id,
                 ).await
             }
             Err(e) => {
+                // Self-connection via anycast — another machine on the
+                // anycast address will answer the next attempt. Retry a
+                // few times immediately, then back off (we may be the
+                // only machine in this region).
+                if e.to_string().contains("self-connection") {
+                    self_hits += 1;
+                    if self_hits <= 3 {
+                        info!(%connect_target, self_hits,
+                            "native relay: self via anycast — redial");
+                        continue 'reconnect;
+                    }
+                    // Backed off self-hits — use normal backoff.
+                    consecutive_failures = self_hits;
+                }
                 consecutive_failures += 1;
                 if consecutive_failures <= 3 {
                     warn!(%connect_target, attempt = consecutive_failures,
@@ -3331,26 +3381,43 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
     }
 
     // Receive their Hello (30s timeout).
-    let remote_hello = match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        futures::StreamExt::next(&mut ws_rx),
-    )
-    .await
-    {
-        Ok(Some(Ok(TungsMsg::Text(text)))) => match MeshMessage::from_json(&text) {
-            Ok(MeshMessage::Hello(hello)) => hello,
-            Ok(other) => {
-                warn!(%connect_target, ?other, "native relay: first message must be Hello");
+    //
+    // Non-Hello messages (PEERS, LatencyHave, etc.) may arrive first when
+    // the remote's federation loop announces OTHER peers through our relay
+    // handle before processing our HELLO. Skip them and keep waiting.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let remote_hello = loop {
+        match tokio::time::timeout_at(deadline, futures::StreamExt::next(&mut ws_rx)).await {
+            Ok(Some(Ok(TungsMsg::Text(text)))) => match MeshMessage::from_json(&text) {
+                Ok(MeshMessage::Hello(hello)) => break hello,
+                Ok(_other) => {
+                    // Not a Hello — skip. We don't know the remote's peer_id yet
+                    // so we can't properly dispatch. These messages are redundant
+                    // anyway (we'll get the same data after Hello exchange).
+                    tracing::debug!(
+                        %connect_target,
+                        "native relay: skipping pre-Hello message"
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(%connect_target, "native relay: invalid message while waiting for Hello: {e}");
+                    return NativeLoopOutcome::Reconnect;
+                }
+            },
+            Ok(Some(Ok(TungsMsg::Close(_)))) | Ok(None) => {
+                warn!(%connect_target, "native relay: connection closed before Hello");
                 return NativeLoopOutcome::Reconnect;
             }
-            Err(e) => {
-                warn!(%connect_target, "native relay: invalid first message: {e}");
+            Ok(Some(Err(e))) => {
+                warn!(%connect_target, "native relay: read error waiting for Hello: {e}");
                 return NativeLoopOutcome::Reconnect;
             }
-        },
-        _ => {
-            warn!(%connect_target, "native relay: no Hello received within timeout");
-            return NativeLoopOutcome::Reconnect;
+            Err(_) => {
+                warn!(%connect_target, "native relay: no Hello received within timeout");
+                return NativeLoopOutcome::Reconnect;
+            }
+            _ => { continue; } // Binary, Ping, Pong — skip
         }
     };
 
@@ -3377,8 +3444,8 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
     // ── Self-connection detection ───────────────────────────────────────
     //
     // If the remote peer_id matches ours, we dialed anycast and reached
-    // ourselves. Set the flashlight flag so the next bootstrap retry
-    // disables our listener (forcing anycast to route elsewhere).
+    // ourselves. This is a fallback — transparent self-rejection at the TCP
+    // level (via `?from=` in the URL) should have caught this earlier.
     //
     // The inbound handler may also send a Redirect with known peers —
     // drain the buffer to pick it up so we can discover the mesh even
@@ -3389,13 +3456,10 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
             info!(
                 %connect_target,
                 peer_id = %remote_peer_id,
-                "native relay: self-connection detected — will retry with flashlight"
+                "native relay: self-connection detected via HELLO \
+                 (transparent self should have caught this at TCP level)"
             );
             drop(st);
-            {
-                let mut st = state.write().await;
-                st.mesh.bootstrap_self_connected = true;
-            }
 
             // Drain buffer — inbound side may have sent a Redirect with
             // known peers right after the Hello.
@@ -3420,25 +3484,40 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
 
     // ── Insert relay handle keyed by peer_id ────────────────────────────
     //
-    // If there's already a relay for this peer_id (duplicate task raced us),
-    // shut down the OLD relay so it doesn't become an orphan leaking threads.
+    // Inbound (mesh.rs) and outbound (us) connections to the same peer
+    // coexist — they're a bidirectional pair, not duplicates. If there's
+    // already a relay for this peer_id, we keep running as a receive-only
+    // connection: dispatching incoming messages but not claiming the map
+    // entry. The existing relay keeps the map entry (for sending commands).
+    //
+    // Only set current_peer_id if we OWN the map entry — cleanup at the
+    // caller removes the entry and sends Disconnected only for owned entries.
     {
         let mut st = state.write().await;
-        if let Some(old_relay) = st.federation.relays.get(&remote_peer_id) {
-            let _ = old_relay.outgoing_tx.send(RelayCommand::Shutdown);
+        if st.federation.relays.contains_key(&remote_peer_id) {
+            info!(
+                %connect_target,
+                peer_id = %remote_peer_id,
+                "native relay: inbound relay exists — running as receive-only"
+            );
+            // Don't insert. Don't set current_peer_id.
+            // Our cmd_rx stays open (cmd_tx held by caller) so the
+            // select loop works fine — just no commands arrive.
+        } else {
+            st.federation.relays.insert(
+                remote_peer_id.clone(),
+                RelayHandle {
+                    outgoing_tx: cmd_tx.clone(),
+                    node_name: remote_node_name.clone(),
+                    connect_target: connect_target.to_string(),
+                    channels: HashMap::new(),
+                    mesh_connected: true,
+                    is_bootstrap,
+                    last_rtt_ms: None,
+                },
+            );
+            *current_peer_id = Some(remote_peer_id.clone());
         }
-        st.federation.relays.insert(
-            remote_peer_id.clone(),
-            RelayHandle {
-                outgoing_tx: cmd_tx.clone(),
-                node_name: remote_node_name.clone(),
-                connect_target: connect_target.to_string(),
-                channels: HashMap::new(),
-                mesh_connected: true,
-                is_bootstrap,
-                last_rtt_ms: None,
-            },
-        );
         // NOTE: do NOT remove from pending_dials here. The entry must persist
         // for the entire relay_task_native lifetime. Otherwise, when the WS drops
         // and the relay is removed from the map, gossip-driven spawns see neither
@@ -3446,7 +3525,6 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
         // relay task while the original is still in its reconnect backoff loop.
         // The entry is removed on task exit (relay_task_native cleanup).
     }
-    *current_peer_id = Some(remote_peer_id.clone());
 
     // Dispatch their Hello to the event processor — relay handle exists,
     // so the event processor can send responses (Peers, LatencyHave, etc.)
@@ -3474,11 +3552,18 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
                     Some(Ok(TungsMsg::Text(text))) => {
                         match MeshMessage::from_json(&text) {
                             Ok(msg) => {
-                                // Redirect = hub already knows us, tells us to
-                                // connect to other peers instead. Dispatch the
-                                // peers and exit without reconnecting. Cleanup
-                                // (relay removal + Disconnected) handled by caller.
-                                let is_redirect = matches!(&msg, MeshMessage::Redirect { .. });
+                                // Redirect = informational peer list. Dispatch
+                                // for discovery but do NOT kill the connection.
+                                // The remote may close the WS after sending
+                                // Redirect — that triggers Reconnect naturally
+                                // via the Close/None branch below.
+                                if matches!(&msg, MeshMessage::Redirect { .. }) {
+                                    info!(
+                                        %connect_target,
+                                        peer_id = %remote_peer_id,
+                                        "native relay: received redirect — dispatching peers"
+                                    );
+                                }
                                 let _ = dispatch_mesh_message(
                                     msg,
                                     &remote_peer_id,
@@ -3486,14 +3571,31 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
                                     &remote_mesh_key,
                                     event_tx,
                                 );
-                                if is_redirect {
-                                    info!(
-                                        %connect_target,
-                                        peer_id = %remote_peer_id,
-                                        "native relay: received redirect — \
-                                         peers dispatched, shutting down"
-                                    );
-                                    return NativeLoopOutcome::Shutdown;
+
+                                // Shadow promotion: if we don't own the map
+                                // entry and it's gone (inbound died), claim it.
+                                if current_peer_id.is_none() {
+                                    let mut st = state.write().await;
+                                    if !st.federation.relays.contains_key(&remote_peer_id) {
+                                        info!(
+                                            %connect_target,
+                                            peer_id = %remote_peer_id,
+                                            "native relay: promoting shadow to primary"
+                                        );
+                                        st.federation.relays.insert(
+                                            remote_peer_id.clone(),
+                                            RelayHandle {
+                                                outgoing_tx: cmd_tx.clone(),
+                                                node_name: remote_node_name.clone(),
+                                                connect_target: connect_target.to_string(),
+                                                channels: HashMap::new(),
+                                                mesh_connected: true,
+                                                is_bootstrap,
+                                                last_rtt_ms: None,
+                                            },
+                                        );
+                                        *current_peer_id = Some(remote_peer_id.clone());
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -3579,6 +3681,306 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
             _ = keepalive.tick() => {
                 last_ping_sent = tokio::time::Instant::now();
                 if ws_tx.send(TungsMsg::Ping(vec![].into())).await.is_err() {
+                    return NativeLoopOutcome::Reconnect;
+                }
+            }
+        }
+    }
+}
+
+/// Inner raw TCP loop — JSON-lines over a switchboard connection.
+///
+/// Equivalent to `native_ws_loop` but for raw TCP connections via the
+/// switchboard half-dial. After the half-dial PeerReady exchange, the TCP
+/// stream continues with newline-delimited JSON MeshMessages.
+///
+/// No WebSocket framing, no HTTP upgrade — just `{...}\n` lines.
+async fn native_raw_loop(
+    mut reader: tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
+    connect_target: &str,
+    cmd_tx: &mpsc::UnboundedSender<RelayCommand>,
+    cmd_rx: &mut mpsc::UnboundedReceiver<RelayCommand>,
+    event_tx: &mpsc::UnboundedSender<RelayEvent>,
+    state: &Arc<tokio::sync::RwLock<super::server::ServerState>>,
+    is_bootstrap: bool,
+    current_peer_id: &mut Option<String>,
+) -> NativeLoopOutcome {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    // ── Hello exchange ──────────────────────────────────────────────────
+
+    // Send our Hello.
+    let our_hello = {
+        let mut st = state.write().await;
+        build_wire_hello(&mut st)
+    };
+    let hello_msg = MeshMessage::Hello(our_hello);
+    let hello_json = match hello_msg.to_json() {
+        Ok(j) => j,
+        Err(e) => {
+            warn!(%connect_target, "native relay (raw): failed to serialize Hello: {e}");
+            return NativeLoopOutcome::Reconnect;
+        }
+    };
+    if writer.write_all(hello_json.as_bytes()).await.is_err()
+        || writer.write_all(b"\n").await.is_err()
+    {
+        warn!(%connect_target, "native relay (raw): failed to send Hello");
+        return NativeLoopOutcome::Reconnect;
+    }
+
+    // Receive their Hello (30s timeout).
+    let mut hello_line = String::new();
+    let remote_hello = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        reader.read_line(&mut hello_line),
+    )
+    .await
+    {
+        Ok(Ok(n)) if n > 0 => match MeshMessage::from_json(hello_line.trim_end()) {
+            Ok(MeshMessage::Hello(hello)) => hello,
+            Ok(other) => {
+                warn!(%connect_target, ?other, "native relay (raw): first message must be Hello");
+                return NativeLoopOutcome::Reconnect;
+            }
+            Err(e) => {
+                warn!(%connect_target, "native relay (raw): invalid first message: {e}");
+                return NativeLoopOutcome::Reconnect;
+            }
+        },
+        _ => {
+            warn!(%connect_target, "native relay (raw): no Hello received within timeout");
+            return NativeLoopOutcome::Reconnect;
+        }
+    };
+
+    let remote_peer_id = remote_hello.peer_id.clone();
+    let remote_node_name = if remote_hello.node_name.is_empty() {
+        super::server::derive_node_name(&remote_hello.server_name)
+    } else {
+        remote_hello.node_name.clone()
+    };
+
+    let remote_mesh_key: Option<String> = Some(remote_peer_id.clone());
+
+    info!(
+        %connect_target,
+        peer_id = %remote_peer_id,
+        node_name = %remote_node_name,
+        server_name = %remote_hello.server_name,
+        "native relay (raw): received Hello"
+    );
+
+    // ── Self-connection detection ───────────────────────────────────────
+    //
+    // Transparent self-rejection at the switchboard level should have caught
+    // this already (peer_id in peeked PeerRequest → drop → RST). This is
+    // the fallback for when the peek missed it.
+    {
+        let st = state.read().await;
+        if remote_peer_id == st.lens.peer_id {
+            info!(
+                %connect_target,
+                peer_id = %remote_peer_id,
+                "native relay (raw): self-connection detected via HELLO \
+                 (transparent self should have caught this at TCP level)"
+            );
+            drop(st);
+
+            // Drain buffer — inbound side may have sent a Redirect.
+            let mut drain_line = String::new();
+            if let Ok(Ok(n)) = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                reader.read_line(&mut drain_line),
+            ).await {
+                if n > 0 {
+                    let trimmed = drain_line.trim_end();
+                    if !trimmed.is_empty() {
+                        if let Ok(msg) = MeshMessage::from_json(trimmed) {
+                            let _ = dispatch_mesh_message(
+                                msg,
+                                &remote_peer_id,
+                                None,
+                                &remote_mesh_key,
+                                event_tx,
+                            );
+                        }
+                    }
+                }
+            }
+
+            return NativeLoopOutcome::Reconnect;
+        }
+    }
+
+    // ── Insert relay handle keyed by peer_id ────────────────────────────
+    //
+    // Same coexistence logic as the WS path: if there's already a relay
+    // for this peer_id (inbound), we run as receive-only shadow.
+    {
+        let mut st = state.write().await;
+        if st.federation.relays.contains_key(&remote_peer_id) {
+            info!(
+                %connect_target,
+                peer_id = %remote_peer_id,
+                "native relay (raw): inbound relay exists — running as receive-only"
+            );
+        } else {
+            st.federation.relays.insert(
+                remote_peer_id.clone(),
+                RelayHandle {
+                    outgoing_tx: cmd_tx.clone(),
+                    node_name: remote_node_name.clone(),
+                    connect_target: connect_target.to_string(),
+                    channels: HashMap::new(),
+                    mesh_connected: true,
+                    is_bootstrap,
+                    last_rtt_ms: None,
+                },
+            );
+            *current_peer_id = Some(remote_peer_id.clone());
+        }
+    }
+
+    // Dispatch their Hello to the event processor.
+    dispatch_mesh_message(
+        MeshMessage::Hello(remote_hello),
+        &remote_peer_id,
+        None,
+        &remote_mesh_key,
+        event_tx,
+    );
+
+    // ── Bidirectional message loop (JSON lines) ─────────────────────────
+
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(30));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    keepalive.tick().await; // skip first immediate tick
+
+    let mut incoming_line = String::new();
+
+    loop {
+        tokio::select! {
+            // Read incoming JSON line from remote peer.
+            result = reader.read_line(&mut incoming_line) => {
+                match result {
+                    Ok(0) => {
+                        info!(%connect_target, peer_id = %remote_peer_id,
+                            "native relay (raw): connection closed by remote");
+                        return NativeLoopOutcome::Reconnect;
+                    }
+                    Err(e) => {
+                        warn!(%connect_target, peer_id = %remote_peer_id,
+                            error = %e, "native relay (raw): read error");
+                        return NativeLoopOutcome::Reconnect;
+                    }
+                    Ok(_) => {
+                        let trimmed = incoming_line.trim_end();
+                        if !trimmed.is_empty() {
+                            match MeshMessage::from_json(trimmed) {
+                                Ok(msg) => {
+                                    if matches!(&msg, MeshMessage::Redirect { .. }) {
+                                        info!(
+                                            %connect_target,
+                                            peer_id = %remote_peer_id,
+                                            "native relay (raw): received redirect — dispatching peers"
+                                        );
+                                    }
+                                    let _ = dispatch_mesh_message(
+                                        msg,
+                                        &remote_peer_id,
+                                        None,
+                                        &remote_mesh_key,
+                                        event_tx,
+                                    );
+
+                                    // Shadow promotion (same as WS path).
+                                    if current_peer_id.is_none() {
+                                        let mut st = state.write().await;
+                                        if !st.federation.relays.contains_key(&remote_peer_id) {
+                                            info!(
+                                                %connect_target,
+                                                peer_id = %remote_peer_id,
+                                                "native relay (raw): promoting shadow to primary"
+                                            );
+                                            st.federation.relays.insert(
+                                                remote_peer_id.clone(),
+                                                RelayHandle {
+                                                    outgoing_tx: cmd_tx.clone(),
+                                                    node_name: remote_node_name.clone(),
+                                                    connect_target: connect_target.to_string(),
+                                                    channels: HashMap::new(),
+                                                    mesh_connected: true,
+                                                    is_bootstrap,
+                                                    last_rtt_ms: None,
+                                                },
+                                            );
+                                            *current_peer_id = Some(remote_peer_id.clone());
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        %connect_target,
+                                        peer_id = %remote_peer_id,
+                                        error = %e,
+                                        "native relay (raw): failed to parse message"
+                                    );
+                                }
+                            }
+                        }
+                        incoming_line.clear();
+                    }
+                }
+            }
+
+            // Outgoing commands from the server event processor.
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    Some(RelayCommand::SendMesh(mesh_msg)) => {
+                        if let Ok(json) = mesh_msg.to_json() {
+                            if writer.write_all(json.as_bytes()).await.is_err()
+                                || writer.write_all(b"\n").await.is_err()
+                            {
+                                return NativeLoopOutcome::Reconnect;
+                            }
+                        }
+                    }
+                    Some(RelayCommand::MeshHello { json: _ }) => {
+                        let hello = {
+                            let mut st = state.write().await;
+                            build_wire_hello(&mut st)
+                        };
+                        let msg = MeshMessage::Hello(hello);
+                        if let Ok(j) = msg.to_json() {
+                            if writer.write_all(j.as_bytes()).await.is_err()
+                                || writer.write_all(b"\n").await.is_err()
+                            {
+                                return NativeLoopOutcome::Reconnect;
+                            }
+                        }
+                    }
+                    Some(RelayCommand::Shutdown) => {
+                        info!(%connect_target, peer_id = %remote_peer_id,
+                            "native relay (raw): shutdown requested");
+                        return NativeLoopOutcome::Shutdown;
+                    }
+                    Some(RelayCommand::Reconnect) => {
+                        info!(%connect_target, peer_id = %remote_peer_id,
+                            "native relay (raw): reconnect requested");
+                        return NativeLoopOutcome::Reconnect;
+                    }
+                    Some(_) => {}
+                    None => {
+                        return NativeLoopOutcome::Shutdown;
+                    }
+                }
+            }
+
+            // Keepalive — write an empty line so remote knows we're alive.
+            _ = keepalive.tick() => {
+                if writer.write_all(b"\n").await.is_err() {
                     return NativeLoopOutcome::Reconnect;
                 }
             }
@@ -4067,6 +4469,7 @@ async fn relay_task(
                                             cvdf_tip_hex: hello.cvdf_tip_hex,
                                             cvdf_genesis_hex: hello.cvdf_genesis_hex,
                                             cluster_vdf_work: hello.cluster_vdf_work,
+                                            assigned_slot: hello.assigned_slot,
                                         });
                                     } else {
                                         warn!(remote_host, "mesh: invalid HELLO payload");
@@ -4369,6 +4772,10 @@ struct MeshHelloPayload {
     /// Used for SPIRAL merge negotiation — cluster with more work wins.
     #[serde(default)]
     pub cluster_vdf_work: Option<f64>,
+    /// Concierge slot assignment — first empty slot in sender's topology.
+    /// Included when the sender has a claimed SPIRAL slot. Joiner takes it.
+    #[serde(default)]
+    pub assigned_slot: Option<u64>,
 }
 
 /// Build a native `wire::HelloPayload` from server state (use inside read lock).
@@ -4396,6 +4803,7 @@ pub fn build_wire_hello(st: &mut super::server::ServerState) -> HelloPayload {
         cvdf_tip_hex: hp.cvdf_tip_hex,
         cvdf_genesis_hex: hp.cvdf_genesis_hex,
         cluster_vdf_work: hp.cluster_vdf_work,
+        assigned_slot: hp.assigned_slot,
     }
 }
 
@@ -4447,10 +4855,11 @@ fn evaluate_spiral_merge(
     st: &mut super::server::ServerState,
     remote_peer_id: &str,
     remote_spiral_index: Option<u64>,
-    remote_cluster_vdf_work: Option<f64>,
+    _remote_cluster_vdf_work: Option<f64>,
     remote_vdf_cumulative_credit: Option<f64>,
     remote_vdf_hash: Option<&str>,
     already_in_clump: bool,
+    remote_assigned_slot: Option<u64>,
     shared_state: SharedState,
 ) -> bool {
     let our_pid = st.lens.peer_id.clone();
@@ -4472,22 +4881,51 @@ fn evaluate_spiral_merge(
         )
     };
 
-    // Case 1: Remote is unclaimed — nothing to merge. Register nothing.
+    // ── VDF Race: two unslotted nodes meet ───────────────────────
+    // Both sides run the SAME comparison with the SAME inputs.
+    // Both independently arrive at the SAME answer:
+    //   higher VDF cumulative credit = slot 0
+    //   lower VDF cumulative credit = slot 1
+    // No assignment. No authority. Just math.
+    // Genesis requires two witnesses agreeing on the same algorithm.
+    if remote_spiral_index.is_none() && !we_are_claimed {
+        let our_credit = st.mesh.vdf_state_rx.as_ref()
+            .and_then(|rx| rx.borrow().resonance.as_ref()
+                .map(|r| r.cumulative_credit))
+            .unwrap_or(0.0);
+        let their_credit = remote_vdf_cumulative_credit.unwrap_or(0.0);
+        let we_win = our_credit > their_credit
+            || (our_credit == their_credit && tiebreak(remote_peer_id));
+
+        // Register the remote at their deterministic slot.
+        let remote_slot = if we_win { 1u64 } else { 0u64 };
+        let our_slot = if we_win { 0u64 } else { 1u64 };
+
+        st.mesh.spiral.add_peer(
+            remote_peer_id,
+            citadel_topology::Spiral3DIndex::new(remote_slot),
+        );
+        st.mesh.spiral.claim_specific_position(&our_pid, our_slot);
+
+        info!(
+            our_slot,
+            remote_slot,
+            our_credit,
+            their_credit,
+            remote = %remote_peer_id,
+            "SPIRAL VDF race: both nodes independently computed slots"
+        );
+        persist_spiral_position(st, our_slot);
+        announce_hello_to_all_relays(st);
+        update_spiral_neighbors(st);
+        dial_missing_spiral_neighbors(st, shared_state);
+        st.notify_topology_change();
+        return true;
+    }
+
+    // Remote is unclaimed but we ARE claimed — nothing to do on our side.
+    // Our HELLO carries assigned_slot — they'll take it immediately.
     if remote_spiral_index.is_none() {
-        // If WE are also unclaimed, compare VDF work. More work = claim first.
-        // Tiebreak via b3(b3(vdf_hash XOR)) when work is exactly equal.
-        if !we_are_claimed {
-            let our_credit = st.mesh.vdf_state_rx.as_ref()
-                .and_then(|rx| rx.borrow().resonance.as_ref()
-                    .map(|r| r.cumulative_credit))
-                .unwrap_or(0.0);
-            let their_credit = remote_vdf_cumulative_credit.unwrap_or(0.0);
-            let we_claim_first = our_credit > their_credit
-                || (our_credit == their_credit && tiebreak(remote_peer_id));
-            if we_claim_first {
-                return claim_and_announce(st, shared_state);
-            }
-        }
         return false;
     }
 
@@ -4499,17 +4937,48 @@ fn evaluate_spiral_merge(
         citadel_topology::Spiral3DIndex::new(remote_idx),
     );
 
-    // Case 2: We are unclaimed, remote is claimed → join their cluster.
+    // ── Concierge: unslotted node meets established mesh ─────────
+    // Remote is established (has a slot). Two possibilities:
+    // 1. They sent assigned_slot → take it immediately. O(1).
+    // 2. They didn't → broken concierge. We have no authority to
+    //    self-claim. Disconnect. Redial. Anycast gives us a different
+    //    concierge that does its job.
     if !we_are_claimed {
         if !added {
-            // Slot conflict with another peer — force-add the remote.
-            // The conflicting peer will resolve via their own merge.
             st.mesh.spiral.force_add_peer(
                 remote_peer_id,
                 citadel_topology::Spiral3DIndex::new(remote_idx),
             );
         }
-        return claim_and_announce(st, shared_state);
+
+        if let Some(slot) = remote_assigned_slot {
+            // Concierge: remote computed the first empty slot in their topology
+            // and told us. Take it. If it's wrong (stale topology, conflict),
+            // collision resolution handles it. If it's garbage, disconnect and
+            // redial — anycast gives us a different concierge.
+            st.mesh.spiral.claim_specific_position(&our_pid, slot);
+            info!(
+                assigned_slot = slot,
+                remote = %remote_peer_id,
+                "SPIRAL concierge: took assigned slot from HELLO"
+            );
+            persist_spiral_position(st, slot);
+            announce_hello_to_all_relays(st);
+            update_spiral_neighbors(st);
+            dial_missing_spiral_neighbors(st, shared_state);
+            st.notify_topology_change();
+            return true;
+        }
+
+        // No assigned_slot — broken concierge. Can't self-claim without
+        // authority. The relay will be pruned or we'll reconnect to a
+        // concierge that actually sends assigned_slot.
+        warn!(
+            remote = %remote_peer_id,
+            remote_slot = remote_idx,
+            "SPIRAL: established peer sent no assigned_slot — broken concierge"
+        );
+        return false;
     }
 
     // Both sides are claimed from here on.
@@ -4536,10 +5005,12 @@ fn evaluate_spiral_merge(
         }
         // We keep our slot. Remote will discover collision from our HELLO and yield.
         if !added {
-            // Force-register us (we won the collision).
-            st.mesh.spiral.force_add_peer(
+            // Re-assert our claim. claim_specific_position sets our_index/our_coord/our_mesh_key
+            // consistently — force_add_peer would only update the occupied map, leaving
+            // the self-identity fields stale if they somehow drifted.
+            st.mesh.spiral.claim_specific_position(
                 &our_pid,
-                citadel_topology::Spiral3DIndex::new(remote_idx),
+                remote_idx,
             );
         }
         return false;
@@ -4586,7 +5057,7 @@ fn evaluate_spiral_merge(
     // NOT recomputed, because by now known_peers includes the remote's credit.
     // Two independently-computed values: ours (cached) vs theirs (from HELLO).
     let our_cluster_work = st.mesh.our_cluster_vdf_work;
-    let their_cluster_work = remote_cluster_vdf_work
+    let their_cluster_work = _remote_cluster_vdf_work
         .or(remote_vdf_cumulative_credit)
         .unwrap_or(0.0);
 
@@ -4614,6 +5085,76 @@ fn evaluate_spiral_merge(
 /// Keeps peers that have active relay connections OR are in known_peers
 /// with recent VDF activity (last 5 minutes). This prevents slot inflation
 /// from truly dead peers while preserving topology learned from gossip.
+/// VDF-based liveness eviction. VDF IS the heartbeat.
+/// If a peer's VDF step hasn't advanced in 10 seconds, it's dead.
+/// One rule. One timer. No special cases for gossip vs connected.
+///
+/// Returns the list of evicted peer keys.
+fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
+    const VDF_DEAD_SECS: u64 = 10;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let our_pid = st.lens.peer_id.clone();
+    let mut evicted = Vec::new();
+
+    for (peer_mkey, peer) in &st.mesh.known_peers {
+        if *peer_mkey == our_pid {
+            continue;
+        }
+        if peer.last_vdf_advance == 0 {
+            if now.saturating_sub(peer.last_seen) < VDF_DEAD_SECS {
+                continue;
+            }
+        } else if now.saturating_sub(peer.last_vdf_advance) < VDF_DEAD_SECS {
+            continue;
+        }
+        evicted.push(peer_mkey.clone());
+    }
+
+    for evicted_key in &evicted {
+        if let Some(peer) = st.mesh.known_peers.remove(evicted_key) {
+            info!(
+                mesh_key = %evicted_key,
+                server_name = %peer.server_name,
+                node_name = %peer.node_name,
+                vdf_step = ?peer.vdf_step,
+                last_vdf_advance = peer.last_vdf_advance,
+                dead_secs = VDF_DEAD_SECS,
+                "mesh: evicting dead peer — VDF not advancing"
+            );
+            st.mesh.connections.remove(evicted_key);
+            st.mesh.spiral.remove_peer(evicted_key);
+
+            // Cut the Ygg overlay connection — dead nodes don't get to stay peered.
+            if let Some(ref ygg) = st.transport_config.ygg_node {
+                if let Some(ref uri) = peer.ygg_peer_uri {
+                    match ygg.remove_peer(uri) {
+                        Ok(()) => info!(
+                            uri,
+                            node_name = %peer.node_name,
+                            "APE: removed dead peer from Ygg overlay"
+                        ),
+                        Err(e) => tracing::debug!(
+                            uri,
+                            error = %e,
+                            "APE: remove_peer failed (may already be gone)"
+                        ),
+                    }
+                }
+            }
+
+            // Shut down the relay task if one exists for this peer.
+            if let Some(relay) = st.federation.relays.remove(evicted_key) {
+                let _ = relay.outgoing_tx.send(RelayCommand::Shutdown);
+            }
+        }
+    }
+
+    evicted
+}
+
 fn evict_stale_spiral_peers(st: &mut super::server::ServerState) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4656,29 +5197,7 @@ fn evict_stale_spiral_peers(st: &mut super::server::ServerState) {
 
 /// Claim the first available SPIRAL slot, persist, announce, update neighbors, prune.
 /// Returns true (always changes topology).
-fn claim_and_announce(
-    st: &mut super::server::ServerState,
-    shared_state: SharedState,
-) -> bool {
-    let our_pid = st.lens.peer_id.clone();
-    evict_stale_spiral_peers(st);
-    let idx = st.mesh.spiral.claim_position(&our_pid);
-    info!(
-        spiral_index = idx.value(),
-        peer_id = %our_pid,
-        known_peers = st.mesh.known_peers.len(),
-        "SPIRAL merge: claimed slot"
-    );
-    persist_spiral_position(st, idx.value());
-    announce_hello_to_all_relays(st);
-    update_spiral_neighbors(st);
-    dial_missing_spiral_neighbors(st, shared_state);
-    st.notify_topology_change();
-    prune_non_spiral_relays(st);
-    true
-}
-
-/// Remove ourselves from our current slot, register the winner, claim first available hole.
+/// Remove ourselves from our current slot, register the winner, claim first hole.
 /// Returns true (always changes topology).
 fn reslot_around_winner(
     st: &mut super::server::ServerState,
@@ -4696,7 +5215,8 @@ fn reslot_around_winner(
         winner_peer_id,
         citadel_topology::Spiral3DIndex::new(winner_slot),
     );
-    // Claim first available hole.
+    // Claim first available hole. claim_position sets our_index/our_coord/our_mesh_key.
+    // No apply_repack — we only move ourselves, other peers decide for themselves.
     let new_idx = st.mesh.spiral.claim_position(&our_pid);
     info!(
         old_slot = ?st.lens.spiral_index,
@@ -4712,14 +5232,13 @@ fn reslot_around_winner(
     true
 }
 
-/// SPIRAL convergence: check if we should move to a lower slot.
+/// SPIRAL convergence: deterministic repack fills all holes in `[0..N)`.
 ///
-/// After topology changes (gossip, eviction), a node may discover that
-/// there are unoccupied slots closer to the origin than its current position.
-/// SPIRAL's convergence protocol says: move there. This fills holes naturally
-/// and guarantees O(log n) convergence to a packed topology.
+/// Single-pass O(N), conflict-free. Every node independently computes the
+/// same result from the same topology state. Replaces the old single-step
+/// `evaluate_position()` approach.
 ///
-/// Called after PEERS gossip processing and stale peer eviction.
+/// Called after PEERS gossip processing, stale peer eviction, and merges.
 /// Returns true if our position changed.
 fn reconverge_spiral(
     st: &mut super::server::ServerState,
@@ -4729,32 +5248,48 @@ fn reconverge_spiral(
     if !st.mesh.spiral.is_claimed() {
         return false;
     }
+
+    // Grace window: after a concierge assignment, VDF race, collision
+    // resolution, or reslot, skip reconverge for 30s. The assigning node
+    // had a more complete topology view. Local reconverge with incomplete
+    // gossip sees "empty" slots that are actually occupied by peers we
+    // haven't heard about yet → moves us to slot 0 → thundering herd.
+    // 30s is enough for PEERS gossip to propagate the full topology.
+    const SETTLE_GRACE_SECS: u64 = 30;
+    if let Some(settled) = st.mesh.spiral_settled_at {
+        if settled.elapsed() < std::time::Duration::from_secs(SETTLE_GRACE_SECS) {
+            return false;
+        }
+    }
+
     // Evict stale peers first — frees slots held by dead nodes.
     evict_stale_spiral_peers(st);
-    // Check if a better slot exists.
+
+    // Self-only convergence: check if there's a lower slot available.
+    // Each node moves only ITSELF. Remote peers decide for themselves
+    // when they receive gossip. Never repack remote peers locally —
+    // that moves them into slots that might be occupied by peers we
+    // haven't learned about yet.
     let better = st.mesh.spiral.evaluate_position();
-    let Some(target) = better else {
-        return false;
-    };
-    let our_pid = st.lens.peer_id.clone();
-    let old_slot = st.lens.spiral_index;
-    // Vacate current position.
-    st.mesh.spiral.remove_peer(&our_pid);
-    // Claim first available hole (should be `target` or even lower).
-    let new_idx = st.mesh.spiral.claim_position(&our_pid);
-    info!(
-        old_slot = ?old_slot,
-        target_slot = target.value(),
-        new_slot = new_idx.value(),
-        "SPIRAL convergence: moved to lower slot"
-    );
-    persist_spiral_position(st, new_idx.value());
-    announce_hello_to_all_relays(st);
-    update_spiral_neighbors(st);
-    dial_missing_spiral_neighbors(st, shared_state);
-    st.notify_topology_change();
-    prune_non_spiral_relays(st);
-    true
+    if let Some(better_idx) = better {
+        let our_pid = st.lens.peer_id.clone();
+        let old_slot = st.mesh.spiral.our_index().map(|i| i.value());
+        st.mesh.spiral.claim_specific_position(&our_pid, better_idx.value());
+        info!(
+            old_slot = ?old_slot,
+            new_slot = better_idx.value(),
+            "SPIRAL reconverge: moved to lower slot"
+        );
+        persist_spiral_position(st, better_idx.value());
+        announce_hello_to_all_relays(st);
+        update_spiral_neighbors(st);
+        dial_missing_spiral_neighbors(st, shared_state);
+        st.notify_topology_change();
+        prune_non_spiral_relays(st);
+        return true;
+    }
+
+    false
 }
 
 /// Persist SPIRAL position to LensIdentity on disk.
@@ -4766,6 +5301,8 @@ fn persist_spiral_position(st: &mut super::server::ServerState, slot: u64) {
     }
     super::lens::persist_identity(&st.data_dir, &updated_lens);
     st.lens = std::sync::Arc::new(updated_lens);
+    // Mark settlement time — reconverge_spiral skips within grace window.
+    st.mesh.spiral_settled_at = Some(std::time::Instant::now());
 }
 
 /// Re-send MESH HELLO to all connected relays (after position change).
@@ -4846,6 +5383,23 @@ fn build_hello_payload(st: &mut super::server::ServerState) -> MeshHelloPayload 
             (Some(status.height), Some(status.weight), Some(status.tip_hex), Some(status.genesis_hex))
         }).unwrap_or((None, None, None, None));
 
+    // Concierge: if we're established (have a SPIRAL slot), compute the
+    // first empty slot so joiners can take it from our HELLO immediately.
+    // One integer. O(1). Scales to millions.
+    let assigned_slot = if st.mesh.spiral.is_claimed() {
+        // Find first unoccupied slot index.
+        let occupied = st.mesh.spiral.all_occupied();
+        let mut slot = 0u64;
+        loop {
+            if !occupied.iter().any(|(_, idx)| idx.value() == slot) {
+                break Some(slot);
+            }
+            slot += 1;
+        }
+    } else {
+        None
+    };
+
     MeshHelloPayload {
         peer_id: st.lens.peer_id.clone(),
         server_name: st.lens.server_name.clone(),
@@ -4866,6 +5420,7 @@ fn build_hello_payload(st: &mut super::server::ServerState) -> MeshHelloPayload 
         cvdf_tip_hex,
         cvdf_genesis_hex,
         cluster_vdf_work,
+        assigned_slot,
     }
 }
 
@@ -4877,26 +5432,10 @@ fn build_hello_payload(st: &mut super::server::ServerState) -> MeshHelloPayload 
 pub fn spawn_mesh_connector(state: SharedState, transport_config: Arc<TransportConfig>) {
     let peers: Vec<String> = transport_config.peers.keys().cloned().collect();
     if peers.is_empty() {
-        // No peers configured. If we haven't claimed a SPIRAL position,
-        // claim origin (slot 0) — we're the first node in the mesh.
-        tokio::spawn(async move {
-            let mut st = state.write().await;
-            if !st.mesh.spiral.is_claimed() {
-                let our_pid = st.lens.peer_id.clone();
-                let idx = st.mesh.spiral.claim_position(&our_pid);
-                info!(
-                    spiral_index = idx.value(),
-                    "mesh: claimed SPIRAL slot (no peers configured)"
-                );
-                let mut updated_lens = (*st.lens).clone();
-                updated_lens.spiral_index = Some(idx.value());
-                if let Some(ref rx) = st.mesh.vdf_state_rx {
-                    updated_lens.vdf_total_steps = rx.borrow().total_steps;
-                }
-                super::lens::persist_identity(&st.data_dir, &updated_lens);
-                st.lens = std::sync::Arc::new(updated_lens);
-            }
-        });
+        // No peers configured. Do NOT self-claim a SPIRAL slot.
+        // Genesis requires two witnesses agreeing on the same math.
+        // A node with no peers has no authority to claim anything.
+        info!("mesh: no peers configured, waiting for inbound connections");
         return;
     }
 
