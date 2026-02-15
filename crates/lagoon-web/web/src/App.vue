@@ -6,6 +6,10 @@ import CommunitySidebar from './components/CommunitySidebar.vue'
 import CommunityModal from './components/CommunityModal.vue'
 import CircleModal from './components/CircleModal.vue'
 import IrcClient from './components/IrcClient.vue'
+import NetworkTopology from './components/NetworkTopology.vue'
+
+// Public routes — rendered without authentication.
+const isMapRoute = window.location.pathname === '/map'
 
 // useCommunities manages server connections in localStorage.
 const {
@@ -133,7 +137,10 @@ function onLogout(serverId) {
 </script>
 
 <template>
-  <div class="app">
+  <!-- Public map route — no auth required -->
+  <NetworkTopology v-if="isMapRoute" class="fullscreen-map" />
+
+  <div v-else class="app">
     <!-- Welcome state: no servers → auth modal -->
     <CommunityModal
       v-if="noServers"
@@ -209,5 +216,10 @@ body {
   display: flex;
   flex-direction: row;
   overflow: hidden;
+}
+
+.fullscreen-map {
+  width: 100vw;
+  height: 100vh;
 }
 </style>
