@@ -1,0 +1,29 @@
+[package]
+name = "ferrouswood"
+description = "SPIRAL-based routing layer — replaces ironwood's spanning tree"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Our Yggdrasil peering layer
+yggdrasil-rs = { path = "../yggdrasil-rs" }
+
+# Async
+tokio = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Encoding
+hex = { workspace = true }
+
+# Serialization (for SPIRAL state)
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

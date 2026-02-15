@@ -6,6 +6,8 @@ members = [
     "crates/lagoon-vdf",
     "crates/anymesh",
     "crates/yggbridge",
+    "crates/yggdrasil-rs",
+    "crates/ferrouswood",
 ]
 
 [workspace.package]
@@ -38,6 +40,7 @@ webauthn-rs-proto = "0.5"
 
 # Crypto
 ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
+blake2 = "0.10"
 blake3 = "1"
 rand = "0.8"
 base64 = "0.22"
@@ -87,6 +90,8 @@ anymesh = { path = "crates/anymesh" }
 
 # Yggdrasil
 yggbridge = { path = "crates/yggbridge" }
+yggdrasil-rs = { path = "crates/yggdrasil-rs" }
+ferrouswood = { path = "crates/ferrouswood" }
 
 # Dev
 pretty_assertions = "1"
