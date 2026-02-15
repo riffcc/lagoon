@@ -1,10 +1,6 @@
 # Stage 1: Build Rust binaries
 FROM rust:1-bookworm AS rust-build
 
-# Install Go (needed by yggbridge crate's build.rs)
-RUN curl -fsSL https://go.dev/dl/go1.24.4.linux-amd64.tar.gz | tar -C /usr/local -xzf -
-ENV PATH="/usr/local/go/bin:${PATH}"
-
 # Cache-bust arg: pass --build-arg CACHEBUST=$(date +%s) to force rebuild
 # Placed before citadel clone to invalidate that layer when citadel changes
 ARG CACHEBUST=0
