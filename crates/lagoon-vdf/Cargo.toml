@@ -11,3 +11,6 @@ description = "VDF (Verifiable Delay Function) chain with ZK proofs via Fiat-Sha
 blake3 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+bincode = { workspace = true }
