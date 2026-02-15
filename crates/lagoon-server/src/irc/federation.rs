@@ -1251,6 +1251,26 @@ pub fn spawn_event_processor(
                     // If they were, no cluster merge needed — same clump.
                     let already_in_clump = st.mesh.known_peers.contains_key(&mkey);
 
+                    // Preserve VDF liveness state from previous entry:
+                    // - Only update last_vdf_advance if the VDF step ACTUALLY advanced
+                    // - Preserve prev_vdf_step for stagnation detection
+                    // A peer with a frozen VDF (same step in every HELLO) must not
+                    // refresh last_vdf_advance — that hides the frozen VDF behind
+                    // the grace period. (Lean: invariant_dead_detection requires
+                    // isDead to be purely a function of VDF silence duration.)
+                    let (prev_vdf_step, last_vdf_advance) = if let Some(existing) = st.mesh.known_peers.get(&mkey) {
+                        let step_advanced = match (existing.vdf_step, vdf_step) {
+                            (Some(old), Some(new)) => new > old,
+                            (None, Some(_)) => true, // first step seen
+                            _ => false,
+                        };
+                        let advance_ts = if step_advanced { now } else { existing.last_vdf_advance };
+                        (existing.vdf_step, advance_ts)
+                    } else {
+                        // First HELLO from this peer — vdf_step presence = first proof of life.
+                        (None, if vdf_step.is_some() { now } else { 0 })
+                    };
+
                     st.mesh.known_peers.insert(
                         mkey.clone(),
                         MeshPeerInfo {
@@ -1272,9 +1292,8 @@ pub fn spawn_event_processor(
                             vdf_cumulative_credit,
                             ygg_peer_uri: ygg_peer_uri.clone(),
                             underlay_uri,
-                            prev_vdf_step: None,
-                            // HELLO with a VDF step = first proof of life.
-                            last_vdf_advance: if vdf_step.is_some() { now } else { 0 },
+                            prev_vdf_step,
+                            last_vdf_advance,
                         },
                     );
                     st.mesh
@@ -1382,7 +1401,13 @@ pub fn spawn_event_processor(
                     {
                         let evicted = evict_dead_peers(&mut st);
                         if !evicted.is_empty() {
-                            reconverge_spiral(&mut st, state.clone());
+                            // Do NOT reconverge here. The eviction is a side-effect
+                            // sweep during HELLO — the evicted peers are unrelated
+                            // to this HELLO's topology data. Reconverge with
+                            // incomplete topology moves us to "false gaps."
+                            // The event-driven reconverge at line 1326 (after
+                            // evaluate_spiral_merge) already handles convergence
+                            // with fresh topology from this HELLO.
                             let neighbors = st.mesh.spiral.neighbors().clone();
                             st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
                             st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
@@ -1493,6 +1518,10 @@ pub fn spawn_event_processor(
                                 if let Some(peer) = st.mesh.known_peers.get_mut(&mkey) {
                                     peer.spiral_index = Some(slot);
                                 }
+                                // Clear pending reservation — the real registration
+                                // supersedes the tentative reservation from
+                                // build_hello_payload.
+                                st.mesh.pending_assigned_slots.remove(&slot);
                                 info!(
                                     slot,
                                     remote = %mkey,
@@ -2714,7 +2743,13 @@ pub fn spawn_event_processor(
                 let mut st = state.write().await;
                 let evicted = evict_dead_peers(&mut st);
                 if !evicted.is_empty() {
-                    reconverge_spiral(&mut st, state.clone());
+                    // Do NOT reconverge here. Timer-driven reconverge has no
+                    // accompanying topology update — we see "empty" slots that
+                    // may actually be occupied by peers whose gossip hasn't
+                    // arrived yet. Moving to those slots causes collisions.
+                    // Reconverge is safe only after processing fresh topology
+                    // data (HELLO, PEERS, Disconnected).
+                    // (Lean: reconverge_requires_complete_topology)
                     let neighbors = st.mesh.spiral.neighbors().clone();
                     st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
                     st.mesh.connection_gossip.set_spiral_neighbors(neighbors);
@@ -4883,19 +4918,18 @@ fn evaluate_spiral_merge(
 
     // ── VDF Race: two unslotted nodes meet ───────────────────────
     // Both sides run the SAME comparison with the SAME inputs.
-    // Both independently arrive at the SAME answer:
-    //   higher VDF cumulative credit = slot 0
-    //   lower VDF cumulative credit = slot 1
+    // Both independently arrive at the SAME answer.
     // No assignment. No authority. Just math.
     // Genesis requires two witnesses agreeing on the same algorithm.
+    //
+    // CRITICAL: uses vdf_tiebreak_wins (VDF hash XOR + blake3) as the
+    // SOLE determinant. cumulative_credit is a moving target — reading
+    // it live introduces asymmetry where both sides think they win
+    // (Lean: snapshot_immutability_required). VDF hash chain tips are
+    // exchanged in HELLO and immutable. Both sides compute the same XOR,
+    // the same blake3, and deterministically agree on the winner.
     if remote_spiral_index.is_none() && !we_are_claimed {
-        let our_credit = st.mesh.vdf_state_rx.as_ref()
-            .and_then(|rx| rx.borrow().resonance.as_ref()
-                .map(|r| r.cumulative_credit))
-            .unwrap_or(0.0);
-        let their_credit = remote_vdf_cumulative_credit.unwrap_or(0.0);
-        let we_win = our_credit > their_credit
-            || (our_credit == their_credit && tiebreak(remote_peer_id));
+        let we_win = tiebreak(remote_peer_id);
 
         // Register the remote at their deterministic slot.
         let remote_slot = if we_win { 1u64 } else { 0u64 };
@@ -4910,10 +4944,9 @@ fn evaluate_spiral_merge(
         info!(
             our_slot,
             remote_slot,
-            our_credit,
-            their_credit,
+            we_win,
             remote = %remote_peer_id,
-            "SPIRAL VDF race: both nodes independently computed slots"
+            "SPIRAL VDF race: deterministic slot assignment (VDF hash tiebreak)"
         );
         persist_spiral_position(st, our_slot);
         announce_hello_to_all_relays(st);
@@ -4983,23 +5016,24 @@ fn evaluate_spiral_merge(
 
     // Both sides are claimed from here on.
 
-    // Case 3: Same slot collision — compare individual cumulative credit.
+    // Case 3: Same slot collision — deterministic VDF hash tiebreak.
+    //
+    // CRITICAL: Do NOT use cumulative_credit for this comparison.
+    // cumulative_credit is a moving target — both sides read their own
+    // live value (which keeps growing) while comparing against the
+    // remote's frozen HELLO snapshot. Both independently conclude they
+    // win → conflict. (Lean: snapshot_immutability_required)
+    //
+    // VDF hash tiebreak uses chain tips from HELLO — immutable, both
+    // sides compute the same XOR → deterministic agreement.
     if our_spiral == Some(remote_idx) {
-        let our_credit = st.mesh.vdf_state_rx.as_ref()
-            .and_then(|rx| rx.borrow().resonance.as_ref()
-                .map(|r| r.cumulative_credit))
-            .unwrap_or(0.0);
-        let their_credit = remote_vdf_cumulative_credit.unwrap_or(0.0);
-        let we_yield = their_credit > our_credit
-            || (their_credit == our_credit && !tiebreak(remote_peer_id));
+        let we_yield = !tiebreak(remote_peer_id);
 
         if we_yield {
             info!(
-                our_credit,
-                their_credit,
                 slot = remote_idx,
                 winner = %remote_peer_id,
-                "SPIRAL merge: slot collision — we yield (lower cumulative credit)"
+                "SPIRAL merge: slot collision — we yield (VDF hash tiebreak)"
             );
             return reslot_around_winner(st, remote_peer_id, remote_idx, shared_state);
         }
@@ -5027,22 +5061,19 @@ fn evaluate_spiral_merge(
     // Compare total VDF work across each clump. Loser re-slots around winner.
     if !added {
         // Remote's slot conflicts with a THIRD peer. Force-add the remote
-        // if it has more VDF credit (active claim beats stale gossip).
+        // if VDF hash tiebreak favors the incoming peer over the existing occupant.
+        // Both values (existing + incoming VDF hashes) are from HELLO snapshots —
+        // no moving-target issue.
         if let Some(existing_key) = st.mesh.spiral.peer_at_index(remote_idx).map(|s| s.to_string()) {
-            let existing_credit = st.mesh.known_peers.get(&existing_key)
-                .and_then(|p| p.vdf_cumulative_credit)
-                .unwrap_or(0.0);
-            let incoming_credit = remote_vdf_cumulative_credit.unwrap_or(0.0);
             let existing_vdf_hash: Option<Vec<u8>> = st.mesh.known_peers.get(&existing_key)
                 .and_then(|p| p.vdf_hash.as_deref())
                 .and_then(|h| hex::decode(h).ok());
-            let incoming_wins = incoming_credit > existing_credit
-                || (incoming_credit == existing_credit && vdf_tiebreak_wins(
-                    remote_peer_id,
-                    &existing_key,
-                    their_vdf_hash_bytes.as_deref(),
-                    existing_vdf_hash.as_deref(),
-                ));
+            let incoming_wins = vdf_tiebreak_wins(
+                remote_peer_id,
+                &existing_key,
+                their_vdf_hash_bytes.as_deref(),
+                existing_vdf_hash.as_deref(),
+            );
             if incoming_wins {
                 st.mesh.spiral.force_add_peer(
                     remote_peer_id,
@@ -5386,16 +5417,32 @@ fn build_hello_payload(st: &mut super::server::ServerState) -> MeshHelloPayload 
     // Concierge: if we're established (have a SPIRAL slot), compute the
     // first empty slot so joiners can take it from our HELLO immediately.
     // One integer. O(1). Scales to millions.
+    //
+    // Eagerly reserves the slot in pending_assigned_slots so two
+    // concurrent outbound Hellos get different slots. The event
+    // processor clears the pending entry when it does the real
+    // registration (Lean: concierge_eager_registration).
     let assigned_slot = if st.mesh.spiral.is_claimed() {
-        // Find first unoccupied slot index.
+        // Clean up expired pending reservations (>30s old).
+        let now = std::time::Instant::now();
+        st.mesh.pending_assigned_slots.retain(|_, ts| {
+            now.duration_since(*ts) < std::time::Duration::from_secs(30)
+        });
+
+        // Find first unoccupied AND non-pending slot index.
         let occupied = st.mesh.spiral.all_occupied();
         let mut slot = 0u64;
         loop {
-            if !occupied.iter().any(|(_, idx)| idx.value() == slot) {
-                break Some(slot);
+            let slot_occupied = occupied.iter().any(|(_, idx)| idx.value() == slot);
+            let slot_pending = st.mesh.pending_assigned_slots.contains_key(&slot);
+            if !slot_occupied && !slot_pending {
+                break;
             }
             slot += 1;
         }
+        // Reserve this slot so the next build_hello_payload call skips it.
+        st.mesh.pending_assigned_slots.insert(slot, now);
+        Some(slot)
     } else {
         None
     };

@@ -325,6 +325,12 @@ pub struct MeshState {
     /// within the grace window to prevent it from undoing the assignment before
     /// gossip propagates the full topology.
     pub spiral_settled_at: Option<std::time::Instant>,
+    /// Slots tentatively reserved by outbound HELLO assigned_slot values.
+    /// Prevents two outbound relays from computing the same assigned_slot.
+    /// Entries are (slot, timestamp) — expired entries are cleaned up on access.
+    /// The event processor removes entries when it does the real registration
+    /// via eager slot registration (concierge_eager_registration theorem).
+    pub pending_assigned_slots: HashMap<u64, std::time::Instant>,
 }
 
 impl MeshState {
@@ -351,6 +357,7 @@ impl MeshState {
             our_cluster_vdf_work: 0.0,
             switchboard_ctl: None,
             spiral_settled_at: None,
+            pending_assigned_slots: HashMap::new(),
         }
     }
 }

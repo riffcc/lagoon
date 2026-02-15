@@ -415,14 +415,11 @@ async fn raw_mesh_handler(
         "switchboard: received Hello"
     );
 
-    // Send our Hello.
-    let our_hello = {
-        let mut st = state.write().await;
-        build_wire_hello(&mut st)
-    };
-    let hello_json = MeshMessage::Hello(our_hello).to_json()?;
-    writer.write_all(hello_json.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
+    // Do NOT send Hello here. The event processor sends the response Hello
+    // AFTER evaluate_spiral_merge (the Juggler invariant). Sending it here
+    // would give the remote stale topology — no assigned_slot, pre-merge
+    // spiral_index. The correct Hello comes via RelayCommand::SendMesh
+    // from the federation event loop after processing the MeshHello event.
 
     // ── Phase 2: Create relay handle ────────────────────────────────────
 
@@ -442,7 +439,7 @@ async fn raw_mesh_handler(
                 node_name: remote_node_name.clone(),
                 connect_target: String::new(), // inbound via switchboard
                 channels: HashMap::new(),
-                mesh_connected: true,
+                mesh_connected: false, // Set to true by event processor after sending post-merge Hello
                 is_bootstrap: false,
                 last_rtt_ms: None,
             },
