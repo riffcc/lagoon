@@ -1338,7 +1338,9 @@ pub fn spawn_event_processor(
                     // This is a real IP (not an overlay address) — confirmed
                     // different node via peer_id verification in HELLO.
                     let underlay_uri = relay_peer_addr
-                        .map(|addr| format!("tcp://[{}]:9443", addr.ip()));
+                        .map(|addr| format!("tcp://[{}]:9443", addr.ip()))
+                        .or_else(|| ygg_peer_uri.clone())
+                        .filter(|u| is_underlay_uri(u));
 
                     // Clone vdf_hash before moving into known_peers — needed for merge tiebreak.
                     let remote_vdf_hash_for_merge = vdf_hash.clone();
@@ -1408,6 +1410,7 @@ pub fn spawn_event_processor(
                     // be an overlay address — NEVER pass it to add_peer.
                     if let Some(ref ygg) = st.transport_config.ygg_node {
                         if let Some(uri) = ape_peer_uri(relay_peer_addr)
+                            .or_else(|| ygg_peer_uri.clone())
                             .filter(|u| is_underlay_uri(u))
                         {
                             if !st.mesh.ygg_peered_uris.contains(uri.as_str()) {
