@@ -7,11 +7,11 @@
 //!   - `peers()` — list connected peers
 
 use std::collections::HashMap;
-use std::net::Ipv6Addr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::crypto::Identity;
@@ -31,6 +31,10 @@ pub struct YggNode {
     /// Channel for the consumer to receive peer events.
     consumer_rx: mpsc::Receiver<PeerEvent>,
     password: Option<Vec<u8>>,
+    /// Actual bound addresses of all listeners (resolved from :0 etc).
+    bound_addrs: Vec<SocketAddr>,
+    /// Watch channel broadcasting current peer count (event-driven, no polling).
+    peer_count_tx: watch::Sender<usize>,
 }
 
 /// Builder for configuring a node before starting it.
@@ -104,6 +108,9 @@ impl YggNode {
         let (event_tx, mut event_rx) = mpsc::channel::<PeerEvent>(256);
         // Consumer channel (event processor → application)
         let (consumer_tx, consumer_rx) = mpsc::channel::<PeerEvent>(256);
+        // Watch channel for peer count (event-driven observation)
+        let (peer_count_tx, _) = watch::channel(0usize);
+        let peer_count_tx_clone = peer_count_tx.clone();
 
         // Event processor task
         let peers_clone = peers.clone();
@@ -118,7 +125,10 @@ impl YggNode {
                             "yggdrasil-rs: peer connected"
                         );
                         let handle = PeerHandle::new(info.clone(), cmd_tx.clone());
-                        peers_clone.write().await.insert(info.key, handle);
+                        let mut peers = peers_clone.write().await;
+                        peers.insert(info.key, handle);
+                        let _ = peer_count_tx_clone.send(peers.len());
+                        drop(peers);
                         let _ = consumer_tx.send(event).await;
                     }
                     PeerEvent::Disconnected { peer_key, reason } => {
@@ -127,7 +137,10 @@ impl YggNode {
                             reason = %reason,
                             "yggdrasil-rs: peer disconnected"
                         );
-                        peers_clone.write().await.remove(peer_key);
+                        let mut peers = peers_clone.write().await;
+                        peers.remove(peer_key);
+                        let _ = peer_count_tx_clone.send(peers.len());
+                        drop(peers);
                         let _ = consumer_tx.send(event).await;
                     }
                     PeerEvent::Frame { .. } => {
@@ -139,6 +152,7 @@ impl YggNode {
 
         // Start listeners
         let mut listener_handles = Vec::new();
+        let mut bound_addrs = Vec::new();
         for addr_str in &listen_addrs {
             let bind_addr = addr_str
                 .strip_prefix("tcp://")
@@ -146,7 +160,10 @@ impl YggNode {
 
             match TcpListener::bind(bind_addr).await {
                 Ok(listener) => {
-                    tracing::info!(addr = %bind_addr, "yggdrasil-rs: listening");
+                    let local_addr = listener.local_addr()
+                        .expect("bound listener must have local address");
+                    tracing::info!(addr = %local_addr, "yggdrasil-rs: listening");
+                    bound_addrs.push(local_addr);
                     let identity = identity.clone();
                     let event_tx = event_tx.clone();
                     let password = password.clone();
@@ -169,6 +186,8 @@ impl YggNode {
             listener_handles,
             consumer_rx,
             password,
+            bound_addrs,
+            peer_count_tx,
         };
 
         // Dial initial peers
@@ -297,6 +316,23 @@ impl YggNode {
     pub async fn peer_count(&self) -> usize {
         self.peers.read().await.len()
     }
+
+    /// Actual bound addresses of all listeners.
+    ///
+    /// When binding to port 0, the OS assigns a port. This method returns the
+    /// resolved addresses so callers (tests, switchboard) know where to connect.
+    pub fn listener_addrs(&self) -> &[SocketAddr] {
+        &self.bound_addrs
+    }
+
+    /// Subscribe to peer count changes (event-driven, no polling).
+    ///
+    /// Returns a watch receiver whose value updates on every connect/disconnect.
+    /// Use `rx.changed().await` to wait for the next change, then `*rx.borrow()`
+    /// to read the current count.
+    pub fn peer_count_watch(&self) -> watch::Receiver<usize> {
+        self.peer_count_tx.subscribe()
+    }
 }
 
 impl Drop for YggNode {
@@ -403,7 +439,7 @@ mod tests {
 
     #[tokio::test]
     async fn two_nodes_peer_directly() {
-        // Node A listens
+        // Node A listens on OS-assigned port
         let node_a = YggNode::new(
             &test_privkey(1),
             &[],
@@ -412,16 +448,43 @@ mod tests {
         .await
         .unwrap();
 
-        // Get the actual bound port
-        // (We use port 0 to let the OS pick, but we need a real listener to get the port.
-        //  For a real test, we'd need to expose the bound address. For now, skip this test
-        //  if we can't determine the port.)
-
-        // Node B dials Node A — but we need the actual port.
-        // This test validates the API flow; full integration requires a known port.
+        let port_a = node_a.listener_addrs()[0].port();
         assert_eq!(node_a.peer_count().await, 0);
 
-        // Clean shutdown
-        drop(node_a);
+        // Node B dials Node A
+        let node_b = YggNode::new(
+            &test_privkey(2),
+            &[format!("tcp://127.0.0.1:{port_a}")],
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // Wait for connections (event-driven via watch channel)
+        let mut rx_a = node_a.peer_count_watch();
+        let mut rx_b = node_b.peer_count_watch();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            // Wait for A to see 1 peer (inbound from B)
+            while *rx_a.borrow_and_update() < 1 {
+                rx_a.changed().await.unwrap();
+            }
+            // Wait for B to see 1 peer (outbound to A)
+            while *rx_b.borrow_and_update() < 1 {
+                rx_b.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("peers should connect within 5 seconds");
+
+        assert_eq!(node_a.peer_count().await, 1);
+        assert_eq!(node_b.peer_count().await, 1);
+
+        // Verify B sees A's key
+        let a_peers = node_a.peers().await;
+        assert_eq!(a_peers[0].key, Identity::from_seed(&[2; 32]).public_key_bytes);
+
+        // Verify A sees B's key
+        let b_peers = node_b.peers().await;
+        assert_eq!(b_peers[0].key, Identity::from_seed(&[1; 32]).public_key_bytes);
     }
 }
