@@ -341,6 +341,15 @@ pub fn dial_missing_spiral_neighbors(
     let tc = st.transport_config.clone();
     let ygg_node = st.transport_config.ygg_node.clone();
 
+    let relay_count = st.federation.relays.len();
+    let pending_count = st.federation.pending_dials.len();
+    tracing::debug!(
+        neighbor_count = neighbor_keys.len(),
+        relay_count,
+        pending_count,
+        "dial_missing_spiral_neighbors: evaluating"
+    );
+
     for neighbor_mkey in &neighbor_keys {
         if *neighbor_mkey == our_pid {
             continue;
@@ -348,7 +357,13 @@ pub fn dial_missing_spiral_neighbors(
 
         let peer = match st.mesh.known_peers.get(neighbor_mkey) {
             Some(p) => p,
-            None => continue,
+            None => {
+                tracing::debug!(
+                    neighbor = %neighbor_mkey,
+                    "dial_missing: neighbor not in known_peers"
+                );
+                continue;
+            }
         };
 
         let node_name = peer.node_name.clone();
@@ -399,47 +414,90 @@ pub fn dial_missing_spiral_neighbors(
         }
 
         // Skip relay spawn if we already have one to this peer.
-        if st.federation.relays.contains_key(neighbor_mkey)
-            || st.federation.pending_dials.contains(&node_name)
-        {
-            continue;
-        }
-
-        // Need a Ygg overlay address for the WebSocket relay connection.
-        let peer_ygg_addr: Option<std::net::Ipv6Addr> = peer
-            .yggdrasil_addr
-            .as_deref()
-            .and_then(|s| s.parse().ok());
-        if peer_ygg_addr.is_none() {
+        let has_relay = st.federation.relays.contains_key(neighbor_mkey);
+        let has_pending = st.federation.pending_dials.contains(&node_name);
+        if has_relay || has_pending {
             tracing::debug!(
-                peer = %node_name,
-                neighbor_mkey = %neighbor_mkey,
-                "mesh: SPIRAL neighbor has no Ygg overlay address — cannot route relay"
+                neighbor = %neighbor_mkey,
+                node_name = %node_name,
+                has_relay,
+                has_pending,
+                "dial_missing: skipping — already connected or pending"
             );
             continue;
         }
 
+        // ── Route selection for SPIRAL neighbor connection ──────────
+        //
+        // Priority 1: Ygg overlay (if we have overlay connectivity).
+        // Priority 2: Anycast switchboard with targeted want="peer:{id}".
+        //
+        // The switchboard is the key mechanism: dial the anycast entry
+        // point, request a specific peer, and the switchboard routes the
+        // TCP connection. No Ygg overlay needed. This is how the third
+        // leg of the triangle forms — you learn about peer C from peer B,
+        // then dial anycast requesting C specifically.
+        let peer_ygg_addr: Option<std::net::Ipv6Addr> = peer
+            .yggdrasil_addr
+            .as_deref()
+            .and_then(|s| s.parse().ok());
+
+        // Find an anycast entry point from bootstrap peers (port 9443).
+        let anycast_entry: Option<String> = tc.peers.iter()
+            .find(|(_, e)| e.port == transport::SWITCHBOARD_PORT && !e.tls)
+            .map(|(host, _)| host.clone());
+
+        if peer_ygg_addr.is_none() && anycast_entry.is_none() {
+            tracing::debug!(
+                peer = %node_name,
+                neighbor_mkey = %neighbor_mkey,
+                "mesh: SPIRAL neighbor has no Ygg overlay and no anycast entry — cannot route"
+            );
+            continue;
+        }
+
+        // Choose route: Ygg overlay if available, otherwise anycast switchboard.
+        let (connect_key, peer_entry) = if peer_ygg_addr.is_some() {
+            // Ygg overlay — use node_name as connect key, overlay routes via mesh.
+            (node_name.clone(), transport::PeerEntry {
+                yggdrasil_addr: peer_ygg_addr,
+                port,
+                tls,
+                want: None,
+            })
+        } else {
+            // Anycast switchboard — dial the entry point, request this specific peer.
+            let anycast = anycast_entry.unwrap();
+            info!(
+                peer = %node_name,
+                neighbor_mkey = %neighbor_mkey,
+                anycast = %anycast,
+                "mesh: dialing SPIRAL neighbor via anycast switchboard"
+            );
+            (anycast, transport::PeerEntry {
+                yggdrasil_addr: None,
+                port: transport::SWITCHBOARD_PORT,
+                tls: false,
+                want: Some(format!("peer:{}", neighbor_mkey)),
+            })
+        };
+
         info!(
             peer = %node_name,
             neighbor_mkey = %neighbor_mkey,
+            connect_key = %connect_key,
             has_underlay = peer_uri.is_some(),
+            has_ygg_overlay = peer_ygg_addr.is_some(),
             "mesh: dialing SPIRAL neighbor"
         );
 
-        let connect_key = node_name.clone();
         // Pre-insert BEFORE spawn — the spawned task needs the write lock
         // (which we hold via &mut st), so it can't insert until we release.
         // Without pre-insert, the loop spawns duplicates for the same peer.
         st.federation.pending_dials.insert(connect_key.clone());
 
         let mut tc_with_peer = (*tc).clone();
-        tc_with_peer.peers.entry(connect_key.clone()).or_insert(
-            transport::PeerEntry {
-                yggdrasil_addr: peer_ygg_addr,
-                port,
-                tls,
-            },
-        );
+        tc_with_peer.peers.entry(connect_key.clone()).or_insert(peer_entry);
         let tc_arc = Arc::new(tc_with_peer);
 
         spawn_native_relay(
@@ -1540,6 +1598,7 @@ pub fn spawn_event_processor(
                                     yggdrasil_addr: peer_ygg_addr,
                                     port: peer_port,
                                     tls: peer_tls,
+                                    want: None,
                                 });
                             let tc_arc = Arc::new(tc_with_peer);
 
@@ -2024,6 +2083,7 @@ pub fn spawn_event_processor(
                                     yggdrasil_addr: peer_ygg_addr,
                                     port,
                                     tls,
+                                    want: None,
                                 },
                             );
                             let tc_arc = Arc::new(tc_with_peer);

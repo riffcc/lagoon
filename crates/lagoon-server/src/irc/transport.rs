@@ -51,6 +51,10 @@ pub struct PeerEntry {
     pub port: u16,
     /// Whether to wrap the connection in TLS. Auto-true for port 443.
     pub tls: bool,
+    /// Targeted switchboard dial — `"peer:{peer_id}"` requests a specific node
+    /// via the anycast switchboard. Used by `dial_missing_spiral_neighbors` to
+    /// reach peers through the anycast entry point without Ygg overlay routing.
+    pub want: Option<String>,
 }
 
 /// Federation transport configuration.
@@ -465,8 +469,9 @@ pub async fn connect_native(
     // SelfDetected, redials anycast → different machine answers.
     if port == SWITCHBOARD_PORT && !tls {
         let our_pid = from_peer_id.unwrap_or("");
-        info!(remote_host, "transport: native mesh via switchboard half-dial");
-        match connect_switchboard(remote_host, our_pid, "any").await? {
+        let want = peer.and_then(|p| p.want.as_deref()).unwrap_or("any");
+        info!(remote_host, want, "transport: native mesh via switchboard half-dial");
+        match connect_switchboard(remote_host, our_pid, want).await? {
             SwitchboardOutcome::Ready(ns) => return Ok(ns),
             SwitchboardOutcome::DirectRedirect { target_peer_id, ygg_addr } => {
                 // Switchboard told us the target is at a different underlay
@@ -547,7 +552,7 @@ pub enum SwitchboardOutcome {
 }
 
 /// Switchboard port — the default port for half-dial connections.
-const SWITCHBOARD_PORT: u16 = 9443;
+pub const SWITCHBOARD_PORT: u16 = 9443;
 
 /// Client-side half-dial protocol (raw TCP JSON lines, no WebSocket).
 ///
@@ -960,6 +965,7 @@ fn parse_peer_entry(entry: &str) -> Option<(String, PeerEntry)> {
                 yggdrasil_addr: Some(addr),
                 port,
                 tls,
+                want: None,
             },
         ))
     } else {
@@ -971,6 +977,7 @@ fn parse_peer_entry(entry: &str) -> Option<(String, PeerEntry)> {
                 yggdrasil_addr: None,
                 port,
                 tls,
+                want: None,
             },
         ))
     }
@@ -1093,6 +1100,7 @@ mod tests {
                 yggdrasil_addr: Some(ygg),
                 port: DEFAULT_PORT,
                 tls: false,
+                want: None,
             },
         );
 
@@ -1125,6 +1133,7 @@ mod tests {
                 yggdrasil_addr: Some(ygg),
                 port: DEFAULT_PORT,
                 tls: false,
+                want: None,
             },
         );
 
@@ -1225,6 +1234,7 @@ mod tests {
                 yggdrasil_addr: Some(ygg),
                 port: DEFAULT_PORT,
                 tls: false,
+                want: None,
             },
         );
         let mode = select_transport_inner("per.lagun.co", &peers, true);
@@ -1241,6 +1251,7 @@ mod tests {
                 yggdrasil_addr: Some(ygg),
                 port: 443,
                 tls: true,
+                want: None,
             },
         );
         // No ygg_node → falls through to TLS WS.
@@ -1263,6 +1274,7 @@ mod tests {
                 yggdrasil_addr: None,
                 port: 443,
                 tls: true,
+                want: None,
             },
         );
         // ygg_node exists but peer has no ygg_addr → TLS WS.
@@ -1285,6 +1297,7 @@ mod tests {
                 yggdrasil_addr: None,
                 port: 6667,
                 tls: false,
+                want: None,
             },
         );
         let mode = select_transport_inner("sanctuary.lon.riff.cc", &peers, false);
@@ -1320,6 +1333,7 @@ mod tests {
                 yggdrasil_addr: Some(ygg),
                 port: 443,
                 tls: true, // would be TLS WS, but Ygg overlay wins
+                want: None,
             },
         );
         let mode = select_transport_inner("lon.lagun.co", &peers, true);
