@@ -1,4 +1,5 @@
 jet_ssh_hostname: 10.7.1.195
+jet_ssh_user: wings
 fqdn: tealc.lon.riff.cc
 server_name: tealc.lagun.co
 lagoon_peers: "lon.lagun.co:9443,sanctuary.lagun.co:9443"

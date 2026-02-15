@@ -1,0 +1,118 @@
+---
+- name: Deploy Lagoon (all nodes)
+  groups:
+    - lagoon
+  ssh_user: root
+
+  tasks:
+    - !shell
+      name: Ensure sudo is available
+      cmd: which sudo || apt-get install -y sudo
+
+    - !shell
+      name: Set FQDN hostname
+      cmd: hostnamectl set-hostname {{ fqdn }}
+      with:
+        sudo: root
+
+    - !shell
+      name: Add bootstrap peer to hosts
+      cmd: grep -q 'lon.lagun.co' /etc/hosts || echo '10.7.1.200 lon.lagun.co' >> /etc/hosts; grep -q 'sanctuary.lagun.co' /etc/hosts || echo '10.7.1.37 sanctuary.lagun.co' >> /etc/hosts; grep -q 'tealc.lagun.co' /etc/hosts || echo '10.7.1.195 tealc.lagun.co' >> /etc/hosts
+      with:
+        sudo: root
+
+    - !shell
+      name: Create directories
+      cmd: mkdir -p /var/lib/lagoon /opt/lagoon-web/web/dist
+      with:
+        sudo: root
+
+    - !shell
+      name: Stop existing services
+      cmd: systemctl stop lagoon-web || true; systemctl stop lagoon || true; systemctl disable lagoon || true
+      with:
+        sudo: root
+
+    - !shell
+      name: Clear node state for fresh start
+      cmd: rm -rf /var/lib/lagoon/*
+      with:
+        sudo: root
+
+    - !copy
+      name: Deploy lagoon-web binary
+      src: lagoon-web
+      dest: /usr/local/bin/lagoon-web
+      attributes:
+        owner: root
+        group: root
+        mode: "0o755"
+      with:
+        sudo: root
+
+    - !copy
+      name: Upload web frontend archive
+      src: lagoon-web-dist.tar.gz
+      dest: /tmp/lagoon-web-dist.tar.gz
+      attributes:
+        mode: "0o644"
+
+    - !shell
+      name: Extract web frontend
+      cmd: rm -rf /opt/lagoon-web/web/dist/* && tar xzf /tmp/lagoon-web-dist.tar.gz --strip-components=1 -C /opt/lagoon-web/web/dist/ && rm /tmp/lagoon-web-dist.tar.gz
+      with:
+        sudo: root
+
+    - !shell
+      name: Install systemd unit
+      cmd: |
+        cat > /etc/systemd/system/lagoon-web.service << 'UNIT'
+        [Unit]
+        Description=Lagoon (embedded IRC + Web)
+        After=network-online.target
+        Wants=network-online.target
+
+        [Service]
+        Type=simple
+        ExecStart=/usr/local/bin/lagoon-web
+        WorkingDirectory=/opt/lagoon-web
+        Environment=LAGOON_EMBEDDED=1
+        Environment=SERVER_NAME={{ server_name }}
+        Environment=LAGOON_WEB_NO_TLS=1
+        Environment=LAGOON_WEB_ADDR=127.0.0.1:8080
+        Environment=LAGOON_IRC_BIND=[::]:6667
+        Environment=LAGOON_IRC_ADDR=127.0.0.1:6667
+        Environment=LAGOON_PEERS={{ lagoon_peers }}
+        Environment=LAGOON_DATA_DIR=/var/lib/lagoon
+        Environment=RUST_LOG={{ rust_log }}
+        Environment=LAGOON_FULL_TELEMETRY=1
+        LimitNOFILE=65536
+        Restart=on-failure
+        RestartSec=5
+
+        [Install]
+        WantedBy=multi-user.target
+        UNIT
+      with:
+        sudo: root
+
+    - !shell
+      name: Reload systemd daemon
+      cmd: systemctl daemon-reload
+      with:
+        sudo: root
+
+    - !sd_service
+      name: Enable and start lagoon-web
+      service: lagoon-web
+      enabled: "true"
+      started: "true"
+      restart: "true"
+      with:
+        sudo: root
+
+    - !shell
+      name: Verify lagoon-web is listening
+      cmd: ss -tlnp | grep ':8080'
+      with:
+        sudo: root
