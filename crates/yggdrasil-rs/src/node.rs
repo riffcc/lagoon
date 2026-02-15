@@ -383,7 +383,11 @@ async fn dial_peer(
     let (host, port, _tls) = peer::parse_uri(uri)?;
 
     // TODO: TLS support via tokio-rustls when scheme is "tls://"
-    let addr = format!("{host}:{port}");
+    let addr = if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
     let stream = tokio::net::TcpStream::connect(&addr).await?;
 
     tracing::debug!(uri = %uri, "yggdrasil-rs: connected, starting handshake");
@@ -486,5 +490,46 @@ mod tests {
         // Verify A sees B's key
         let b_peers = node_b.peers().await;
         assert_eq!(b_peers[0].key, Identity::from_seed(&[1; 32]).public_key_bytes);
+    }
+
+    #[tokio::test]
+    async fn two_nodes_peer_over_ipv6() {
+        // Node A listens on IPv6 loopback
+        let node_a = YggNode::new(
+            &test_privkey(3),
+            &[],
+            &["tcp://[::1]:0".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let port_a = node_a.listener_addrs()[0].port();
+        assert_eq!(node_a.peer_count().await, 0);
+
+        // Node B dials Node A via IPv6 URI (tests bracket handling in dial_peer)
+        let node_b = YggNode::new(
+            &test_privkey(4),
+            &[format!("tcp://[::1]:{port_a}")],
+            &[],
+        )
+        .await
+        .unwrap();
+
+        // Wait for connections
+        let mut rx_a = node_a.peer_count_watch();
+        let mut rx_b = node_b.peer_count_watch();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while *rx_a.borrow_and_update() < 1 {
+                rx_a.changed().await.unwrap();
+            }
+            while *rx_b.borrow_and_update() < 1 {
+                rx_b.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("IPv6 peers should connect within 5 seconds");
+
+        assert_eq!(node_a.peer_count().await, 1);
+        assert_eq!(node_b.peer_count().await, 1);
     }
 }
