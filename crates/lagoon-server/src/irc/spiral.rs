@@ -587,11 +587,21 @@ impl SpiralTopology {
         if is_us_a {
             self.our_index = Some(idx_b);
             self.our_coord = Some(coord_b);
+            // Self is tracked in peer_positions too — keep it in sync.
+            if let Some(ref key) = self.our_mesh_key {
+                self.peer_positions
+                    .insert(key.clone(), (idx_b, coord_b));
+            }
             self.peer_positions
                 .insert(peer_b.to_string(), (idx_a, coord_a));
         } else if is_us_b {
             self.our_index = Some(idx_a);
             self.our_coord = Some(coord_a);
+            // Self is tracked in peer_positions too — keep it in sync.
+            if let Some(ref key) = self.our_mesh_key {
+                self.peer_positions
+                    .insert(key.clone(), (idx_a, coord_a));
+            }
             self.peer_positions
                 .insert(peer_a.to_string(), (idx_b, coord_b));
         } else {
