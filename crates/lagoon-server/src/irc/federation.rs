@@ -329,26 +329,37 @@ pub fn dial_missing_spiral_neighbors(
         let port = peer.port;
         let tls = peer.tls;
 
-        // ALWAYS try to add a direct Ygg underlay link for SPIRAL neighbors,
-        // even if we already have a relay. A relay might have been established
-        // via overlay routing (high latency) before the underlay URI was known.
-        // Adding the underlay peer gives Ygg a direct path, improving latency
-        // for ALL traffic to this neighbor — including existing relays.
+        // Add a direct Ygg underlay link for SPIRAL neighbors — but only once.
+        // After the first successful add (or "already configured" error), record
+        // the URI so we don't spam add_peer on every cycle.
         let peer_uri = peer.underlay_uri.as_ref().or(peer.ygg_peer_uri.as_ref());
         if let Some(ref uri) = peer_uri {
-            if let Some(ref ygg) = ygg_node {
-                match ygg.add_peer(uri) {
-                    Ok(()) => info!(
-                        underlay_uri = %uri,
-                        peer = %node_name,
-                        "mesh: added SPIRAL neighbor as Ygg underlay peer"
-                    ),
-                    Err(e) => warn!(
-                        underlay_uri = %uri,
-                        peer = %node_name,
-                        error = %e,
-                        "mesh: failed to add SPIRAL neighbor as Ygg underlay peer"
-                    ),
+            if !st.mesh.ygg_peered_uris.contains(uri.as_str()) {
+                if let Some(ref ygg) = ygg_node {
+                    match ygg.add_peer(uri) {
+                        Ok(()) => {
+                            info!(
+                                underlay_uri = %uri,
+                                peer = %node_name,
+                                "mesh: added SPIRAL neighbor as Ygg underlay peer"
+                            );
+                            st.mesh.ygg_peered_uris.insert(uri.to_string());
+                        }
+                        Err(e) => {
+                            let err_str = e.to_string();
+                            if err_str.contains("already configured") {
+                                // Peer is already there — record it and stop retrying.
+                                st.mesh.ygg_peered_uris.insert(uri.to_string());
+                            } else {
+                                warn!(
+                                    underlay_uri = %uri,
+                                    peer = %node_name,
+                                    error = %e,
+                                    "mesh: failed to add SPIRAL neighbor as Ygg underlay peer"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1247,6 +1258,10 @@ pub fn spawn_event_processor(
                     // Clone vdf_hash before moving into known_peers — needed for merge tiebreak.
                     let remote_vdf_hash_for_merge = vdf_hash.clone();
 
+                    // Direct HELLO = proof of life. Clear any eviction tombstone —
+                    // tombstones only block gossip-based resurrection, not live peers.
+                    st.mesh.eviction_tombstones.remove(&mkey);
+
                     // Track whether this peer was already in our clump before this HELLO.
                     // If they were, no cluster merge needed — same clump.
                     let already_in_clump = st.mesh.known_peers.contains_key(&mkey);
@@ -1303,18 +1318,21 @@ pub fn spawn_event_processor(
                     // APE: dynamically peer with this node's Yggdrasil overlay.
                     if let Some(ref ygg) = st.transport_config.ygg_node {
                         if let Some(uri) = ape_peer_uri(relay_peer_addr, ygg_peer_uri.as_deref()) {
-                            match ygg.add_peer(&uri) {
-                                Ok(()) => info!(
-                                    uri,
-                                    peer_id,
-                                    "APE: added Yggdrasil peer from MESH HELLO"
-                                ),
-                                Err(e) => warn!(
-                                    uri,
-                                    peer_id,
-                                    error = %e,
-                                    "APE: failed to add Yggdrasil peer"
-                                ),
+                            if !st.mesh.ygg_peered_uris.contains(uri.as_str()) {
+                                match ygg.add_peer(&uri) {
+                                    Ok(()) => {
+                                        info!(uri, peer_id, "APE: added Yggdrasil peer from MESH HELLO");
+                                        st.mesh.ygg_peered_uris.insert(uri.clone());
+                                    }
+                                    Err(e) => {
+                                        let err_str = e.to_string();
+                                        if err_str.contains("already configured") {
+                                            st.mesh.ygg_peered_uris.insert(uri.clone());
+                                        } else {
+                                            warn!(uri, peer_id, error = %e, "APE: failed to add Yggdrasil peer");
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1710,6 +1728,11 @@ pub fn spawn_event_processor(
                         if mkey == our_pid {
                             continue;
                         }
+                        // Don't resurrect tombstoned peers — they were evicted
+                        // for VDF non-advancement and gossip is carrying stale info.
+                        if st.mesh.eviction_tombstones.contains_key(&mkey) {
+                            continue;
+                        }
 
                         // Collect SPIRAL positions for batch merge (replaces one-by-one add).
                         if let Some(idx) = peer.spiral_index {
@@ -1790,18 +1813,13 @@ pub fn spawn_event_processor(
                         }
                     }
 
-                    // ── Universal partition merge ─────────────────────────
-                    // When ANY two meshes discover each other (direct HELLO,
-                    // bridge node, transitive gossip — doesn't matter HOW),
-                    // resolve ALL slot conflicts between the incoming peer set
-                    // and our current topology. Per-slot: higher VDF cumulative
-                    // credit wins. If we lose our own slot, reslot.
+                    // ── Gossip topology learning ──────────────────────────
+                    // Fill EMPTY slots from gossip. Gossip informs, HELLO decides.
+                    // Slot CONFLICTS are NOT resolved here — only direct HELLO
+                    // exchanges have matching VDF hash pairs for deterministic
+                    // tiebreaking. Gossip is hearsay; you don't evict a live peer
+                    // because a third party claimed someone else is at their slot.
                     if !incoming_spiral_peers.is_empty() {
-                        let our_pid = st.lens.peer_id.clone();
-                        let mut we_need_reslot = false;
-                        let mut reslot_winner_pid = String::new();
-                        let mut reslot_winner_slot = 0u64;
-
                         for (incoming_pid, incoming_idx) in &incoming_spiral_peers {
                             let slot = incoming_idx.value();
 
@@ -1819,80 +1837,17 @@ pub fn spawn_event_processor(
                                     // Same peer already there. No conflict.
                                 }
                                 Some(ref existing) => {
-                                    // CONFLICT: different peer claims same slot.
-                                    // Compare VDF cumulative credit. Winner keeps slot.
-                                    let incoming_credit = st.mesh.known_peers
-                                        .get(incoming_pid.as_str())
-                                        .and_then(|p| p.vdf_cumulative_credit)
-                                        .unwrap_or(0.0);
-                                    let existing_credit = if *existing == our_pid {
-                                        // Our own VDF credit (not from known_peers).
-                                        st.mesh.vdf_state_rx.as_ref()
-                                            .and_then(|rx| rx.borrow().resonance.as_ref()
-                                                .map(|r| r.cumulative_credit))
-                                            .unwrap_or(0.0)
-                                    } else {
-                                        st.mesh.known_peers.get(existing.as_str())
-                                            .and_then(|p| p.vdf_cumulative_credit)
-                                            .unwrap_or(0.0)
-                                    };
-
-                                    // Higher credit wins. Tiebreak: lower peer_id.
-                                    let incoming_wins = incoming_credit > existing_credit
-                                        || (incoming_credit == existing_credit
-                                            && *incoming_pid < *existing);
-
-                                    if incoming_wins {
-                                        // Incoming peer takes this slot.
-                                        st.mesh.spiral.force_add_peer(
-                                            incoming_pid, *incoming_idx,
-                                        );
-                                        changed = true;
-
-                                        info!(
-                                            slot,
-                                            incoming = %incoming_pid,
-                                            evicted = %existing,
-                                            incoming_credit,
-                                            existing_credit,
-                                            "SPIRAL merge: incoming peer wins slot conflict"
-                                        );
-
-                                        // If WE were evicted, schedule a reslot.
-                                        if *existing == our_pid {
-                                            we_need_reslot = true;
-                                            reslot_winner_pid = incoming_pid.clone();
-                                            reslot_winner_slot = slot;
-                                        }
-                                    } else {
-                                        // Existing occupant keeps slot.
-                                        // Don't add incoming peer at this slot —
-                                        // they'll learn to reslot from our gossip.
-                                        info!(
-                                            slot,
-                                            keeper = %existing,
-                                            challenger = %incoming_pid,
-                                            existing_credit,
-                                            incoming_credit,
-                                            "SPIRAL merge: existing peer keeps slot"
-                                        );
-                                    }
+                                    // Conflict: different peer claims same slot.
+                                    // Do NOT resolve from gossip. Wait for direct HELLO
+                                    // where both sides have matching VDF hash snapshots.
+                                    tracing::debug!(
+                                        slot,
+                                        existing = %existing,
+                                        incoming = %incoming_pid,
+                                        "SPIRAL gossip: slot conflict noted (deferred to HELLO)"
+                                    );
                                 }
                             }
-                        }
-
-                        // If we lost our slot, reslot into the first available hole.
-                        if we_need_reslot {
-                            info!(
-                                winner = %reslot_winner_pid,
-                                winner_slot = reslot_winner_slot,
-                                "SPIRAL merge: we lost our slot, reslotting"
-                            );
-                            reslot_around_winner(
-                                &mut st, &reslot_winner_pid,
-                                reslot_winner_slot, state.clone(),
-                            );
-                            changed = true;
                         }
                     }
 
@@ -5123,12 +5078,16 @@ fn evaluate_spiral_merge(
 /// Returns the list of evicted peer keys.
 fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
     const VDF_DEAD_SECS: u64 = 10;
+    const TOMBSTONE_TTL_SECS: u64 = 120;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let our_pid = st.lens.peer_id.clone();
     let mut evicted = Vec::new();
+
+    // Prune expired tombstones.
+    st.mesh.eviction_tombstones.retain(|_, ts| now.saturating_sub(*ts) < TOMBSTONE_TTL_SECS);
 
     for (peer_mkey, peer) in &st.mesh.known_peers {
         if *peer_mkey == our_pid {
@@ -5145,6 +5104,8 @@ fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
     }
 
     for evicted_key in &evicted {
+        // Tombstone: prevent gossip from resurrecting this peer.
+        st.mesh.eviction_tombstones.insert(evicted_key.clone(), now);
         if let Some(peer) = st.mesh.known_peers.remove(evicted_key) {
             info!(
                 mesh_key = %evicted_key,
@@ -5375,6 +5336,18 @@ fn build_hello_payload(st: &mut super::server::ServerState) -> MeshHelloPayload 
             )
         })
         .unwrap_or((None, None, None, None, None, None));
+
+    // Snapshot our VDF hash for deterministic tiebreaking in PEERS merges.
+    // The PEERS universal merge must NOT read live vdf_state_rx.current_hash
+    // because it changes every VDF tick — causing oscillation when our slot
+    // is challenged. By snapshotting at HELLO build time, the hash used for
+    // tiebreaking matches what we sent in our HELLO (which is what remote
+    // nodes see). Both sides use the same pair of frozen hashes.
+    if let Some(ref hash_hex) = vdf_hash {
+        if let Ok(hash_bytes) = hex::decode(hash_hex) {
+            st.mesh.our_vdf_hash_snapshot = Some(hash_bytes);
+        }
+    }
 
     // Cluster VDF work = our cumulative + all known peers' cumulative.
     // This is the value we SEND in our HELLO — represents our clump's

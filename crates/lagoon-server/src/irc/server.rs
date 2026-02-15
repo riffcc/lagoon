@@ -331,6 +331,21 @@ pub struct MeshState {
     /// The event processor removes entries when it does the real registration
     /// via eager slot registration (concierge_eager_registration theorem).
     pub pending_assigned_slots: HashMap<u64, std::time::Instant>,
+    /// Tombstones for evicted peer_ids — prevents gossip from resurrecting dead peers.
+    /// Key: mesh_key of evicted peer. Value: UNIX timestamp of eviction.
+    /// Gossip handlers skip any peer_id found in this set. TTL: 120s.
+    /// Without this, evict→gossip→re-insert→evict cycles at ~10Hz forever.
+    pub eviction_tombstones: HashMap<String, u64>,
+    /// Snapshot of our own VDF hash, frozen at HELLO build time.
+    /// Used in PEERS universal merge for deterministic tiebreaking.
+    /// Reading live `vdf_state_rx.current_hash` oscillates because it changes
+    /// every VDF tick — the remote side sees our HELLO hash, not our live hash.
+    /// (Lean: snapshot_immutability_required)
+    pub our_vdf_hash_snapshot: Option<Vec<u8>>,
+    /// URIs we've already successfully added as Ygg underlay peers.
+    /// Prevents dial_missing_spiral_neighbors from hammering add_peer()
+    /// on every cycle for already-configured peers.
+    pub ygg_peered_uris: HashSet<String>,
 }
 
 impl MeshState {
@@ -358,6 +373,9 @@ impl MeshState {
             switchboard_ctl: None,
             spiral_settled_at: None,
             pending_assigned_slots: HashMap::new(),
+            eviction_tombstones: HashMap::new(),
+            our_vdf_hash_snapshot: None,
+            ygg_peered_uris: HashSet::new(),
         }
     }
 }
