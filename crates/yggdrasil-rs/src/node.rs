@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::net::Ipv6Addr;
 use std::sync::Arc;
 
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 
@@ -275,6 +275,22 @@ impl YggNode {
         for handle in peers.values() {
             let _ = handle.send(packet_type, payload.to_vec());
         }
+    }
+
+    /// Accept an externally-provided TCP connection as an inbound peer.
+    ///
+    /// The switchboard on port 9443 detects "meta" first bytes and hands the
+    /// stream here. `spawn_session` performs the full meta handshake and enters
+    /// the ironwood read/write loop — identical to what the internal accept_loop does.
+    pub fn accept_inbound(&self, stream: TcpStream, uri: String) {
+        peer::spawn_session(
+            stream,
+            self.identity.clone(),
+            uri,
+            true, // inbound
+            self.event_tx.clone(),
+            self.password.clone(),
+        );
     }
 
     /// Number of currently connected peers.

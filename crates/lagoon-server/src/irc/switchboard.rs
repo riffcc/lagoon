@@ -6,9 +6,9 @@
 //! ## Port 9443 Multiplexer
 //!
 //! The switchboard listens on port 9443 (raw TCP, no HTTP proxy). Protocol
-//! detection by first byte:
+//! detection by first 4 bytes:
 //! - `0x7B` (`{`) → switchboard half-dial (JSON lines)
-//! - Anything else → proxy to internal Ygg listener at `127.0.0.1:19443`
+//! - `meta` → Yggdrasil peer (meta TLV handshake via yggdrasil-rs)
 //!
 //! ## Self-Connection Avoidance
 //!
@@ -49,10 +49,6 @@ use super::federation::{
 use super::server::ServerState;
 use super::wire;
 use super::wire::{MeshMessage, SwitchboardMessage};
-
-/// Internal Ygg listener address — the switchboard proxies non-switchboard
-/// traffic here.
-const YGG_INTERNAL_PORT: u16 = 19443;
 
 /// Control messages for the switchboard listener.
 ///
@@ -154,37 +150,38 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     state: Arc<RwLock<ServerState>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Peek at first byte for protocol detection.
-    let mut buf = [0u8; 1];
+    // Peek at first bytes for protocol detection.
+    let mut buf = [0u8; 4];
     let n = stream.peek(&mut buf).await?;
     if n == 0 {
         return Err("switchboard: empty peek".into());
     }
 
-    match buf[0] {
-        b'{' => {
-            // JSON → switchboard half-dial.
-            debug!(%peer_addr, "switchboard: half-dial detected");
-            half_dial(stream, peer_addr, state).await
+    if buf[0] == b'{' {
+        // JSON → switchboard half-dial.
+        debug!(%peer_addr, "switchboard: half-dial detected");
+        half_dial(stream, peer_addr, state).await
+    } else if n >= 4 && &buf[..4] == b"meta" {
+        // Yggdrasil meta handshake → hand to yggdrasil-rs peer session.
+        debug!(%peer_addr, "switchboard: Ygg meta handshake detected");
+        let ygg_node = {
+            let st = state.read().await;
+            st.transport_config.ygg_node.clone()
+        };
+        match ygg_node {
+            Some(node) => {
+                let uri = format!("tcp://[{}]:{}", peer_addr.ip(), peer_addr.port());
+                node.accept_inbound(stream, uri);
+                Ok(())
+            }
+            None => Err("switchboard: Ygg peer detected but no Ygg node running".into()),
         }
-        _ => {
-            // Anything else → proxy to internal Ygg listener.
-            debug!(%peer_addr, "switchboard: proxying to Ygg");
-            ygg_proxy(stream).await
-        }
+    } else {
+        Err(format!(
+            "switchboard: unknown protocol from {peer_addr} (first bytes: {:02x?})",
+            &buf[..n]
+        ).into())
     }
-}
-
-/// Proxy a non-switchboard connection to the internal Ygg listener.
-///
-/// Bidirectional byte forwarding to `127.0.0.1:19443`.
-async fn ygg_proxy(
-    mut client: TcpStream,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ygg_addr: SocketAddr = ([127, 0, 0, 1], YGG_INTERNAL_PORT).into();
-    let mut ygg = TcpStream::connect(ygg_addr).await?;
-    tokio::io::copy_bidirectional(&mut client, &mut ygg).await?;
-    Ok(())
 }
 
 /// Run the responder side of the half-dial protocol (client sends first).

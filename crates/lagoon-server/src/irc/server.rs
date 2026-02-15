@@ -1146,9 +1146,9 @@ async fn init_yggdrasil(lens: &super::lens::LensIdentity) -> Option<yggdrasil_rs
     private_key[..32].copy_from_slice(&lens.secret_seed);
     private_key[32..].copy_from_slice(signing_key.verifying_key().as_bytes());
 
-    // Ygg listens on internal-only port. The switchboard listener on [::]:9443
-    // handles external traffic and proxies non-switchboard bytes to this address.
-    let listen = vec!["tcp://127.0.0.1:19443".to_string()];
+    // No listener — the switchboard on [::]:9443 detects "meta" first bytes
+    // and hands Ygg connections directly via accept_inbound().
+    let listen: Vec<String> = vec![];
 
     // Always start with empty peers — APE populates from MESH HELLO.
     let empty_peers: Vec<String> = vec![];
