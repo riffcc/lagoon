@@ -8,7 +8,7 @@
 //! - **meta**: "meta" TLV handshake protocol (peer authentication)
 //! - **wire**: Ironwood uvarint framing and packet types
 //! - **peer**: TCP peer connection management (sessions, keepalive)
-//! - **node**: Public API — drop-in replacement for yggbridge's `YggNode`
+//! - **node**: Public API — `YggNode` manages peers and provides identity
 
 pub mod crypto;
 pub mod error;

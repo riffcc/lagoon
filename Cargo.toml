@@ -5,7 +5,7 @@ members = [
     "crates/lagoon-web",
     "crates/lagoon-vdf",
     "crates/anymesh",
-    "crates/yggbridge",
+
     "crates/yggdrasil-rs",
     "crates/ferrouswood",
 ]
@@ -89,7 +89,6 @@ libc = "0.2"
 anymesh = { path = "crates/anymesh" }
 
 # Yggdrasil
-yggbridge = { path = "crates/yggbridge" }
 yggdrasil-rs = { path = "crates/yggdrasil-rs" }
 ferrouswood = { path = "crates/ferrouswood" }
 

@@ -61,8 +61,8 @@ thiserror = { workspace = true }
 # IRC server (embedded)
 lagoon-server = { path = "../lagoon-server" }
 
-# Yggdrasil overlay (for accepting ws:// connections on the mesh)
-yggbridge = { workspace = true }
+# Yggdrasil overlay
+yggdrasil-rs = { workspace = true }
 
 # Hex encoding
 hex = { workspace = true }

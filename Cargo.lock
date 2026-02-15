@@ -1160,7 +1160,7 @@ dependencies = [
  "uuid",
  "webauthn-rs",
  "webauthn-rs-proto",
- "yggbridge",
+ "yggdrasil-rs",
 ]
 
 [[package]]
@@ -2736,20 +2736,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "yggbridge"
-version = "0.1.0"
-dependencies = [
- "ed25519-dalek",
- "hex",
- "rand 0.9.2",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "yggdrasil-rs"
 version = "0.1.0"
 dependencies = [
@@ -2761,7 +2747,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "yggbridge",
 ]
 
 [[package]]

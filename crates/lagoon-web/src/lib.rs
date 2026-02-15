@@ -112,29 +112,14 @@ pub async fn run_with_irc() -> Result<(), Box<dyn std::error::Error + Send + Syn
     let (irc_state, topology_rx, _irc_handles, _vdf_shutdown) =
         lagoon_server::irc::server::start(&addrs).await?;
 
-    // Extract our peer_id for transparent self-rejection, and Ygg node
-    // for overlay web gateway listener.
-    let (our_peer_id, ygg_node) = {
+    // Extract our peer_id for transparent self-rejection.
+    let our_peer_id = {
         let st = irc_state.read().await;
-        (st.lens.peer_id.clone(), st.transport_config.ygg_node.clone())
+        st.lens.peer_id.clone()
     };
 
     let state = AppState::new()?.with_irc(irc_state, topology_rx);
     let app = build_router(state);
-
-    // Spawn Ygg overlay web gateway — ws:// federation over the mesh.
-    // Other nodes dial ws://[our_ygg_addr]:8080/api/mesh/ws through
-    // the overlay. Ygg encrypts the transport, so no TLS needed.
-    if let Some(ref node) = ygg_node {
-        match node.listen(8080) {
-            Ok(listener) => {
-                info!("web gateway listening on Yggdrasil overlay port 8080");
-                let app_clone = app.clone();
-                tokio::spawn(ygg_serve(listener, app_clone));
-            }
-            Err(e) => tracing::warn!("failed to listen on Ygg overlay port 8080: {e}"),
-        }
-    }
 
     let use_tls = std::env::var("LAGOON_WEB_TLS").is_ok();
 
@@ -274,38 +259,3 @@ async fn serve_tls(app: Router) -> Result<(), Box<dyn std::error::Error + Send +
     }
 }
 
-/// Serve the web gateway over Yggdrasil overlay connections.
-///
-/// Accepts connections from the embedded Ygg node's listener (port 8080) and
-/// serves the full Axum router — including `/api/mesh/ws` for native mesh
-/// federation. This lets other nodes connect via `ws://[ygg_addr]:8080/...`
-/// through the encrypted overlay, with no TLS needed (Ygg encrypts).
-async fn ygg_serve(listener: yggbridge::YggListener, app: Router) {
-    loop {
-        let (stream, remote_addr) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("ygg overlay accept error: {e}");
-                continue;
-            }
-        };
-
-        let app = app.clone();
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-
-            let service = hyper::service::service_fn(
-                move |req: hyper::Request<hyper::body::Incoming>| {
-                    let mut app = app.clone();
-                    async move { app.call(req.map(axum::body::Body::new)).await }
-                },
-            );
-
-            let builder =
-                hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-            if let Err(e) = builder.serve_connection_with_upgrades(io, service).await {
-                debug!("ygg overlay connection error from {remote_addr}: {e}");
-            }
-        });
-    }
-}

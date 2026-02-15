@@ -196,7 +196,7 @@ pub struct ResonanceReport {
 /// Runtime health metrics for diagnosing leaks.
 #[derive(Serialize)]
 pub struct RuntimeReport {
-    /// Number of goroutines in the embedded Go runtime (yggbridge).
+    /// Reserved (was: goroutine count from Go yggbridge, now pure Rust).
     pub go_goroutines: i32,
     /// Number of relay tasks currently in-flight (spawned, not yet HELLO'd).
     pub pending_dials: usize,
@@ -385,7 +385,7 @@ pub async fn get_debug_mesh(
 
     // ── Runtime health ──
     let runtime = RuntimeReport {
-        go_goroutines: yggbridge::goroutine_count(),
+        go_goroutines: 0, // No Go runtime — yggdrasil-rs is pure Rust
         pending_dials: st.federation.pending_dials.len(),
         active_relays: st.federation.relays.len(),
         active_dial_count: st.federation.active_dial_count,
@@ -397,17 +397,18 @@ pub async fn get_debug_mesh(
 
     let ygg_peers = if let Some(ref node) = ygg_node {
         node.peers()
+            .await
             .into_iter()
             .map(|p| YggPeerReport {
-                address: String::new(), // Ygg address derived from key, not in PeerInfo
+                address: p.addr.to_string(),
                 remote: p.uri,
-                key: p.key,
-                up: p.up,
+                key: hex::encode(p.key),
+                up: true, // Connected peers are always up in yggdrasil-rs
                 inbound: p.inbound,
-                latency_ms: p.latency_ms,
-                bytes_sent: p.tx_bytes,
-                bytes_recvd: p.rx_bytes,
-                uptime: p.uptime,
+                latency_ms: 0.0,
+                bytes_sent: 0,
+                bytes_recvd: 0,
+                uptime: 0.0,
             })
             .collect()
     } else {

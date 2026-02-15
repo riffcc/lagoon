@@ -1,7 +1,7 @@
 //! Yggdrasil node — manages peer connections and provides the public API.
 //!
-//! Compatible with the yggbridge `YggNode` API for smooth migration:
-//!   - `new(private_key, peers, listen_addrs)` — same signature
+//! Pure Rust Yggdrasil node — manages peer connections and provides the public API.
+//!   - `new(private_key, peers, listen_addrs)` — start a node
 //!   - `address()`, `public_key_hex()` — synchronous identity queries
 //!   - `add_peer()`, `remove_peer()` — peer management
 //!   - `peers()` — list connected peers
@@ -21,7 +21,7 @@ use crate::wire::PacketType;
 
 /// A pure-Rust Yggdrasil node.
 ///
-/// Drop-in replacement for yggbridge's `YggNode`. No Go. No FFI. No goroutines.
+/// Pure Rust Yggdrasil node. No Go. No FFI. No goroutines.
 pub struct YggNode {
     identity: Arc<Identity>,
     peers: Arc<RwLock<HashMap<[u8; 32], PeerHandle>>>,
@@ -78,7 +78,7 @@ impl NodeBuilder {
 impl YggNode {
     /// Create and start a new Yggdrasil node.
     ///
-    /// API-compatible with yggbridge's `YggNode::new`.
+    /// Create and start a node with the given identity and initial peers.
     pub async fn new(
         private_key: &[u8; 64],
         peers: &[String],
