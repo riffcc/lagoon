@@ -150,6 +150,12 @@ async fn handle_connection(
     peer_addr: SocketAddr,
     state: Arc<RwLock<ServerState>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Log local_addr — diagnostic for TCP_REPAIR viability.
+    // If this shows the shared anycast IP (e.g. 2a09:8280:1::d2:e42f:0),
+    // TCP_REPAIR socket migration across Fly machines is possible.
+    let local_addr = stream.local_addr().ok();
+    info!(%peer_addr, ?local_addr, "switchboard: connection local_addr diagnostic");
+
     // Peek at first bytes for protocol detection.
     let mut buf = [0u8; 4];
     let n = stream.peek(&mut buf).await?;
@@ -245,12 +251,44 @@ async fn half_dial(
     );
 
     // Step 3: Resolve target.
+    // Strip "ygg:" prefix — Ygg splice requests use the same resolution
+    // but skip the mesh half-dial with the target (raw TCP splice instead).
+    let (is_ygg_splice, resolve_want) = if let Some(peer_id) = want.strip_prefix("ygg:") {
+        (true, format!("peer:{peer_id}"))
+    } else {
+        (false, want.clone())
+    };
+
     let resolution = {
         let st = state.read().await;
-        resolve_target(&want, &our_peer_id, &client_peer_id, &st)
+        resolve_target(&resolve_want, &our_peer_id, &client_peer_id, &st)
     };
 
     match resolution {
+        ResolveResult::IsSelf if is_ygg_splice => {
+            // We ARE the target and client wants Ygg peering.
+            // Send PeerReady, reunite the stream, hand to Ygg node.
+            let ready = SwitchboardMessage::PeerReady {
+                peer_id: our_peer_id.clone(),
+            };
+            writer.write_all(ready.to_line()?.as_bytes()).await?;
+
+            // Reunite read+write halves into TcpStream for Ygg handshake.
+            let inner_read = reader.into_inner();
+            let stream = inner_read.reunite(writer)
+                .map_err(|e| format!("switchboard: stream reunite failed: {e}"))?;
+
+            let st = state.read().await;
+            if let Some(ref ygg) = st.transport_config.ygg_node {
+                let uri = format!("switchboard://{}", peer_addr);
+                ygg.accept_inbound(stream, uri);
+                info!(%peer_addr, client_peer_id,
+                    "switchboard: Ygg peering accepted (self)");
+            } else {
+                warn!(%peer_addr, "switchboard: Ygg splice requested but no Ygg node");
+            }
+            Ok(())
+        }
         ResolveResult::IsSelf => {
             // We ARE the target. Send PeerReady, then enter raw mesh session.
             let ready = SwitchboardMessage::PeerReady {
@@ -267,6 +305,70 @@ async fn half_dial(
             // Enter raw TCP mesh handler (JSON lines, no WebSocket).
             raw_mesh_handler(reader, writer, state, peer_addr).await?;
             Ok(())
+        }
+        ResolveResult::Redirect { peer_id, underlay_addr } if is_ygg_splice => {
+            // Ygg splice to remote: raw TCP to target:9443, no half-dial.
+            // Target's switchboard byte detector sees 'meta' first bytes from
+            // the client and routes directly to ygg_node.accept_inbound().
+            if let Some(ref underlay) = underlay_addr {
+                let target_host = super::transport::extract_host_from_uri(underlay);
+                let target_addr = if target_host.contains(':') {
+                    format!("[{}]:{}", target_host, super::transport::SWITCHBOARD_PORT)
+                } else {
+                    format!("{}:{}", target_host, super::transport::SWITCHBOARD_PORT)
+                };
+
+                info!(
+                    %peer_addr, client_peer_id, target = %peer_id, %target_addr,
+                    "switchboard: Ygg splice to target via raw internal connection"
+                );
+
+                let target_stream = match TcpStream::connect(&target_addr).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        warn!(%target_addr, error = %e,
+                            "switchboard: Ygg splice internal dial failed");
+                        return Err(format!(
+                            "switchboard: Ygg splice dial to {target_addr} failed: {e}"
+                        ).into());
+                    }
+                };
+                let _ = target_stream.set_nodelay(true);
+
+                // Tell client we're ready — they'll send meta bytes next.
+                let ready = SwitchboardMessage::PeerReady {
+                    peer_id: peer_id.clone(),
+                };
+                writer.write_all(ready.to_line()?.as_bytes()).await?;
+
+                info!(%peer_addr, client_peer_id,
+                    "switchboard: Ygg splice established — entering bidirectional copy");
+
+                // Bidirectional byte copy (client ↔ target raw TCP).
+                let (t_read, mut t_write) = target_stream.into_split();
+                let mut t_reader = BufReader::new(t_read);
+                let mut client_reader = reader;
+                let mut client_writer = writer;
+                tokio::select! {
+                    r = tokio::io::copy(&mut client_reader, &mut t_write) => {
+                        if let Err(e) = r {
+                            debug!(error = %e, "switchboard: Ygg splice client→target ended");
+                        }
+                    }
+                    r = tokio::io::copy(&mut t_reader, &mut client_writer) => {
+                        if let Err(e) = r {
+                            debug!(error = %e, "switchboard: Ygg splice target→client ended");
+                        }
+                    }
+                }
+
+                info!(%peer_addr, "switchboard: Ygg splice complete");
+                Ok(())
+            } else {
+                Err(format!(
+                    "switchboard: Ygg splice target {peer_id} has no underlay address"
+                ).into())
+            }
         }
         ResolveResult::Redirect { peer_id, underlay_addr } => {
             if let Some(ref underlay) = underlay_addr {

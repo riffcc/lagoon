@@ -315,6 +315,22 @@ impl YggNode {
         );
     }
 
+    /// Dial a peer using a pre-connected TCP stream (outbound).
+    ///
+    /// Used for Ygg-over-switchboard: the caller completes the switchboard
+    /// half-dial to get a stream that's L4-spliced to the target's port 9443,
+    /// then hands the stream here for the Ygg meta handshake.
+    pub fn dial_via_stream(&self, stream: TcpStream, uri: String) {
+        peer::spawn_session(
+            stream,
+            self.identity.clone(),
+            uri,
+            false, // outbound
+            self.event_tx.clone(),
+            self.password.clone(),
+        );
+    }
+
     /// Number of currently connected peers.
     pub async fn peer_count(&self) -> usize {
         self.peers.read().await.len()
