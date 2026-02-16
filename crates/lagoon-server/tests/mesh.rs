@@ -899,6 +899,7 @@ fn make_hello() -> HelloPayload {
         assigned_slot: None,
         cluster_chain_value: None,
         cluster_chain_round: None,
+        cluster_chain_work: None,
         cluster_round_seed: None,
     }
 }
@@ -2159,6 +2160,7 @@ async fn underlay_uri_stored_from_hello_relay_peer_addr() {
         assigned_slot: None,
         cluster_chain_value: None,
         cluster_chain_round: None,
+        cluster_chain_work: None,
         cluster_round_seed: None,
     };
     let msg = MeshMessage::Hello(hello);
@@ -2903,7 +2905,7 @@ fn cluster_chain_merge_protocol() {
     // In real protocol: loser first adopts winner's old value from HELLO,
     // then on next HELLO sees winner's merged value and adopts again.
     // Here we test the final state: loser has winner's merged value.
-    beta.adopt(alpha.value, alpha.round);
+    beta.adopt(alpha.value, alpha.round, alpha.cumulative_work);
 
     // Post-merge: both chains match.
     assert_eq!(alpha.compare(Some(&beta.value)), ChainComparison::SameCluster);
@@ -2940,7 +2942,7 @@ fn cluster_chain_fresh_join_adoption() {
 
     // Simulate adoption: fresh node creates genesis then adopts.
     let mut joiner = ClusterChain::genesis(established.value, established.round, 1);
-    joiner.adopt(established.value, established.round);
+    joiner.adopt(established.value, established.round, established.cumulative_work);
 
     // Now they're the same cluster.
     assert_eq!(established.compare(Some(&joiner.value)), ChainComparison::SameCluster);
@@ -3021,7 +3023,7 @@ fn cluster_chain_cascading_merge() {
     let topo1 = blake3::hash(b"alpha-beta-topo").as_bytes().to_owned();
     let beta_value = beta.value;
     alpha.update_history(&beta_value, beta.round, &topo1, 40, 5);
-    beta.adopt(alpha.value, alpha.round);
+    beta.adopt(alpha.value, alpha.round, alpha.cumulative_work);
 
     assert_eq!(alpha.compare(Some(&beta.value)), ChainComparison::SameCluster);
 
@@ -3029,8 +3031,8 @@ fn cluster_chain_cascading_merge() {
     let topo2 = blake3::hash(b"alpha-beta-gamma-topo").as_bytes().to_owned();
     let gamma_value = gamma.value;
     alpha.update_history(&gamma_value, gamma.round, &topo2, 50, 6);
-    gamma.adopt(alpha.value, alpha.round);
-    beta.adopt(alpha.value, alpha.round);
+    gamma.adopt(alpha.value, alpha.round, alpha.cumulative_work);
+    beta.adopt(alpha.value, alpha.round, alpha.cumulative_work);
 
     // All three chains now match.
     assert_eq!(alpha.compare(Some(&beta.value)), ChainComparison::SameCluster);
@@ -3054,5 +3056,131 @@ fn cluster_chain_cascading_merge() {
          ===============================================",
         alpha.summary().merge_count,
     );
+}
+
+/// F-VDF SPORE cascade: merge happens once at contact point, army members
+/// adopt via broadcast (higher work → adopt, no re-merge, no double-counting).
+#[test]
+fn fvdf_spore_cascade_no_double_counting() {
+    // Cluster Alpha: 3 nodes, work = 50 each (they've been advancing together).
+    let seed_a = blake3::hash(b"alpha-cluster").as_bytes().to_owned();
+    let mut alpha_scout = ClusterChain::genesis(seed_a, 0, 3);
+    let mut alpha_soldier1 = ClusterChain::genesis(seed_a, 0, 3);
+    let mut alpha_soldier2 = ClusterChain::genesis(seed_a, 0, 3);
+
+    // Advance all Alpha nodes in lockstep (simulating Universal Clock).
+    for i in 1..=50 {
+        let round_seed = test_seed(i * 100);
+        alpha_scout.advance(&round_seed, i * 100, 3);
+        alpha_soldier1.advance(&round_seed, i * 100, 3);
+        alpha_soldier2.advance(&round_seed, i * 100, 3);
+    }
+    assert_eq!(alpha_scout.cumulative_work, 50);
+    assert_eq!(alpha_scout.value, alpha_soldier1.value);
+    assert_eq!(alpha_scout.value, alpha_soldier2.value);
+
+    // Cluster Beta: 2 nodes, work = 30 each.
+    let seed_b = blake3::hash(b"beta-cluster").as_bytes().to_owned();
+    let mut beta_scout = ClusterChain::genesis(seed_b, 0, 2);
+    let mut beta_soldier = ClusterChain::genesis(seed_b, 0, 2);
+
+    for i in 1..=30 {
+        let round_seed = test_seed(i * 100);
+        beta_scout.advance(&round_seed, i * 100, 2);
+        beta_soldier.advance(&round_seed, i * 100, 2);
+    }
+    assert_eq!(beta_scout.cumulative_work, 30);
+
+    // CONTACT: alpha_scout meets beta_scout.
+    // Both do symmetric merge: blake3(sort(A, B)), work = 50 + 30 = 80.
+    let pre_alpha_value = alpha_scout.value;
+    let pre_beta_value = beta_scout.value;
+    let alpha_work_before = alpha_scout.cumulative_work;
+    let beta_work_before = beta_scout.cumulative_work;
+
+    // Alpha scout merges.
+    alpha_scout.fungible_adopt(
+        &pre_beta_value, beta_scout.round, beta_scout.cumulative_work, 5000, 5);
+    // Beta scout merges (uses alpha's PRE-merge work, not post-merge).
+    beta_scout.fungible_adopt(
+        &pre_alpha_value, 50, alpha_work_before, 5000, 5);
+
+    // Both scouts get the SAME merged value (commutative).
+    assert_eq!(alpha_scout.value, beta_scout.value);
+    // Combined work = 50 + 30 = 80.
+    assert_eq!(alpha_scout.cumulative_work, alpha_work_before + beta_work_before);
+    assert_eq!(beta_scout.cumulative_work, alpha_work_before + beta_work_before);
+
+    let merged_value = alpha_scout.value;
+    let merged_work = alpha_scout.cumulative_work;
+    let merged_round = alpha_scout.round;
+
+    // SPORE CASCADE: scouts broadcast ChainUpdate to their armies.
+    // Army members see higher work → ADOPT (not re-merge).
+    // This is the key: adopt() sets value/work/round directly.
+    let adopted_1 = alpha_soldier1.adopt(merged_value, merged_round, merged_work);
+    let adopted_2 = alpha_soldier2.adopt(merged_value, merged_round, merged_work);
+    let adopted_beta = beta_soldier.adopt(merged_value, merged_round, merged_work);
+
+    assert!(adopted_1, "soldier1 should adopt (higher work)");
+    assert!(adopted_2, "soldier2 should adopt (higher work)");
+    assert!(adopted_beta, "beta soldier should adopt (higher work)");
+
+    // ALL nodes now have the SAME value and work.
+    assert_eq!(alpha_soldier1.value, merged_value);
+    assert_eq!(alpha_soldier2.value, merged_value);
+    assert_eq!(beta_soldier.value, merged_value);
+
+    // Work is EXACTLY 80 everywhere — no double-counting.
+    assert_eq!(alpha_soldier1.cumulative_work, 80, "no double-counting");
+    assert_eq!(alpha_soldier2.cumulative_work, 80, "no double-counting");
+    assert_eq!(beta_soldier.cumulative_work, 80, "no double-counting");
+
+    // All nodes now advance in lockstep (same epoch, same genesis).
+    let next_seed = test_seed(999);
+    alpha_scout.advance(&next_seed, 5100, 5);
+    alpha_soldier1.advance(&next_seed, 5100, 5);
+    alpha_soldier2.advance(&next_seed, 5100, 5);
+    beta_scout.advance(&next_seed, 5100, 5);
+    beta_soldier.advance(&next_seed, 5100, 5);
+
+    assert_eq!(alpha_scout.value, alpha_soldier1.value);
+    assert_eq!(alpha_scout.value, alpha_soldier2.value);
+    assert_eq!(alpha_scout.value, beta_scout.value);
+    assert_eq!(alpha_scout.value, beta_soldier.value);
+
+    eprintln!(
+        "\n=== F-VDF SPORE CASCADE: VERIFIED ===\n\
+         Alpha army: 3 nodes, work = 50\n\
+         Beta army: 2 nodes, work = 30\n\
+         Contact: scout A + scout B → merged, work = 80\n\
+         Cascade: army members adopt via broadcast → work = 80 (no double-counting)\n\
+         Post-merge advance: all 5 nodes in lockstep ✓\n\
+         =====================================",
+    );
+}
+
+/// ChainUpdate wire format round-trip.
+#[test]
+fn chain_update_wire_round_trip() {
+    use lagoon_server::irc::wire::MeshMessage;
+
+    let msg = MeshMessage::ChainUpdate {
+        value: "aa".repeat(32),
+        cumulative_work: 42000,
+        round: 100,
+        proof: Some("dGVzdA==".into()),
+    };
+    let json = msg.to_json().unwrap();
+    let decoded = MeshMessage::from_json(&json).unwrap();
+    match decoded {
+        MeshMessage::ChainUpdate { value, cumulative_work, round, proof } => {
+            assert_eq!(value, "aa".repeat(32));
+            assert_eq!(cumulative_work, 42000);
+            assert_eq!(round, 100);
+            assert_eq!(proof.as_deref(), Some("dGVzdA=="));
+        }
+        other => panic!("expected ChainUpdate, got {other:?}"),
+    }
 }
 

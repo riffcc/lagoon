@@ -732,6 +732,7 @@ impl ServerState {
                     super::cluster_chain::ChainSummary {
                         chain_value_hex: v.clone(),
                         round: peer_info.cluster_chain_round.unwrap_or(0),
+                        cumulative_work: 0,
                         merge_count: 0,
                         split_count: 0,
                     }
@@ -3395,6 +3396,8 @@ async fn handle_command(
                             #[serde(default)]
                             cluster_chain_round: Option<u64>,
                             #[serde(default)]
+                            cluster_chain_work: Option<u64>,
+                            #[serde(default)]
                             cluster_round_seed: Option<String>,
                         }
                         if let Ok(hello) = serde_json::from_str::<HelloPayload>(json) {
@@ -3438,6 +3441,7 @@ async fn handle_command(
                                     assigned_slot: hello.assigned_slot,
                                     cluster_chain_value: hello.cluster_chain_value,
                                     cluster_chain_round: hello.cluster_chain_round,
+                                    cluster_chain_work: hello.cluster_chain_work,
                                     cluster_round_seed: hello.cluster_round_seed,
                                 },
                             );

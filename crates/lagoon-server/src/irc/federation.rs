@@ -140,6 +140,7 @@ pub fn dispatch_mesh_message(
                 assigned_slot: hello.assigned_slot,
                 cluster_chain_value: hello.cluster_chain_value.clone(),
                 cluster_chain_round: hello.cluster_chain_round,
+                cluster_chain_work: hello.cluster_chain_work,
                 cluster_round_seed: hello.cluster_round_seed.clone(),
             });
             Some(hello)
@@ -286,6 +287,16 @@ pub fn dispatch_mesh_message(
                 remote_host: remote_host.to_string(),
                 migration,
                 client_peer_id,
+            });
+            None
+        }
+        MeshMessage::ChainUpdate { value, cumulative_work, round, proof } => {
+            let _ = event_tx.send(RelayEvent::ChainUpdate {
+                remote_host: remote_host.to_string(),
+                value,
+                cumulative_work,
+                round,
+                proof,
             });
             None
         }
@@ -762,6 +773,8 @@ pub enum RelayEvent {
         cluster_chain_value: Option<String>,
         /// Cluster identity chain round number.
         cluster_chain_round: Option<u64>,
+        /// Cluster chain cumulative work (advance steps across all epochs).
+        cluster_chain_work: Option<u64>,
         /// Cluster round seed (hex-encoded [u8; 32]) from the FVDF chain.
         cluster_round_seed: Option<String>,
     },
@@ -894,6 +907,19 @@ pub enum RelayEvent {
         remote_host: String,
         /// Base64-encoded bincode `CvdfServiceMessage`.
         data: String,
+    },
+    /// Received cluster chain update from a peer (SPORE cascade after merge).
+    /// If their cumulative_work > ours, adopt their chain state.
+    ChainUpdate {
+        remote_host: String,
+        /// Chain value as hex string.
+        value: String,
+        /// Cumulative work across all epochs.
+        cumulative_work: u64,
+        /// Current round number.
+        round: u64,
+        /// Base64-bincode-encoded `ClusterChainProof` (optional during rollout).
+        proof: Option<String>,
     },
 }
 
@@ -1321,6 +1347,7 @@ pub fn spawn_event_processor(
                     assigned_slot,
                     cluster_chain_value,
                     cluster_chain_round,
+                    cluster_chain_work,
                     cluster_round_seed: _,
                 } => {
                     // Backfill node_name/site_name for old peers that don't send them.
@@ -1571,23 +1598,33 @@ pub fn spawn_event_processor(
                             if let Ok(bytes) = hex::decode(hex_val) {
                                 if let Ok(value) = <[u8; 32]>::try_from(bytes.as_slice()) {
                                     let round = cluster_chain_round.unwrap_or(0);
+                                    let work = cluster_chain_work.unwrap_or(0);
                                     let mut cc = super::cluster_chain::ClusterChain::genesis(value, round, 1);
-                                    cc.adopt(value, round);
+                                    cc.adopt(value, round, work);
                                     st.mesh.cluster_chain = Some(cc);
-                                    info!(chain = &hex_val[..8.min(hex_val.len())], "cluster chain: adopted from first peer (fresh join)");
+                                    info!(chain = &hex_val[..8.min(hex_val.len())], work, "cluster chain: adopted from first peer (fresh join)");
+                                    broadcast_chain_update(&st);
                                 }
                             }
                         }
                     }
 
-                    // F-VDF fungible merge: both sides compute max(our_chain, their_chain).
-                    // The value IS the winner — no work comparison, no losers.
-                    // Work is additive: cluster_vdf_work naturally sums as peers
-                    // discover each other via SPORE gossip post-merge.
+                    // F-VDF epoch reset: both sides compute blake3(sort(A, B)).
+                    // The merged value becomes the new epoch genesis — both nodes
+                    // restart their chain from this seed and advance in lockstep.
+                    // Work is additive: cumulative_work sums across merges.
                     //
                     // Extract context before mutable borrow on cluster_chain.
-                    let merge_ts = st.mesh.vdf_state_rx.as_ref()
-                        .map(|rx| rx.borrow().total_steps).unwrap_or(0);
+                    // Use QUANTIZED height as timestamp — this gates the advance
+                    // so neither node re-advances until the NEXT quantum boundary.
+                    // Both nodes are within one quantum of each other (they just
+                    // exchanged HELLO), so they gate on the same next boundary.
+                    use super::cluster_chain::ROUND_QUANTUM;
+                    let merge_quantum = st.mesh.vdf_state_rx.as_ref()
+                        .map(|rx| {
+                            let total = rx.borrow().total_steps;
+                            (total / ROUND_QUANTUM) * ROUND_QUANTUM
+                        }).unwrap_or(0);
                     let merge_size = (st.mesh.known_peers.len() + 1) as u32;
                     let remote_chain_bytes = cluster_chain_value.as_ref().and_then(|hex_str| {
                         hex::decode(hex_str).ok().and_then(|bytes| {
@@ -1604,16 +1641,25 @@ pub fn spawn_event_processor(
                             }
                             super::cluster_chain::ChainComparison::DifferentCluster => {
                                 if let Some(remote_value) = remote_chain_bytes {
+                                    let their_work = cluster_chain_work.unwrap_or(0);
                                     let their_round = cluster_chain_round.unwrap_or(0);
-                                    let changed = cc.fungible_adopt(
-                                        &remote_value, their_round, merge_ts, merge_size);
-                                    if changed {
-                                        info!(adopted = %cc.value_short(),
-                                              "cluster chain: F-VDF merge — adopted combined identity");
-                                    } else {
-                                        info!(chain = %cc.value_short(),
-                                              "cluster chain: F-VDF merge — we carry the combined identity");
-                                    }
+
+                                    // ALWAYS symmetric merge. ALWAYS additive work.
+                                    // blake3(sort(A,B)), work = ours + theirs.
+                                    // Both sides compute the same merged value.
+                                    // Combined work is strictly higher than either
+                                    // input → cascades through both armies via SPORE.
+                                    let pre_work = cc.cumulative_work;
+                                    cc.fungible_adopt(
+                                        &remote_value, their_round, their_work,
+                                        merge_quantum, merge_size);
+                                    info!(merged = %cc.value_short(),
+                                          pre_work, their_work,
+                                          combined_work = cc.cumulative_work,
+                                          "cluster chain: symmetric merge — additive work, new epoch");
+                                    // SPORE cascade: broadcast to all peers so
+                                    // army members adopt without re-merging.
+                                    broadcast_chain_update(&st);
                                 }
                             }
                             super::cluster_chain::ChainComparison::FreshJoin => {
@@ -3235,6 +3281,81 @@ pub fn spawn_event_processor(
                     }
                 }
 
+                RelayEvent::ChainUpdate { remote_host, value, cumulative_work, round, proof } => {
+                    // SPORE cascade: a peer merged and is broadcasting the result.
+                    // If their work > ours, adopt — no re-merge, no double-counting.
+                    //
+                    // PROOF VERIFICATION: if a proof is present, verify it before
+                    // adopting. Without a valid proof, reject the update — the
+                    // cumulative_work claim is just a number someone made up.
+                    let chain_bytes = hex::decode(&value).ok().and_then(|b| {
+                        <[u8; 32]>::try_from(b.as_slice()).ok()
+                    });
+                    if let Some(new_value) = chain_bytes {
+                        // Verify proof if present.
+                        let proof_valid = if let Some(ref proof_b64) = proof {
+                            use base64::Engine as _;
+                            let decoded = base64::engine::general_purpose::STANDARD
+                                .decode(proof_b64)
+                                .ok()
+                                .and_then(|bytes| bincode::deserialize::<
+                                    super::cluster_chain::ClusterChainProof
+                                >(&bytes).ok());
+                            match decoded {
+                                Some(p) => {
+                                    let ok = p.verify() && p.tip == new_value
+                                        && p.cumulative_work == cumulative_work;
+                                    if !ok {
+                                        warn!(
+                                            from = %remote_host,
+                                            "cluster chain: REJECTED ChainUpdate — proof verification failed"
+                                        );
+                                    }
+                                    ok
+                                }
+                                None => {
+                                    warn!(from = %remote_host, "cluster chain: REJECTED — proof decode failed");
+                                    false
+                                }
+                            }
+                        } else {
+                            // No proof attached — accept during rollout.
+                            // TODO: once all nodes carry proofs, reject proofless updates.
+                            true
+                        };
+
+                        if !proof_valid { continue; }
+
+                        let mut st = state.write().await;
+                        let adopted = if let Some(ref mut cc) = st.mesh.cluster_chain {
+                            if cumulative_work > cc.cumulative_work {
+                                cc.adopt(new_value, round, cumulative_work);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            // We have no chain — adopt theirs.
+                            let mut cc = super::cluster_chain::ClusterChain::genesis(
+                                new_value, round, 1);
+                            cc.adopt(new_value, round, cumulative_work);
+                            st.mesh.cluster_chain = Some(cc);
+                            true
+                        };
+                        if adopted {
+                            info!(
+                                from = %remote_host,
+                                chain = &value[..8.min(value.len())],
+                                cumulative_work,
+                                proof_verified = proof.is_some(),
+                                "cluster chain: adopted via SPORE cascade"
+                            );
+                            // Re-broadcast to our peers so the cascade continues.
+                            broadcast_chain_update(&st);
+                        }
+                    }
+                }
+
                 RelayEvent::SocketMigrate { remote_host, migration, client_peer_id } => {
                     tracing::info!(
                         remote_host,
@@ -3283,7 +3404,7 @@ pub fn spawn_event_processor(
                         // Every node independently observes the same quantum
                         // boundary. No leader. No propagation. The VDF height
                         // IS the clock — quantizing eliminates minor drift.
-                        const ROUND_QUANTUM: u64 = 30;
+                        use super::cluster_chain::ROUND_QUANTUM;
                         let chain_height = c.height();
                         quantized_height = Some((chain_height / ROUND_QUANTUM) * ROUND_QUANTUM);
 
@@ -3639,6 +3760,35 @@ pub fn broadcast_profile_have_to_cluster(
     }
 }
 
+/// Broadcast current cluster chain state to ALL connected peers.
+///
+/// Called after a merge or SPORE adoption. Every connected peer receives the
+/// new chain value + cumulative work. Receivers with lower work adopt it.
+/// This is the SPORE cascade path — cluster-mates see higher work and adopt
+/// without re-merging (preventing double-counting).
+///
+/// Broadcasts to ALL peers (not just same-site) because after a cross-cluster
+/// merge, the old army members on both sides need the update.
+pub fn broadcast_chain_update(st: &super::server::ServerState) {
+    let Some(ref cc) = st.mesh.cluster_chain else { return };
+    // Generate ZK proof — 3 Fiat-Shamir challenges, ~500 bytes constant-size.
+    let proof_b64 = {
+        let proof = cc.generate_proof(3);
+        bincode::serialize(&proof).ok().map(|bytes| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        })
+    };
+    let msg = MeshMessage::ChainUpdate {
+        value: cc.value_hex(),
+        cumulative_work: cc.cumulative_work,
+        round: cc.round,
+        proof: proof_b64,
+    };
+    for (_key, relay) in &st.federation.relays {
+        let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(msg.clone()));
+    }
+}
 
 /// Execute latency gossip sync actions by sending MESH subcommands to relay peers.
 fn execute_latency_gossip_actions(
@@ -5318,6 +5468,7 @@ async fn relay_task(
                                             assigned_slot: hello.assigned_slot,
                                             cluster_chain_value: hello.cluster_chain_value,
                                             cluster_chain_round: hello.cluster_chain_round,
+                                            cluster_chain_work: hello.cluster_chain_work,
                                             cluster_round_seed: hello.cluster_round_seed,
                                         });
                                     } else {
@@ -5632,6 +5783,9 @@ struct MeshHelloPayload {
     /// Cluster identity chain round number.
     #[serde(default)]
     pub cluster_chain_round: Option<u64>,
+    /// Cluster chain cumulative work (advance steps across all epochs).
+    #[serde(default)]
+    pub cluster_chain_work: Option<u64>,
     /// Cluster round seed (hex-encoded [u8; 32]) — the FVDF chain hash used
     /// as the advance seed for the cluster chain. Comes from the cluster's
     /// cooperative VDF; losers adopt it on merge, don't generate their own.
@@ -5667,6 +5821,7 @@ pub fn build_wire_hello(st: &mut super::server::ServerState) -> HelloPayload {
         assigned_slot: hp.assigned_slot,
         cluster_chain_value: hp.cluster_chain_value,
         cluster_chain_round: hp.cluster_chain_round,
+        cluster_chain_work: hp.cluster_chain_work,
         cluster_round_seed: hp.cluster_round_seed,
     }
 }
@@ -6508,6 +6663,7 @@ fn build_hello_payload(st: &mut super::server::ServerState) -> MeshHelloPayload 
         assigned_slot,
         cluster_chain_value: st.mesh.cluster_chain.as_ref().map(|cc| cc.value_hex()),
         cluster_chain_round: st.mesh.cluster_chain.as_ref().map(|cc| cc.round),
+        cluster_chain_work: st.mesh.cluster_chain.as_ref().map(|cc| cc.cumulative_work),
         cluster_round_seed: st.mesh.cluster_round_seed.map(|s| hex::encode(s)),
     }
 }
@@ -6641,6 +6797,12 @@ fn mesh_message_to_irc(msg: &MeshMessage) -> Message {
         }
         MeshMessage::VdfWindow { .. } => {
             ("VDF_WINDOW".into(), String::new())
+        }
+        MeshMessage::ChainUpdate { value, cumulative_work, round, proof } => {
+            ("CHAIN_UPDATE".into(), serde_json::json!({
+                "value": value, "cumulative_work": cumulative_work, "round": round,
+                "proof": proof,
+            }).to_string())
         }
     };
     let mut params = vec![sub];

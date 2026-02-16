@@ -71,6 +71,11 @@ pub struct HelloPayload {
     /// Cluster identity chain round number.
     #[serde(default)]
     pub cluster_chain_round: Option<u64>,
+    /// Cluster chain cumulative work — total advance steps across all epochs.
+    /// Used in DifferentCluster comparison: higher work wins (adoption),
+    /// equal work triggers symmetric merge (blake3(sort), epoch reset).
+    #[serde(default)]
+    pub cluster_chain_work: Option<u64>,
     /// Cluster round seed (hex-encoded [u8; 32]) — the VDF quantum hash used
     /// as the advance seed for the cluster chain. Propagated from the cluster's
     /// clock source (highest VDF work). Losers don't generate — they receive.
@@ -169,6 +174,28 @@ pub enum MeshMessage {
         migration: String,
         /// The peer_id of the original client (so target knows who to expect).
         client_peer_id: String,
+    },
+
+    /// Cluster chain update — broadcast after merge so cluster-mates adopt
+    /// the new value without re-merging (prevents double-counting).
+    ///
+    /// Propagated via SPORE-style push to all connected peers. Receivers
+    /// compare `cumulative_work`: if higher, adopt value + work + round.
+    /// This is the intra-cluster cascade path — DifferentCluster HELLO is
+    /// only for genuine cross-cluster contact.
+    #[serde(rename = "chain_update")]
+    ChainUpdate {
+        /// New chain value (hex-encoded 32 bytes).
+        value: String,
+        /// Cumulative work across all epochs.
+        cumulative_work: u64,
+        /// Current round number.
+        round: u64,
+        /// Base64-bincode-encoded `ClusterChainProof`. Receivers MUST verify
+        /// this proof before adopting. Without a valid proof, the cumulative_work
+        /// claim is just a number someone made up.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proof: Option<String>,
     },
 
     /// CVDF cooperative VDF message — attestations, rounds, sync.
@@ -374,6 +401,7 @@ mod tests {
             assigned_slot: Some(3),
             cluster_chain_value: Some("deadbeefcafe".into()),
             cluster_chain_round: Some(99),
+            cluster_chain_work: Some(42),
             cluster_round_seed: Some("abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234".into()),
         });
 
@@ -685,6 +713,49 @@ mod tests {
                 assert_eq!(client_peer_id, "b3b3/abc123");
             }
             other => panic!("expected SocketMigrate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_update_round_trip() {
+        let msg = MeshMessage::ChainUpdate {
+            value: "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233".into(),
+            cumulative_work: 5300,
+            round: 42,
+            proof: Some("c29tZXByb29m".into()),
+        };
+        let json = msg.to_json().unwrap();
+        assert!(json.contains(r#""type":"chain_update""#));
+        assert!(json.contains(r#""cumulative_work":5300"#));
+        assert!(json.contains(r#""proof":"c29tZXByb29m""#));
+        let decoded = MeshMessage::from_json(&json).unwrap();
+        match decoded {
+            MeshMessage::ChainUpdate { value, cumulative_work, round, proof } => {
+                assert_eq!(value, "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233");
+                assert_eq!(cumulative_work, 5300);
+                assert_eq!(round, 42);
+                assert_eq!(proof.as_deref(), Some("c29tZXByb29m"));
+            }
+            other => panic!("expected ChainUpdate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chain_update_without_proof_round_trip() {
+        let msg = MeshMessage::ChainUpdate {
+            value: "ff".repeat(32),
+            cumulative_work: 0,
+            round: 0,
+            proof: None,
+        };
+        let json = msg.to_json().unwrap();
+        assert!(!json.contains("proof")); // skip_serializing_if = None
+        let decoded = MeshMessage::from_json(&json).unwrap();
+        match decoded {
+            MeshMessage::ChainUpdate { proof, .. } => {
+                assert!(proof.is_none());
+            }
+            other => panic!("expected ChainUpdate, got {other:?}"),
         }
     }
 

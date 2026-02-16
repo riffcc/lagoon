@@ -2,12 +2,19 @@
 //!
 //! Every cluster maintains a blake3 hash chain that advances on VDF window ticks.
 //! All nodes in the same cluster compute the same chain value because they share
-//! the same state and the same VDF-anchored clock.
+//! the same genesis seed and the same VDF-anchored Universal Clock.
 //!
 //! The chain value is carried in HELLO messages. When two nodes meet:
 //! - Same chain → same cluster, business as usual.
-//! - Different chain → different clusters, triggers merge.
+//! - Different chain → different clusters, triggers merge (epoch reset).
 //! - No chain → fresh node, adopts the peer's chain.
+//!
+//! **Epoch reset on merge:** When clusters merge via `blake3(sort(A,B))`, the
+//! merged value becomes the NEW genesis for the combined cluster. Both nodes
+//! restart their chain from that seed. The chain property is preserved within
+//! each epoch — the merge IS a new epoch. Work is never lost: `cumulative_work`
+//! tracks total advance steps across all epochs. A rolling ZK proof (Merkle
+//! root + Fiat-Shamir spot checks) compactly proves total sequential work.
 //!
 //! History is recorded as a blockchain of events (advance, merge, split, genesis)
 //! for debug visualization. Pruning APIs are designed but not yet implemented
@@ -18,6 +25,13 @@
 //! (block chain integrity, pruning soundness, history tracking).
 
 use serde::{Deserialize, Serialize};
+
+/// VDF quantum window size in ticks. At 10 Hz, 100 ticks = 10 seconds.
+///
+/// Nodes within 5 seconds (50 ticks) of each other land on the same quantum
+/// boundary. This is the Universal Clock's synchronization window — the VDF
+/// height IS the clock, quantization absorbs minor drift between honest nodes.
+pub const ROUND_QUANTUM: u64 = 100;
 
 /// Advance a cluster chain by one round.
 ///
@@ -141,12 +155,32 @@ impl ChainBlock {
 ///
 /// Tracks the current chain value and round, plus a history of blocks
 /// for debug visualization. History is stored newest-first.
+///
+/// **Epoch model:** The chain advances within an epoch (`advance_chain(prev, seed)`).
+/// On merge, a new epoch starts: `genesis` is set to the merged value, `value` resets
+/// to genesis, and `cumulative_work` accumulates additively. The old epoch's history
+/// is encoded in the merged genesis hash itself.
 #[derive(Debug, Clone)]
 pub struct ClusterChain {
+    /// Current epoch genesis — the seed this epoch started from.
+    /// Set to the merged value on epoch reset. Both sides of a merge
+    /// compute the same genesis, so they advance in lockstep.
+    pub genesis: [u8; 32],
     /// Current chain value (256-bit blake3 hash).
     pub value: [u8; 32],
-    /// Current round number.
+    /// Current round number (monotonic across epochs).
     pub round: u64,
+    /// Total advance steps across ALL epochs. This never resets —
+    /// it's the cluster's rolling work counter. On merge, both sides'
+    /// cumulative_work values are added (fungible work conservation).
+    pub cumulative_work: u64,
+    /// All chain values in the current epoch (genesis, v1, v2, ..., tip).
+    /// Reset on merge (epoch reset). Used to generate ZK proofs.
+    /// At 10-second intervals: ~8640 entries/day, ~270 KB/day. Manageable.
+    pub epoch_chain: Vec<[u8; 32]>,
+    /// Quantized VDF height when this epoch started (for round_seed derivation
+    /// in proof verification).
+    pub epoch_start_quantum: u64,
     /// Block history (newest first). Used for debug visualization.
     /// Capped at `max_history_blocks` to prevent unbounded growth.
     history: Vec<ChainBlock>,
@@ -157,7 +191,9 @@ pub struct ClusterChain {
 impl ClusterChain {
     /// Create a new cluster chain from a genesis seed.
     ///
-    /// The seed is typically derived from the node's VDF genesis hash.
+    /// The seed is the well-known starting value (e.g. `blake3("lagoon")`).
+    /// All nodes start from the same genesis — time (VDF quantum advance)
+    /// is the salt that progresses the chain.
     pub fn genesis(seed: [u8; 32], timestamp_round: u64, cluster_size: u32) -> Self {
         let block = ChainBlock {
             prev_block_hash: "0".into(),
@@ -168,8 +204,12 @@ impl ClusterChain {
             cluster_size,
         };
         Self {
+            genesis: seed,
             value: seed,
             round: 0,
+            cumulative_work: 0,
+            epoch_chain: vec![seed],
+            epoch_start_quantum: timestamp_round,
             history: vec![block],
             max_history_blocks: 1000,
         }
@@ -177,9 +217,14 @@ impl ClusterChain {
 
     /// Advance the chain by one round.
     ///
-    /// Called on each VDF window tick (every ~3 seconds).
-    /// `round_seed` is the VDF hash at the quantized round boundary (Universal Clock).
-    /// `timestamp_round` is the quantized VDF height (for history bookkeeping).
+    /// Called on each VDF quantum tick (every ~10 seconds at 10 Hz).
+    /// `round_seed` is `blake3(quantized_height)` — deterministic from the
+    /// Universal Clock. `timestamp_round` is the quantized VDF height.
+    ///
+    /// Within an epoch, the chain advances normally:
+    /// `value = advance_chain(prev_value, round_seed)`. Each step depends on
+    /// the previous — this IS the chain property. The epoch resets on merge
+    /// (see `fungible_adopt`), but within an epoch, it's a proper hash chain.
     pub fn advance(&mut self, round_seed: &[u8; 32], timestamp_round: u64, cluster_size: u32) {
         let new_value = advance_chain(&self.value, round_seed);
         let prev_hash = self
@@ -197,6 +242,8 @@ impl ClusterChain {
         };
         self.value = new_value;
         self.round += 1;
+        self.cumulative_work += 1;
+        self.epoch_chain.push(new_value);
         self.history.insert(0, block);
         self.enforce_history_limit();
     }
@@ -234,16 +281,28 @@ impl ClusterChain {
         self.enforce_history_limit();
     }
 
-    /// F-VDF fungible merge: both sides compute `max(our_chain, their_chain)`.
+    /// F-VDF epoch reset: merge two cluster chains into a new epoch.
     ///
-    /// The winner IS the value — the lexicographically larger chain.
-    /// Commutative, associative, idempotent (proper CRDT join-semilattice).
-    /// Work is additive: the peer set grows as clusters discover each other.
-    /// Returns `true` if our chain value changed (we adopted).
+    /// Computes `blake3(sort(our_value, their_value))` — a NEW combined identity
+    /// that neither side had before. This merged value becomes the **new genesis**
+    /// for the combined cluster. Both nodes reset their chain state to this seed.
+    ///
+    /// **Epoch reset semantics:**
+    /// - `genesis` = merged value (new epoch seed)
+    /// - `value` = merged value (chain restarts from here)
+    /// - `cumulative_work` += other's work (fungible, additive — work is never lost)
+    /// - `timestamp_round` = caller's quantized VDF height (prevents immediate
+    ///   re-advance; both nodes gate on the NEXT quantum boundary)
+    ///
+    /// The chain property is preserved WITHIN each epoch. The merge creates a new
+    /// epoch. Old history is encoded in the merged genesis hash itself.
+    ///
+    /// Returns `true` if our chain value changed.
     pub fn fungible_adopt(
         &mut self,
         other_value: &[u8; 32],
         other_round: u64,
+        other_cumulative_work: u64,
         timestamp_round: u64,
         merged_size: u32,
     ) -> bool {
@@ -266,8 +325,16 @@ impl ClusterChain {
             },
             cluster_size: merged_size,
         };
+        // Epoch reset: merged value becomes the new genesis.
+        // Both sides compute the same merged seed (commutative),
+        // so they advance in lockstep from the next quantum tick.
+        self.genesis = merged;
         self.value = merged;
         self.round = new_round;
+        self.cumulative_work += other_cumulative_work;
+        // New epoch: reset the chain to just the merged genesis.
+        self.epoch_chain = vec![merged];
+        self.epoch_start_quantum = timestamp_round;
         self.history.insert(0, block);
         self.enforce_history_limit();
         changed
@@ -291,15 +358,34 @@ impl ClusterChain {
         };
         self.value = new_value;
         self.round += 1;
+        self.cumulative_work += 1;
+        self.epoch_chain.push(new_value);
         self.history.insert(0, block);
         self.enforce_history_limit();
     }
 
-    /// Adopt a peer's chain state (SPORE catch-up after temporary disconnect).
-    pub fn adopt(&mut self, peer_value: [u8; 32], peer_round: u64) {
+    /// Adopt a peer's chain state (SPORE cascade after merge).
+    ///
+    /// Called when a cluster-mate broadcasts a merged chain value with higher
+    /// cumulative_work. We adopt their value, round, and work wholesale.
+    /// Also sets genesis — we're joining their epoch.
+    ///
+    /// Returns `true` if we actually changed (their work was higher).
+    pub fn adopt(&mut self, peer_value: [u8; 32], peer_round: u64, peer_work: u64) -> bool {
+        if peer_work <= self.cumulative_work && peer_value == self.value {
+            return false; // Already at this state or ahead.
+        }
+        self.genesis = peer_value;
         self.value = peer_value;
         self.round = peer_round;
+        self.cumulative_work = peer_work;
+        // Reset epoch chain — we don't have the intermediates.
+        // We trust the peer's proof (which should accompany ChainUpdate).
+        // Our own epoch chain restarts from their tip.
+        self.epoch_chain = vec![peer_value];
+        self.epoch_start_quantum = 0; // Will be set on next advance.
         // History is NOT updated — the gap shows the disconnect in debug view.
+        true
     }
 
     /// The timestamp_round used in the most recent advance (for quantum gating).
@@ -394,6 +480,8 @@ pub struct ChainSummary {
     pub chain_value_hex: String,
     /// Current round number.
     pub round: u64,
+    /// Total advance steps across all epochs (never resets).
+    pub cumulative_work: u64,
     /// Number of merge events in recorded history.
     pub merge_count: u32,
     /// Number of split events in recorded history.
@@ -401,6 +489,67 @@ pub struct ChainSummary {
 }
 
 impl ClusterChain {
+    /// Number of advance steps in the current epoch.
+    pub fn epoch_steps(&self) -> u64 {
+        self.epoch_chain.len().saturating_sub(1) as u64
+    }
+
+    /// Generate a ZK proof of the current epoch's chain computation.
+    ///
+    /// Uses Merkle+Fiat-Shamir over the epoch's chain values. The proof
+    /// demonstrates that `advance_chain(chain[i], round_seed[i]) == chain[i+1]`
+    /// at `num_challenges` randomly selected positions.
+    ///
+    /// The verifier can independently derive `round_seed[i]` from the
+    /// `epoch_start_quantum` and ROUND_QUANTUM, since round seeds are
+    /// deterministic from quantized VDF height.
+    ///
+    /// For small epochs (≤ 10000 steps, ~28 hours), endpoint recompute
+    /// provides 100% security in addition to the spot checks.
+    pub fn generate_proof(&self, num_challenges: usize) -> ClusterChainProof {
+        let epoch_steps = self.epoch_steps();
+        if epoch_steps == 0 {
+            return ClusterChainProof {
+                genesis: self.genesis,
+                tip: self.value,
+                epoch_steps: 0,
+                cumulative_work: self.cumulative_work,
+                epoch_start_quantum: self.epoch_start_quantum,
+                merkle_root: self.genesis,
+                challenges: Vec::new(),
+            };
+        }
+
+        let tree = lagoon_vdf::MerkleTree::build(&self.epoch_chain);
+        let root = tree.root();
+
+        let mut challenges = Vec::with_capacity(num_challenges);
+        for k in 0..num_challenges {
+            let raw_idx = chain_fiat_shamir_challenge(
+                root, self.genesis, self.value, epoch_steps, k as u64,
+            );
+            let idx = (raw_idx % epoch_steps) as usize;
+
+            challenges.push(ClusterChainChallenge {
+                index: idx as u64,
+                chain_at_index: self.epoch_chain[idx],
+                chain_at_next: self.epoch_chain[idx + 1],
+                proof_index: tree.prove(idx),
+                proof_next: tree.prove(idx + 1),
+            });
+        }
+
+        ClusterChainProof {
+            genesis: self.genesis,
+            tip: self.value,
+            epoch_steps,
+            cumulative_work: self.cumulative_work,
+            epoch_start_quantum: self.epoch_start_quantum,
+            merkle_root: root,
+            challenges,
+        }
+    }
+
     /// Build a summary for HELLO messages and visualization.
     pub fn summary(&self) -> ChainSummary {
         let merge_count = self
@@ -416,10 +565,195 @@ impl ClusterChain {
         ChainSummary {
             chain_value_hex: hex::encode(self.value),
             round: self.round,
+            cumulative_work: self.cumulative_work,
             merge_count,
             split_count,
         }
     }
+}
+
+// ── ZK Proof for Cluster Chain Work ─────────────────────────────────────
+//
+// Proves that a cluster chain was correctly computed from genesis to tip
+// in exactly N sequential steps, using the domain-specific step function
+// `advance_chain(prev, round_seed) = blake3(blake3(prev || round_seed))`.
+//
+// The round_seed for step i is deterministic:
+//   round_seed[i] = blake3(bytes_of(epoch_start_quantum + i * ROUND_QUANTUM))
+//
+// This means a verifier with knowledge of the epoch_start_quantum can
+// independently derive all round seeds and verify the chain computation.
+//
+// For small epochs (≤ 10000 steps, ~28 hours at 10-second intervals),
+// full endpoint recompute provides 100% security. For larger epochs,
+// Fiat-Shamir spot checks provide probabilistic security.
+
+/// Maximum epoch steps for endpoint recompute verification.
+/// At 10-second intervals, 10000 steps = ~28 hours.
+/// `advance_chain` is two blake3 calls per step — recomputing 10000 steps
+/// takes ~20 microseconds. Well within budget.
+const EPOCH_RECOMPUTE_LIMIT: u64 = 10_000;
+
+/// Derive round_seed for step `i` within an epoch.
+///
+/// `round_seed[i] = blake3(bytes_of(epoch_start_quantum + i * ROUND_QUANTUM))`
+///
+/// The Universal Clock quantization ensures all honest nodes derive the same
+/// seed for the same step. The verifier computes this independently.
+pub fn derive_round_seed(epoch_start_quantum: u64, step_index: u64) -> [u8; 32] {
+    let quantum = epoch_start_quantum + step_index * ROUND_QUANTUM;
+    *blake3::hash(&quantum.to_le_bytes()).as_bytes()
+}
+
+/// A single Fiat-Shamir challenge for the cluster chain proof.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterChainChallenge {
+    /// Index into the epoch chain (0..epoch_steps).
+    pub index: u64,
+    /// Chain value at position `index`.
+    pub chain_at_index: [u8; 32],
+    /// Chain value at position `index + 1`.
+    pub chain_at_next: [u8; 32],
+    /// Merkle proof for `chain_at_index`.
+    pub proof_index: Vec<[u8; 32]>,
+    /// Merkle proof for `chain_at_next`.
+    pub proof_next: Vec<[u8; 32]>,
+}
+
+/// Non-interactive ZK proof that a cluster chain was correctly computed.
+///
+/// Proves: starting from `genesis`, after `epoch_steps` applications of
+/// `advance_chain(prev, derive_round_seed(epoch_start_quantum, i))`,
+/// the chain arrives at `tip`. Work claim = `cumulative_work`.
+///
+/// Dual-layered verification:
+///   1. **Endpoint recompute** (small epochs ≤ 10000): recompute the full chain
+///      from genesis using derived round seeds. 100% secure, microseconds.
+///   2. **Merkle+Fiat-Shamir** (any epoch): k spot-check proofs against the
+///      committed Merkle root. Probabilistic, but constant-size proof.
+///
+/// Wire size: ~500 bytes with 3 challenges, regardless of epoch length.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterChainProof {
+    /// Genesis value of the current epoch.
+    pub genesis: [u8; 32],
+    /// Current tip value.
+    pub tip: [u8; 32],
+    /// Number of advance steps in this epoch.
+    pub epoch_steps: u64,
+    /// Total cumulative work across ALL epochs (fungible, additive).
+    pub cumulative_work: u64,
+    /// Quantized VDF height when this epoch started.
+    /// Verifier uses this to derive round seeds independently.
+    pub epoch_start_quantum: u64,
+    /// Merkle root over all chain values in the epoch.
+    pub merkle_root: [u8; 32],
+    /// Fiat-Shamir spot checks.
+    pub challenges: Vec<ClusterChainChallenge>,
+}
+
+impl ClusterChainProof {
+    /// Verify the proof without access to the full chain.
+    ///
+    /// For each challenge:
+    /// 1. Re-derive expected challenge index (Fiat-Shamir)
+    /// 2. Derive `round_seed[i]` from `epoch_start_quantum`
+    /// 3. Check `advance_chain(chain[i], round_seed[i]) == chain[i+1]`
+    /// 4. Verify Merkle proofs for both positions
+    ///
+    /// For small epochs, also recomputes the full chain from genesis.
+    pub fn verify(&self) -> bool {
+        if self.epoch_steps == 0 {
+            return self.genesis == self.tip;
+        }
+
+        // Fiat-Shamir spot checks.
+        for (k, challenge) in self.challenges.iter().enumerate() {
+            // 1. Re-derive expected challenge index.
+            let expected_raw = chain_fiat_shamir_challenge(
+                self.merkle_root, self.genesis, self.tip,
+                self.epoch_steps, k as u64,
+            );
+            if challenge.index != expected_raw % self.epoch_steps {
+                return false;
+            }
+
+            // 2. Derive round_seed for this step.
+            let round_seed = derive_round_seed(
+                self.epoch_start_quantum, challenge.index);
+
+            // 3. Check advance_chain(chain[i], round_seed) == chain[i+1].
+            let expected_next = advance_chain(
+                &challenge.chain_at_index, &round_seed);
+            if expected_next != challenge.chain_at_next {
+                return false;
+            }
+
+            // 4. Verify Merkle proofs.
+            if !lagoon_vdf::MerkleTree::verify_proof(
+                self.merkle_root,
+                challenge.chain_at_index,
+                challenge.index as usize,
+                &challenge.proof_index,
+            ) {
+                return false;
+            }
+            if !lagoon_vdf::MerkleTree::verify_proof(
+                self.merkle_root,
+                challenge.chain_at_next,
+                (challenge.index + 1) as usize,
+                &challenge.proof_next,
+            ) {
+                return false;
+            }
+        }
+
+        // Endpoint recompute for small epochs — 100% secure.
+        if self.epoch_steps <= EPOCH_RECOMPUTE_LIMIT {
+            let mut h = self.genesis;
+            for i in 0..self.epoch_steps {
+                let seed = derive_round_seed(self.epoch_start_quantum, i);
+                h = advance_chain(&h, &seed);
+            }
+            if h != self.tip {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Check whether this proof's `cumulative_work` is consistent with the epoch.
+    ///
+    /// `cumulative_work` includes ALL previous epochs. The current epoch
+    /// contributes `epoch_steps` to the total. So:
+    ///   `cumulative_work >= epoch_steps` (can be much larger due to merged work).
+    pub fn work_consistent(&self) -> bool {
+        self.cumulative_work >= self.epoch_steps
+    }
+}
+
+/// Derive Fiat-Shamir challenge index for cluster chain proof.
+///
+/// Deterministic from: merkle_root, genesis, tip, steps, challenge number.
+/// Different domain separation from VDF proofs to prevent cross-protocol attacks.
+fn chain_fiat_shamir_challenge(
+    merkle_root: [u8; 32],
+    genesis: [u8; 32],
+    tip: [u8; 32],
+    steps: u64,
+    challenge_num: u64,
+) -> u64 {
+    let mut h = blake3::Hasher::new();
+    // Domain separation: "cluster_chain_proof" prefix.
+    h.update(b"cluster_chain_proof");
+    h.update(&merkle_root);
+    h.update(&genesis);
+    h.update(&tip);
+    h.update(&steps.to_le_bytes());
+    h.update(&challenge_num.to_le_bytes());
+    let hash = h.finalize();
+    u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap())
 }
 
 #[cfg(test)]
@@ -515,9 +849,10 @@ mod tests {
         let seed = blake3::hash(b"adopter").as_bytes().to_owned();
         let mut chain = ClusterChain::genesis(seed, 0, 1);
         let peer_value = blake3::hash(b"peer-chain-tip").as_bytes().to_owned();
-        chain.adopt(peer_value, 42);
+        chain.adopt(peer_value, 42, 100);
         assert_eq!(chain.value, peer_value);
         assert_eq!(chain.round, 42);
+        assert_eq!(chain.cumulative_work, 100);
     }
 
     #[test]
@@ -602,12 +937,14 @@ mod tests {
         let seed_a = blake3::hash(b"alpha").as_bytes().to_owned();
         let seed_b = blake3::hash(b"beta").as_bytes().to_owned();
         let mut chain = ClusterChain::genesis(seed_a, 0, 3);
-        let changed = chain.fungible_adopt(&seed_b, 5, 100, 6);
+        let changed = chain.fungible_adopt(&seed_b, 5, 0, 100, 6);
         // Result is blake3(sort(seed_a, seed_b)) — new combined identity
         let expected = fungible_merge(&seed_a, &seed_b);
         assert_eq!(chain.value, expected);
         assert_ne!(expected, seed_a); // combined value differs from both inputs
         assert_ne!(expected, seed_b);
+        // Epoch reset: genesis is now the merged value
+        assert_eq!(chain.genesis, expected);
         assert!(matches!(chain.history[0].event, ChainEvent::FungibleMerge { .. }));
         assert_eq!(chain.merge_events().len(), 1);
         // blake3 combine always changes both sides (neither input survives)
@@ -622,12 +959,13 @@ mod tests {
         let mut chain_a = ClusterChain::genesis(seed_a, 0, 3);
         let mut chain_b = ClusterChain::genesis(seed_b, 0, 2);
 
-        // Both adopt via fungible_adopt
-        chain_a.fungible_adopt(&seed_b, chain_b.round, 100, 5);
-        chain_b.fungible_adopt(&seed_a, chain_a.round, 100, 5);
+        // Both adopt via fungible_adopt — epoch reset
+        chain_a.fungible_adopt(&seed_b, chain_b.round, 0, 100, 5);
+        chain_b.fungible_adopt(&seed_a, chain_a.round, 0, 100, 5);
 
-        // Now they're SameCluster
+        // Now they're SameCluster with the same genesis
         assert_eq!(chain_a.compare(Some(&chain_b.value)), ChainComparison::SameCluster);
+        assert_eq!(chain_a.genesis, chain_b.genesis);
     }
 
     #[test]
@@ -639,14 +977,67 @@ mod tests {
         let mut chain_a = ClusterChain::genesis(seed_a, 0, 2);
         let mut chain_b = ClusterChain::genesis(seed_b, 0, 1);
 
-        // Both sides merge — should arrive at the same combined value
-        chain_a.fungible_adopt(&seed_b, chain_b.round, 100, 3);
-        chain_b.fungible_adopt(&seed_a, chain_a.round, 100, 3);
+        // Both sides merge — epoch reset, same combined value
+        chain_a.fungible_adopt(&seed_b, chain_b.round, 0, 100, 3);
+        chain_b.fungible_adopt(&seed_a, chain_a.round, 0, 100, 3);
         assert_eq!(chain_a.value, chain_b.value);
+        assert_eq!(chain_a.genesis, chain_b.genesis);
 
         // The combined value is neither original
         assert_ne!(chain_a.value, seed_a);
         assert_ne!(chain_a.value, seed_b);
+    }
+
+    #[test]
+    fn epoch_reset_enables_convergent_advance() {
+        // THE key property: after merge (epoch reset), both nodes advance
+        // to the same value when given the same round seed.
+        let seed_a = blake3::hash(b"cluster-x").as_bytes().to_owned();
+        let seed_b = blake3::hash(b"cluster-y").as_bytes().to_owned();
+        let mut chain_a = ClusterChain::genesis(seed_a, 0, 2);
+        let mut chain_b = ClusterChain::genesis(seed_b, 0, 2);
+
+        // Epoch reset on both sides
+        chain_a.fungible_adopt(&seed_b, 0, 0, 100, 4);
+        chain_b.fungible_adopt(&seed_a, 0, 0, 100, 4);
+        assert_eq!(chain_a.value, chain_b.value);
+
+        // Now advance both with the same round seed — should stay in sync
+        let seed_1 = test_seed(100);
+        chain_a.advance(&seed_1, 100, 4);
+        chain_b.advance(&seed_1, 100, 4);
+        assert_eq!(chain_a.value, chain_b.value);
+
+        // And again
+        let seed_2 = test_seed(200);
+        chain_a.advance(&seed_2, 200, 4);
+        chain_b.advance(&seed_2, 200, 4);
+        assert_eq!(chain_a.value, chain_b.value);
+    }
+
+    #[test]
+    fn cumulative_work_is_additive_across_merges() {
+        // Work is fungible: merge adds both sides' cumulative work.
+        let seed_a = blake3::hash(b"worker-a").as_bytes().to_owned();
+        let seed_b = blake3::hash(b"worker-b").as_bytes().to_owned();
+        let mut chain_a = ClusterChain::genesis(seed_a, 0, 1);
+        let mut chain_b = ClusterChain::genesis(seed_b, 0, 1);
+
+        // A does 5 advance steps
+        for i in 1..=5 {
+            chain_a.advance(&test_seed(i * 100), i * 100, 1);
+        }
+        assert_eq!(chain_a.cumulative_work, 5);
+
+        // B does 3 advance steps
+        for i in 1..=3 {
+            chain_b.advance(&test_seed(i * 100), i * 100, 1);
+        }
+        assert_eq!(chain_b.cumulative_work, 3);
+
+        // Merge: A adopts B's work additively
+        chain_a.fungible_adopt(&chain_b.value, chain_b.round, chain_b.cumulative_work, 600, 2);
+        assert_eq!(chain_a.cumulative_work, 8); // 5 + 3
     }
 
     #[test]
@@ -664,5 +1055,133 @@ mod tests {
         assert_eq!(summary.round, 4);
         assert_eq!(summary.merge_count, 1);
         assert_eq!(summary.split_count, 1);
+    }
+
+    // ── ZK Proof Tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn proof_genesis_only() {
+        let seed = blake3::hash(b"proof-genesis").as_bytes().to_owned();
+        let chain = ClusterChain::genesis(seed, 0, 1);
+        let proof = chain.generate_proof(3);
+        assert_eq!(proof.epoch_steps, 0);
+        assert!(proof.verify(), "genesis-only proof should verify");
+    }
+
+    #[test]
+    fn proof_after_advances() {
+        let seed = blake3::hash(b"proof-advances").as_bytes().to_owned();
+        let mut chain = ClusterChain::genesis(seed, 0, 3);
+
+        // Advance using derive_round_seed (same as what the verifier will compute).
+        for i in 0..20 {
+            let round_seed = derive_round_seed(0, i);
+            chain.advance(&round_seed, i * ROUND_QUANTUM, 3);
+        }
+
+        assert_eq!(chain.epoch_steps(), 20);
+        assert_eq!(chain.epoch_chain.len(), 21); // genesis + 20 advances
+        assert_eq!(chain.cumulative_work, 20);
+
+        let proof = chain.generate_proof(5);
+        assert_eq!(proof.epoch_steps, 20);
+        assert_eq!(proof.cumulative_work, 20);
+        assert_eq!(proof.challenges.len(), 5);
+        assert!(proof.verify(), "proof after 20 advances should verify");
+        assert!(proof.work_consistent(), "work should be consistent");
+    }
+
+    #[test]
+    fn proof_after_epoch_reset() {
+        let seed_a = blake3::hash(b"proof-epoch-a").as_bytes().to_owned();
+        let seed_b = blake3::hash(b"proof-epoch-b").as_bytes().to_owned();
+        let mut chain_a = ClusterChain::genesis(seed_a, 0, 3);
+        let mut chain_b = ClusterChain::genesis(seed_b, 0, 2);
+
+        // Advance both chains.
+        for i in 0..10 {
+            chain_a.advance(&derive_round_seed(0, i), i * ROUND_QUANTUM, 3);
+            chain_b.advance(&derive_round_seed(0, i), i * ROUND_QUANTUM, 2);
+        }
+
+        // Merge: epoch reset.
+        let pre_b_value = chain_b.value;
+        chain_a.fungible_adopt(
+            &pre_b_value, chain_b.round, chain_b.cumulative_work, 1000, 5);
+
+        // After merge: epoch_chain has just the merged genesis.
+        assert_eq!(chain_a.epoch_chain.len(), 1);
+        assert_eq!(chain_a.epoch_steps(), 0);
+        assert_eq!(chain_a.cumulative_work, 20); // 10 + 10
+
+        // Advance in new epoch.
+        for i in 0..5 {
+            chain_a.advance(&derive_round_seed(1000, i), 1000 + i * ROUND_QUANTUM, 5);
+        }
+
+        assert_eq!(chain_a.epoch_steps(), 5);
+        assert_eq!(chain_a.cumulative_work, 25); // 20 + 5
+
+        let proof = chain_a.generate_proof(3);
+        assert_eq!(proof.epoch_steps, 5);
+        assert_eq!(proof.cumulative_work, 25);
+        assert!(proof.verify(), "proof after epoch reset should verify");
+        assert!(proof.work_consistent());
+    }
+
+    #[test]
+    fn tampered_proof_fails_verification() {
+        let seed = blake3::hash(b"tamper-test").as_bytes().to_owned();
+        let mut chain = ClusterChain::genesis(seed, 0, 1);
+
+        for i in 0..15 {
+            chain.advance(&derive_round_seed(0, i), i * ROUND_QUANTUM, 1);
+        }
+
+        // Valid proof.
+        let proof = chain.generate_proof(3);
+        assert!(proof.verify());
+
+        // Tamper: change the tip.
+        let mut bad_tip = proof.clone();
+        bad_tip.tip = blake3::hash(b"fake-tip").as_bytes().to_owned();
+        assert!(!bad_tip.verify(), "tampered tip should fail");
+
+        // Tamper: change the genesis.
+        let mut bad_genesis = proof.clone();
+        bad_genesis.genesis = blake3::hash(b"fake-genesis").as_bytes().to_owned();
+        assert!(!bad_genesis.verify(), "tampered genesis should fail");
+
+        // Tamper: inflate epoch_steps.
+        let mut bad_steps = proof.clone();
+        bad_steps.epoch_steps = 100;
+        assert!(!bad_steps.verify(), "inflated steps should fail");
+
+        // Tamper: change a challenge hash.
+        if !proof.challenges.is_empty() {
+            let mut bad_hash = proof.clone();
+            bad_hash.challenges[0].chain_at_next = [0xFF; 32];
+            assert!(!bad_hash.verify(), "tampered challenge hash should fail");
+        }
+    }
+
+    #[test]
+    fn proof_large_epoch_endpoint_recompute() {
+        // Test with enough steps to exercise the proof but small enough to be fast.
+        let seed = blake3::hash(b"large-epoch").as_bytes().to_owned();
+        let mut chain = ClusterChain::genesis(seed, 500, 5);
+
+        for i in 0..100 {
+            chain.advance(&derive_round_seed(500, i), 500 + i * ROUND_QUANTUM, 5);
+        }
+
+        assert_eq!(chain.epoch_steps(), 100);
+        let proof = chain.generate_proof(5);
+        assert!(proof.verify(), "100-step proof should verify");
+
+        // Verify round_seed derivation matches.
+        let seed_0 = derive_round_seed(500, 0);
+        let expected_first = advance_chain(&chain.genesis, &seed_0);
+        assert_eq!(chain.epoch_chain[1], expected_first);
     }
 }
