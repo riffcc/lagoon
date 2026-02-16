@@ -474,10 +474,13 @@ pub fn dial_missing_spiral_neighbors(
             .as_deref()
             .and_then(|s| s.parse().ok());
 
-        // Find an anycast entry point from bootstrap peers (port 9443).
-        let anycast_entry: Option<String> = tc.peers.iter()
-            .find(|(_, e)| e.port == transport::SWITCHBOARD_PORT && !e.tls)
-            .map(|(host, _)| host.clone());
+        // Find an anycast switchboard entry point.
+        // Priority 1: explicit LAGOON_SWITCHBOARD_ADDR (e.g. Bunny anycast IP).
+        // Priority 2: bootstrap peer with port 9443 (e.g. Fly anycast).
+        let anycast_entry: Option<String> = tc.switchboard_addr.clone()
+            .or_else(|| tc.peers.iter()
+                .find(|(_, e)| e.port == transport::SWITCHBOARD_PORT && !e.tls)
+                .map(|(host, _)| host.clone()));
 
         if peer_ygg_addr.is_none() && anycast_entry.is_none() {
             tracing::debug!(
@@ -1219,6 +1222,8 @@ pub fn spawn_event_processor(
                         st.mesh.connection_gossip.set_spiral_neighbors(neighbors.clone());
                         st.mesh.liveness_gossip.set_spiral_neighbors(neighbors);
                         dial_missing_spiral_neighbors(&mut st, state.clone());
+                        // APE: if disconnection dropped us below threshold, recover.
+                        attempt_mesh_rejoin(&mut st, state.clone());
                         publish_connection_snapshot(&mut st);
                         st.notify_topology_change();
                     }
@@ -1534,12 +1539,14 @@ pub fn spawn_event_processor(
                         }
                     }
 
+                    // Dial any SPIRAL neighbors we don't have a relay to yet.
+                    // Always dial BEFORE pruning — atomic reslot: establish new
+                    // connections first, then shed excess in the prune step.
+                    dial_missing_spiral_neighbors(&mut st, state.clone());
+
                     // Prune relay connections to non-SPIRAL peers now that the
                     // neighbor set may have changed.
                     prune_non_spiral_relays(&mut st);
-
-                    // Dial any SPIRAL neighbors we don't have a relay to yet.
-                    dial_missing_spiral_neighbors(&mut st, state.clone());
 
                     // Publish connection snapshot — we just connected to a new peer.
                     publish_connection_snapshot(&mut st);
@@ -1561,6 +1568,8 @@ pub fn spawn_event_processor(
                             st.mesh.connection_gossip.set_spiral_neighbors(neighbors.clone());
                             st.mesh.liveness_gossip.set_spiral_neighbors(neighbors);
                             dial_missing_spiral_neighbors(&mut st, state.clone());
+                            // APE: if eviction killed all our relays, rejoin the mesh.
+                            attempt_mesh_rejoin(&mut st, state.clone());
                             publish_connection_snapshot(&mut st);
                             st.notify_topology_change();
                         }
@@ -1890,6 +1899,10 @@ pub fn spawn_event_processor(
                     let mut changed = false;
                     let mut new_peer_servers: Vec<(String, String, String, u16, bool)> = Vec::new();
                     let mut newly_discovered: Vec<MeshPeerInfo> = Vec::new();
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
 
                     // Collect incoming peers with SPIRAL positions for batch merge.
                     let mut incoming_spiral_peers: Vec<(String, citadel_topology::Spiral3DIndex)> = Vec::new();
@@ -1920,6 +1933,12 @@ pub fn spawn_event_processor(
                         // Don't resurrect tombstoned peers — they were evicted
                         // for VDF non-advancement and gossip is carrying stale info.
                         if st.mesh.eviction_tombstones.contains_key(&mkey) {
+                            continue;
+                        }
+                        // Reject stale gossip at the door. If last_seen is older
+                        // than GHOST_DEAD_SECS, this peer would be immediately
+                        // evicted anyway. Don't waste a SPIRAL slot on a ghost.
+                        if peer.last_seen > 0 && now.saturating_sub(peer.last_seen) >= 20 {
                             continue;
                         }
 
@@ -3200,6 +3219,8 @@ pub fn spawn_event_processor(
                     st.mesh.connection_gossip.set_spiral_neighbors(neighbors.clone());
                     st.mesh.liveness_gossip.set_spiral_neighbors(neighbors);
                     dial_missing_spiral_neighbors(&mut st, state.clone());
+                    // APE: if eviction killed all our relays, rejoin the mesh.
+                    attempt_mesh_rejoin(&mut st, state.clone());
                     publish_connection_snapshot(&mut st);
                     st.notify_topology_change();
                 }
@@ -3313,6 +3334,12 @@ pub fn spawn_event_processor(
             // shared PoLP latency data (proof_store). Swaps that improve
             // combined neighbor latency are applied atomically.
             _ = latency_swap_interval.tick() => {
+                // LAGOON_ENABLE_SWAPS=1 to opt in. Off by default — swap
+                // decisions require identical latency maps on every node,
+                // which gossip can't guarantee. Causes oscillation.
+                if std::env::var("LAGOON_ENABLE_SWAPS").as_deref() != Ok("1") {
+                    continue;
+                }
                 let mut st = state.write().await;
                 if !st.mesh.spiral.is_claimed() || st.mesh.spiral.occupied_count() < 3 {
                     continue;
@@ -3369,7 +3396,7 @@ pub fn spawn_event_processor(
                 update_spiral_neighbors(&mut st);
                 dial_missing_spiral_neighbors(&mut st, state.clone());
                 st.notify_topology_change();
-                prune_non_spiral_relays(&mut st);
+                // Atomic reslot: new connections first, prune later (via HELLO or MeshPeers).
             }
 
             else => break,
@@ -5735,9 +5762,12 @@ fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
     // Run bitmap decay — stale bits flip to 0, SPORE rebuilt.
     st.mesh.liveness_bitmap.decay(now);
 
-    // Prune expired tombstones. 250ms = one SPORE convergence cycle.
-    // Stale gossip can't arrive after that. Direct HELLO clears immediately.
-    st.mesh.eviction_tombstones.retain(|_, ts| ts.elapsed() < std::time::Duration::from_millis(250));
+    // Prune expired tombstones. 30s = bitmap decay (20s) + propagation margin.
+    // Covers the full gossip convergence window: after 30s, every node's bitmap
+    // has decayed this peer's bit to 0, so gossip won't carry its stale entry.
+    // New pods get new peer_ids, so this only blocks the OLD peer_id.
+    // Direct HELLO always clears tombstones instantly (proof of life).
+    st.mesh.eviction_tombstones.retain(|_, ts| ts.elapsed() < std::time::Duration::from_secs(30));
 
     let spiral_neighbors = st.mesh.spiral.neighbors().clone();
 
@@ -5813,6 +5843,9 @@ fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
             }
 
             // Shut down the relay task if one exists for this peer.
+            // No relay is immortal — bootstrap or otherwise. The APE recovery
+            // mechanism (attempt_mesh_rejoin) handles getting back on the mesh
+            // by trying known peers, then falling back to seed addresses.
             if let Some(relay) = st.federation.relays.remove(evicted_key) {
                 let _ = relay.outgoing_tx.send(RelayCommand::Shutdown);
             }
@@ -5820,6 +5853,148 @@ fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
     }
 
     evicted
+}
+
+/// APE (Any Point of Entry) mesh recovery — threshold-based, fires when active
+/// relay count falls below the desired connection count.
+///
+/// The invariant: "I need N connections to function." N = max(SPIRAL neighbors, 1).
+/// When active connections drop below N, scan known_peers for peers we're NOT
+/// currently connected to or pending, and dial them to fill the deficit.
+///
+/// Recovery hierarchy:
+/// 1. Known peers from gossip — any of them is an entry point back into the mesh
+/// 2. Seed addresses from config (LAGOON_PEERS) — the bootstrap fallback
+///
+/// No peer is immortal. No relay is privileged. The bootstrap address is just
+/// the seed entry in known_peers — the one you knew before you knew anyone else.
+/// The system routes around stuck state: if a pending dial is stuck, the next
+/// recovery sweep skips it and tries another peer.
+fn attempt_mesh_rejoin(
+    st: &mut super::server::ServerState,
+    shared_state: super::server::SharedState,
+) {
+    let active_relays = st.federation.relays.len();
+    let spiral_neighbors = st.mesh.spiral.neighbors().len();
+    let desired = spiral_neighbors.max(1);
+
+    if active_relays >= desired {
+        return; // Enough connections — nothing to recover.
+    }
+
+    let deficit = desired - active_relays;
+    let our_pid = st.lens.peer_id.clone();
+    let event_tx = st.federation_event_tx.clone();
+    let tc = st.transport_config.clone();
+
+    // Collect peer_ids (relay map keys) we're already connected to.
+    let connected_keys: std::collections::HashSet<&str> = st
+        .federation
+        .relays
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+
+    let mut dialed = 0usize;
+
+    // Phase 1: Try known peers. Any of them is an entry point.
+    for (mkey, peer) in &st.mesh.known_peers {
+        if dialed >= deficit {
+            break;
+        }
+        if *mkey == our_pid {
+            continue;
+        }
+        // Skip peers we're already connected to (by mesh key).
+        if connected_keys.contains(mkey.as_str()) {
+            continue;
+        }
+        // Skip peers we're already dialing (by node_name).
+        let node_name = &peer.node_name;
+        if st.federation.pending_dials.contains(node_name) {
+            continue;
+        }
+
+        // Need either an underlay URI or a Ygg overlay address for a route.
+        let peer_uri = peer.underlay_uri.as_ref().filter(|u| is_underlay_uri(u));
+        let peer_ygg: Option<std::net::Ipv6Addr> = peer
+            .yggdrasil_addr
+            .as_deref()
+            .and_then(|s| s.parse().ok());
+
+        if peer_uri.is_none() && peer_ygg.is_none() {
+            continue;
+        }
+
+        info!(
+            peer = %node_name,
+            mesh_key = %mkey,
+            active = active_relays,
+            desired,
+            deficit,
+            "APE recovery: connection deficit — dialing known peer"
+        );
+
+        let underlay_host = peer_uri.map(|u| transport::extract_host_from_uri(u));
+        let peer_entry = transport::PeerEntry {
+            yggdrasil_addr: peer_ygg,
+            port: transport::SWITCHBOARD_PORT,
+            tls: false,
+            want: None,
+            dial_host: underlay_host,
+        };
+
+        st.federation.pending_dials.insert(node_name.clone());
+        let mut tc_with_peer = (*tc).clone();
+        tc_with_peer
+            .peers
+            .entry(node_name.clone())
+            .or_insert(peer_entry);
+        spawn_native_relay(
+            node_name.clone(),
+            event_tx.clone(),
+            Arc::new(tc_with_peer),
+            shared_state.clone(),
+            false,
+        );
+        dialed += 1;
+    }
+
+    if dialed > 0 {
+        return; // Got some known peers dialing, wait for gossip to fill the rest.
+    }
+
+    // Phase 2: No reachable known peers. Fall back to seed addresses (LAGOON_PEERS).
+    for (host, _entry) in &tc.peers {
+        if dialed >= deficit {
+            break;
+        }
+        if st.federation.pending_dials.contains(host) {
+            continue;
+        }
+        // Skip seeds we're already connected to (check by node_name match).
+        let already_connected = st.federation.relays.values().any(|r| r.connect_target == *host);
+        if already_connected {
+            continue;
+        }
+
+        info!(
+            seed = %host,
+            active = active_relays,
+            desired,
+            "APE recovery: no known peers reachable — falling back to seed"
+        );
+
+        st.federation.pending_dials.insert(host.clone());
+        spawn_native_relay(
+            host.clone(),
+            event_tx.clone(),
+            tc.clone(),
+            shared_state.clone(),
+            true,
+        );
+        dialed += 1;
+    }
 }
 
 fn evict_stale_spiral_peers(st: &mut super::server::ServerState) {
@@ -5971,7 +6146,10 @@ fn reconverge_spiral(
         update_spiral_neighbors(st);
         dial_missing_spiral_neighbors(st, shared_state);
         st.notify_topology_change();
-        prune_non_spiral_relays(st);
+        // Atomic reslot: dial new SPIRAL neighbors FIRST, prune old ones LATER.
+        // prune_non_spiral_relays runs in the periodic sweep and after HELLO —
+        // by then the new connections are established. Pruning here would cut
+        // old connections before replacements are ready, causing disconnection.
         return true;
     }
 

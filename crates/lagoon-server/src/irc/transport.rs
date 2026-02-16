@@ -75,6 +75,12 @@ pub struct TransportConfig {
     /// Embedded Yggdrasil node for overlay networking.
     /// When present, Ygg-addressed peers are dialed directly through the overlay.
     pub ygg_node: Option<Arc<yggdrasil_rs::YggNode>>,
+    /// Global anycast switchboard IP (e.g. `109.224.228.162`). No port — always 9443.
+    /// When set, `dial_missing_spiral_neighbors` uses this as the dial target
+    /// for peers without a direct underlay route. The switchboard routes the
+    /// TCP connection to the requested peer via half-dial.
+    /// Set via `LAGOON_SWITCHBOARD_ADDR` env var. IP only, no port suffix.
+    pub switchboard_addr: Option<String>,
 }
 
 impl std::fmt::Debug for TransportConfig {
@@ -83,6 +89,7 @@ impl std::fmt::Debug for TransportConfig {
             .field("peers", &self.peers)
             .field("yggdrasil_available", &self.yggdrasil_available)
             .field("ygg_node", &self.ygg_node.is_some())
+            .field("switchboard_addr", &self.switchboard_addr)
             .finish()
     }
 }
@@ -93,6 +100,7 @@ impl TransportConfig {
             peers: HashMap::new(),
             yggdrasil_available: false,
             ygg_node: None,
+            switchboard_addr: None,
         }
     }
 }
@@ -1110,6 +1118,17 @@ pub fn build_config() -> TransportConfig {
 
     if config.yggdrasil_available {
         info!("transport: Yggdrasil connectivity detected (TUN/system)");
+    }
+
+    // LAGOON_SWITCHBOARD_ADDR = global anycast switchboard (e.g. "109.224.228.162:9443").
+    // Used by dial_missing_spiral_neighbors to reach peers via half-dial when no
+    // direct underlay route exists. Separate from LAGOON_PEERS (bootstrap/mesh WebSocket).
+    if let Ok(addr) = std::env::var("LAGOON_SWITCHBOARD_ADDR") {
+        let addr = addr.trim().to_string();
+        if !addr.is_empty() {
+            info!(switchboard_addr = %addr, "transport: global switchboard address configured");
+            config.switchboard_addr = Some(addr);
+        }
     }
 
     // LAGOON_PEERS = mesh federation endpoints.
