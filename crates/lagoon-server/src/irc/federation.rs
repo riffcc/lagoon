@@ -506,8 +506,27 @@ pub fn dial_missing_spiral_neighbors(
             continue;
         }
 
-        // Choose route: Ygg overlay if available, otherwise anycast switchboard.
-        let (connect_key, peer_entry) = if peer_ygg_addr.is_some() {
+        // Choose route: switchboard (if configured) > Ygg overlay > anycast fallback.
+        //
+        // When LAGOON_SWITCHBOARD_ADDR is set, ALL SPIRAL dials go through the
+        // switchboard. The server-side L4 splice handles cross-provider routing
+        // transparently (Bunny→switchboard→Fly target). Without a switchboard
+        // addr, direct dial via Ygg overlay/underlay (Fly→Fly).
+        let (connect_key, peer_entry) = if let Some(ref sb_addr) = tc.switchboard_addr {
+            info!(
+                peer = %node_name,
+                neighbor_mkey = %neighbor_mkey,
+                switchboard = %sb_addr,
+                "mesh: dialing SPIRAL neighbor via switchboard"
+            );
+            (sb_addr.clone(), transport::PeerEntry {
+                yggdrasil_addr: None,
+                port: transport::SWITCHBOARD_PORT,
+                tls: false,
+                want: Some(format!("peer:{}", neighbor_mkey)),
+                dial_host: None,
+            })
+        } else if peer_ygg_addr.is_some() {
             // Ygg overlay — dial the peer's switchboard directly.
             // Port MUST be SWITCHBOARD_PORT (9443) — SPIRAL neighbors use the
             // switchboard protocol, not IRC. peer.port is the IRC listen port

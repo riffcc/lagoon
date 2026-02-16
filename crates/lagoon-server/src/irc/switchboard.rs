@@ -270,25 +270,108 @@ async fn half_dial(
         }
         ResolveResult::Redirect { peer_id, underlay_addr } => {
             if let Some(ref underlay) = underlay_addr {
-                let redirect = SwitchboardMessage::PeerRedirect {
-                    target_peer_id: peer_id.clone(),
-                    method: "direct".into(),
-                    ygg_addr: Some(underlay.clone()),
+                // L4 splice — open internal connection to target, then copy
+                // bytes bidirectionally. The client sees PeerReady (transparent).
+                //
+                // This is the ASP application-layer proxy path. Works on any
+                // provider (Fly proxy-based anycast, BGP, floating VIP).
+                // TCP_REPAIR is a future optimization for bare-metal BGP where
+                // the anycast IP is locally bound.
+                let target_host = super::transport::extract_host_from_uri(underlay);
+                let target_addr = if target_host.contains(':') {
+                    format!("[{}]:{}", target_host, super::transport::SWITCHBOARD_PORT)
+                } else {
+                    format!("{}:{}", target_host, super::transport::SWITCHBOARD_PORT)
                 };
-                writer.write_all(redirect.to_line()?.as_bytes()).await?;
+
                 info!(
-                    %peer_addr,
-                    client_peer_id,
-                    target_peer_id = %peer_id,
-                    %underlay,
-                    "switchboard: redirect (direct, underlay)"
+                    %peer_addr, client_peer_id, target = %peer_id, %target_addr,
+                    "switchboard: splicing to target via internal connection"
                 );
+
+                // Connect to target's switchboard internally.
+                let target_stream = match TcpStream::connect(&target_addr).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // Internal dial failed — fall back to direct redirect.
+                        warn!(%target_addr, error = %e,
+                            "switchboard: internal dial failed, falling back to direct redirect");
+                        let redirect = SwitchboardMessage::PeerRedirect {
+                            target_peer_id: peer_id.clone(),
+                            method: "direct".into(),
+                            ygg_addr: Some(underlay.clone()),
+                        };
+                        writer.write_all(redirect.to_line()?.as_bytes()).await?;
+                        return Ok(());
+                    }
+                };
+                let _ = target_stream.set_nodelay(true);
+
+                // Complete half-dial with target (target sees the original client).
+                let (t_read, mut t_write) = target_stream.into_split();
+                let mut t_reader = BufReader::new(t_read);
+
+                // Send PeerRequest to target — will resolve IsSelf on the target.
+                let t_request = SwitchboardMessage::PeerRequest {
+                    my_peer_id: client_peer_id.clone(),
+                    want: format!("peer:{}", peer_id),
+                };
+                t_write.write_all(t_request.to_line()?.as_bytes()).await?;
+
+                // Read target's SwitchboardHello.
+                let mut t_line = String::new();
+                tokio::time::timeout(Duration::from_secs(5),
+                    t_reader.read_line(&mut t_line)).await
+                    .map_err(|_| "switchboard: target SwitchboardHello timeout")?
+                    .map_err(|e| format!("switchboard: target read error: {e}"))?;
+                let _t_hello = SwitchboardMessage::from_line(&t_line)?;
+
+                // Read target's PeerReady.
+                let mut t_line2 = String::new();
+                tokio::time::timeout(Duration::from_secs(5),
+                    t_reader.read_line(&mut t_line2)).await
+                    .map_err(|_| "switchboard: target PeerReady timeout")?
+                    .map_err(|e| format!("switchboard: target read error: {e}"))?;
+                let t_response = SwitchboardMessage::from_line(&t_line2)?;
+                let target_ready_id = match t_response {
+                    SwitchboardMessage::PeerReady { peer_id } => peer_id,
+                    other => return Err(format!(
+                        "switchboard: expected PeerReady from target, got {other:?}").into()),
+                };
+
+                // Forward PeerReady to the original client (transparent).
+                let ready = SwitchboardMessage::PeerReady {
+                    peer_id: target_ready_id,
+                };
+                writer.write_all(ready.to_line()?.as_bytes()).await?;
+
+                info!(%peer_addr, client_peer_id,
+                    "switchboard: splice established — entering bidirectional copy");
+
+                // Bidirectional byte forwarding. When either direction ends, both stop.
+                // BufReader drains its internal buffer before reading from the stream.
+                let mut client_reader = reader;
+                let mut client_writer = writer;
+                tokio::select! {
+                    r = tokio::io::copy(&mut client_reader, &mut t_write) => {
+                        if let Err(e) = r {
+                            debug!(error = %e, "switchboard: splice client→target ended");
+                        }
+                    }
+                    r = tokio::io::copy(&mut t_reader, &mut client_writer) => {
+                        if let Err(e) = r {
+                            debug!(error = %e, "switchboard: splice target→client ended");
+                        }
+                    }
+                }
+
+                info!(%peer_addr, "switchboard: splice complete");
+                Ok(())
             } else {
-                return Err(format!(
+                Err(format!(
                     "switchboard: redirect target {peer_id} has no underlay address"
-                ).into());
+                ).into())
             }
-            Ok(())
         }
         ResolveResult::NotFound => {
             Err(format!("switchboard: no peer found for want={want}").into())
