@@ -9,6 +9,9 @@ members = [
     "crates/yggdrasil-rs",
     "crates/ferrouswood",
 ]
+exclude = [
+    "crates/netprobe",
+]
 
 [workspace.package]
 version = "0.1.0"
