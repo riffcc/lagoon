@@ -1035,10 +1035,13 @@ pub async fn start(
         });
         st.mesh.vdf_state_rx = Some(vdf_state_rx);
         st.mesh.vdf_chain = Some(Arc::clone(&chain));
-        // Initialize cluster identity chain from VDF genesis hash.
-        // The chain advances on VDF window ticks and is carried in HELLO.
+        // Initialize cluster identity chain from a FIXED well-known genesis.
+        // Every node starts from the same root — time (VDF quantum advance)
+        // is the salt that progresses the chain. Using the node's unique VDF
+        // genesis here would make every node a different cluster on startup.
+        let cluster_genesis = *blake3::hash(b"lagoon").as_bytes();
         st.mesh.cluster_chain = Some(super::cluster_chain::ClusterChain::genesis(
-            genesis, 0, 1,
+            cluster_genesis, 0, 1,
         ));
         let shutdown_rx = _vdf_shutdown_tx.subscribe();
         tokio::spawn(super::vdf::run_vdf_engine(
