@@ -3311,15 +3311,36 @@ pub fn spawn_event_processor(
                 };
 
                 // Advance cluster identity chain on each VDF window tick.
-                // Uses VDF total_steps as the timestamp input — monotonically
-                // increasing, VDF-anchored, same for all nodes at same tick.
+                //
+                // The round seed is the VDF height quantized to the window
+                // boundary (30 steps = 1 window ≈ 3s at 10 Hz). All nodes
+                // snap to the same boundary: node at height 571 and node at
+                // 574 both use quantum 570. The chain only advances when we
+                // cross into a NEW quantum — not every tick.
+                //
+                // This is the Universal Clock: VDF height is deterministic
+                // (sequential, non-parallelizable), and quantizing eliminates
+                // minor drift between nodes. After merge, both sides agree on
+                // (value, round) and the next quantum boundary produces the
+                // same advance seed on both.
+                //
+                // TODO: Replace quantized height with the actual VDF hash at
+                // that height once CVDF (cooperative VDF) provides a shared
+                // chain tip that all cluster members agree on. The hash is
+                // unpredictable (VDF is sequential) — using it as the seed
+                // prevents precomputation of future chain values.
                 {
-                    let timestamp_round = st.mesh.vdf_state_rx.as_ref()
+                    const ROUND_QUANTUM: u64 = 30; // 1 VDF window = 30 steps
+                    let vdf_height = st.mesh.vdf_state_rx.as_ref()
                         .map(|rx| rx.borrow().total_steps)
                         .unwrap_or(0);
+                    let quantized = (vdf_height / ROUND_QUANTUM) * ROUND_QUANTUM;
                     let cluster_size = (st.mesh.known_peers.len() + 1) as u32;
                     if let Some(ref mut cc) = st.mesh.cluster_chain {
-                        cc.advance(timestamp_round, cluster_size);
+                        // Only advance when crossing a quantum boundary.
+                        if quantized > cc.last_timestamp_round() {
+                            cc.advance(quantized, cluster_size);
+                        }
                     }
                 }
 

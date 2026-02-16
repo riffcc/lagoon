@@ -230,6 +230,11 @@ impl ClusterChain {
         // History is NOT updated — the gap shows the disconnect in debug view.
     }
 
+    /// The timestamp_round used in the most recent advance (for quantum gating).
+    pub fn last_timestamp_round(&self) -> u64 {
+        self.history.first().map(|b| b.timestamp_round).unwrap_or(0)
+    }
+
     /// Get the current chain value as a hex string.
     pub fn value_hex(&self) -> String {
         hex::encode(self.value)
