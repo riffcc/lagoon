@@ -3323,6 +3323,17 @@ pub fn spawn_event_processor(
                     }
                 }
 
+                // HACK(TODO: remove): Re-broadcast HELLO so cluster chain values propagate.
+                // Without this, chains only compare on initial connection —
+                // nodes that connected before merge never re-compare.
+                // The 5s debounce in announce_hello_to_all_relays prevents flooding.
+                //
+                // The real fix: piggyback chain_value + chain_round on VdfWindow
+                // messages (already sent to all SPIRAL neighbors every tick) or
+                // add a lightweight CHAIN_SYNC gossip message. Full HELLO re-broadcast
+                // is wasteful — it carries the entire payload every 5s.
+                announce_hello_to_all_relays(&mut st);
+
                 // Broadcast to SPIRAL neighbors.
                 if let Some((msg, height, steps)) = window_msg {
                     let neighbor_keys: Vec<String> = st.mesh.spiral.neighbors()
