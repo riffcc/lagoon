@@ -1565,6 +1565,7 @@ pub fn spawn_event_processor(
                             prev_vdf_step,
                             last_vdf_advance,
                             cluster_chain_value: cluster_chain_value.clone(),
+                            cluster_chain_epoch_origin: cluster_chain_epoch_origin.clone(),
                             cluster_chain_round,
                         },
                     );
@@ -2276,6 +2277,7 @@ pub fn spawn_event_processor(
                                 // nodes see every peer's cluster identity.
                                 if peer.cluster_chain_value.is_some() {
                                     existing.cluster_chain_value = peer.cluster_chain_value.clone();
+                                    existing.cluster_chain_epoch_origin = peer.cluster_chain_epoch_origin.clone();
                                     existing.cluster_chain_round = peer.cluster_chain_round;
                                 }
                             }

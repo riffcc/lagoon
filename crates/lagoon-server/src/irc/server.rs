@@ -237,6 +237,10 @@ pub struct MeshPeerInfo {
     /// Cluster identity chain value (hex-encoded blake3 hash).
     #[serde(default)]
     pub cluster_chain_value: Option<String>,
+    /// Cluster epoch origin (hex-encoded blake3 hash) — stable cluster identity.
+    /// Only changes on merge/adopt, NOT on advance.
+    #[serde(default)]
+    pub cluster_chain_epoch_origin: Option<String>,
     /// Cluster identity chain round number.
     #[serde(default)]
     pub cluster_chain_round: Option<u64>,
@@ -270,6 +274,7 @@ impl Default for MeshPeerInfo {
             prev_vdf_step: None,
             last_vdf_advance: 0,
             cluster_chain_value: None,
+            cluster_chain_epoch_origin: None,
             cluster_chain_round: None,
         }
     }
@@ -731,6 +736,7 @@ impl ServerState {
                 cluster_chain: peer_info.cluster_chain_value.as_ref().map(|v| {
                     super::cluster_chain::ChainSummary {
                         chain_value_hex: v.clone(),
+                        epoch_origin_hex: peer_info.cluster_chain_epoch_origin.clone().unwrap_or_default(),
                         round: peer_info.cluster_chain_round.unwrap_or(0),
                         cumulative_work: 0,
                         merge_count: 0,

@@ -512,6 +512,11 @@ pub enum ChainComparison {
 pub struct ChainSummary {
     /// Chain value as hex string (first 16 chars for display, full for comparison).
     pub chain_value_hex: String,
+    /// Epoch origin as hex string — stable cluster identity.
+    /// Only changes on merge/adopt, NOT on advance.  Use this for cluster
+    /// grouping (same epoch_origin = same cluster).
+    #[serde(default)]
+    pub epoch_origin_hex: String,
     /// Current round number.
     pub round: u64,
     /// Total advance steps across all epochs (never resets).
@@ -612,6 +617,7 @@ impl ClusterChain {
             .count() as u32;
         ChainSummary {
             chain_value_hex: hex::encode(self.value),
+            epoch_origin_hex: hex::encode(self.epoch_origin),
             round: self.round,
             cumulative_work: self.cumulative_work,
             merge_count,

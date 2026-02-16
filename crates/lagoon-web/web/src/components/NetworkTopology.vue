@@ -41,10 +41,11 @@ function nodeColor(node) {
 }
 
 /** Derive a consistent HSL hue from a hex string (cluster identity).
- *  Same chain_value_hex → same color. Different values → different hues.
+ *  Uses epoch_origin_hex (stable across advances) for cluster grouping.
+ *  Falls back to chain_value_hex for old nodes that don't send epoch_origin.
  *  Returns an HSL color string or null if no cluster chain data. */
 function clusterRingColor(node) {
-  const hex = node.cluster_chain?.chain_value_hex
+  const hex = node.cluster_chain?.epoch_origin_hex || node.cluster_chain?.chain_value_hex
   if (!hex || hex.length < 8) return null
   // Use first 8 hex chars as a 32-bit number → map to hue [0, 360).
   const n = parseInt(hex.substring(0, 8), 16)
@@ -52,9 +53,9 @@ function clusterRingColor(node) {
   return `hsl(${hue}, 70%, 55%)`
 }
 
-/** Short display of cluster chain value (first 8 hex chars). */
+/** Short display of cluster identity (first 8 hex chars of epoch_origin). */
 function clusterValueShort(node) {
-  const hex = node.cluster_chain?.chain_value_hex
+  const hex = node.cluster_chain?.epoch_origin_hex || node.cluster_chain?.chain_value_hex
   if (!hex) return null
   return hex.substring(0, 8) + '...'
 }
@@ -498,8 +499,8 @@ function updateGraph(snapshot) {
   const spiralCount = snapshot.links.filter(l => l.link_type === 'spiral').length
   const clusterValues = new Set(
     serverNodes
-      .map(n => n.cluster_chain?.chain_value_hex)
-      .filter(v => v != null)
+      .map(n => n.cluster_chain?.epoch_origin_hex || n.cluster_chain?.chain_value_hex)
+      .filter(v => v != null && v !== '')
   )
   stats.value = {
     nodes: serverNodes.length,
