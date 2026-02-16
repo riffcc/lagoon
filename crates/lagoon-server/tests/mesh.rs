@@ -898,6 +898,7 @@ fn make_hello() -> HelloPayload {
         cluster_vdf_work: None,
         assigned_slot: None,
         cluster_chain_value: None,
+        cluster_chain_epoch_origin: None,
         cluster_chain_round: None,
         cluster_chain_work: None,
         cluster_round_seed: None,
@@ -2159,6 +2160,7 @@ async fn underlay_uri_stored_from_hello_relay_peer_addr() {
         cluster_vdf_work: None,
         assigned_slot: None,
         cluster_chain_value: None,
+        cluster_chain_epoch_origin: None,
         cluster_chain_round: None,
         cluster_chain_work: None,
         cluster_round_seed: None,
@@ -2888,9 +2890,9 @@ fn cluster_chain_merge_protocol() {
         beta.advance(&test_seed(ts), ts, 2);
     }
 
-    // Pre-merge: chains are different.
-    assert_eq!(alpha.compare(Some(&beta.value)), ChainComparison::DifferentCluster);
-    assert_eq!(beta.compare(Some(&alpha.value)), ChainComparison::DifferentCluster);
+    // Pre-merge: chains are different (different epoch origins).
+    assert_eq!(alpha.compare(Some(&beta.epoch_origin)), ChainComparison::DifferentCluster);
+    assert_eq!(beta.compare(Some(&alpha.epoch_origin)), ChainComparison::DifferentCluster);
 
     // Alpha wins (more nodes → more VDF work in real scenario).
     // Winner records merge with loser's chain value.
@@ -2905,11 +2907,11 @@ fn cluster_chain_merge_protocol() {
     // In real protocol: loser first adopts winner's old value from HELLO,
     // then on next HELLO sees winner's merged value and adopts again.
     // Here we test the final state: loser has winner's merged value.
-    beta.adopt(alpha.value, alpha.round, alpha.work_contributions.clone());
+    beta.adopt(alpha.value, alpha.round, alpha.work_contributions.clone(), Some(alpha.epoch_origin));
 
-    // Post-merge: both chains match.
-    assert_eq!(alpha.compare(Some(&beta.value)), ChainComparison::SameCluster);
-    assert_eq!(beta.compare(Some(&alpha.value)), ChainComparison::SameCluster);
+    // Post-merge: both have same epoch_origin (adopted from alpha).
+    assert_eq!(alpha.compare(Some(&beta.epoch_origin)), ChainComparison::SameCluster);
+    assert_eq!(beta.compare(Some(&alpha.epoch_origin)), ChainComparison::SameCluster);
 
     // Both advance together — chains stay in sync.
     alpha.advance(&test_seed(50), 50, 5);
@@ -2942,11 +2944,11 @@ fn cluster_chain_fresh_join_adoption() {
 
     // Simulate adoption: fresh node creates genesis then adopts.
     let mut joiner = ClusterChain::genesis(established.value, established.round, 1);
-    joiner.adopt(established.value, established.round, established.work_contributions.clone());
+    joiner.adopt(established.value, established.round, established.work_contributions.clone(), Some(established.epoch_origin));
 
-    // Now they're the same cluster.
-    assert_eq!(established.compare(Some(&joiner.value)), ChainComparison::SameCluster);
-    assert_eq!(joiner.compare(Some(&established.value)), ChainComparison::SameCluster);
+    // Now they're the same cluster (same epoch_origin).
+    assert_eq!(established.compare(Some(&joiner.epoch_origin)), ChainComparison::SameCluster);
+    assert_eq!(joiner.compare(Some(&established.epoch_origin)), ChainComparison::SameCluster);
 
     // They advance together.
     established.advance(&test_seed(40), 40, 4);
@@ -3023,21 +3025,21 @@ fn cluster_chain_cascading_merge() {
     let topo1 = blake3::hash(b"alpha-beta-topo").as_bytes().to_owned();
     let beta_value = beta.value;
     alpha.update_history(&beta_value, beta.round, &topo1, 40, 5);
-    beta.adopt(alpha.value, alpha.round, alpha.work_contributions.clone());
+    beta.adopt(alpha.value, alpha.round, alpha.work_contributions.clone(), Some(alpha.epoch_origin));
 
-    assert_eq!(alpha.compare(Some(&beta.value)), ChainComparison::SameCluster);
+    assert_eq!(alpha.compare(Some(&beta.epoch_origin)), ChainComparison::SameCluster);
 
     // Step 2: Alpha (now includes Beta) merges Gamma.
     let topo2 = blake3::hash(b"alpha-beta-gamma-topo").as_bytes().to_owned();
     let gamma_value = gamma.value;
     alpha.update_history(&gamma_value, gamma.round, &topo2, 50, 6);
-    gamma.adopt(alpha.value, alpha.round, alpha.work_contributions.clone());
-    beta.adopt(alpha.value, alpha.round, alpha.work_contributions.clone());
+    gamma.adopt(alpha.value, alpha.round, alpha.work_contributions.clone(), Some(alpha.epoch_origin));
+    beta.adopt(alpha.value, alpha.round, alpha.work_contributions.clone(), Some(alpha.epoch_origin));
 
-    // All three chains now match.
-    assert_eq!(alpha.compare(Some(&beta.value)), ChainComparison::SameCluster);
-    assert_eq!(alpha.compare(Some(&gamma.value)), ChainComparison::SameCluster);
-    assert_eq!(beta.compare(Some(&gamma.value)), ChainComparison::SameCluster);
+    // All three chains now match (same epoch_origin).
+    assert_eq!(alpha.compare(Some(&beta.epoch_origin)), ChainComparison::SameCluster);
+    assert_eq!(alpha.compare(Some(&gamma.epoch_origin)), ChainComparison::SameCluster);
+    assert_eq!(beta.compare(Some(&gamma.epoch_origin)), ChainComparison::SameCluster);
 
     assert_eq!(alpha.summary().merge_count, 2);
 
@@ -3121,9 +3123,10 @@ fn fvdf_spore_cascade_no_double_counting() {
     // Army members see higher work → ADOPT (not re-merge).
     // This is the key: adopt() sets value/work/round directly.
     let merged_contributions = alpha_scout.work_contributions.clone();
-    let adopted_1 = alpha_soldier1.adopt(merged_value, merged_round, merged_contributions.clone());
-    let adopted_2 = alpha_soldier2.adopt(merged_value, merged_round, merged_contributions.clone());
-    let adopted_beta = beta_soldier.adopt(merged_value, merged_round, merged_contributions.clone());
+    let merged_origin = alpha_scout.epoch_origin;
+    let adopted_1 = alpha_soldier1.adopt(merged_value, merged_round, merged_contributions.clone(), Some(merged_origin));
+    let adopted_2 = alpha_soldier2.adopt(merged_value, merged_round, merged_contributions.clone(), Some(merged_origin));
+    let adopted_beta = beta_soldier.adopt(merged_value, merged_round, merged_contributions.clone(), Some(merged_origin));
 
     assert!(adopted_1, "soldier1 should adopt (higher work)");
     assert!(adopted_2, "soldier2 should adopt (higher work)");
@@ -3176,11 +3179,12 @@ fn chain_update_wire_round_trip() {
         round: 100,
         proof: Some("dGVzdA==".into()),
         work_contributions: Some(contribs),
+        epoch_origin: Some("bb".repeat(32)),
     };
     let json = msg.to_json().unwrap();
     let decoded = MeshMessage::from_json(&json).unwrap();
     match decoded {
-        MeshMessage::ChainUpdate { value, cumulative_work, round, proof, work_contributions } => {
+        MeshMessage::ChainUpdate { value, cumulative_work, round, proof, work_contributions, .. } => {
             assert_eq!(value, "aa".repeat(32));
             assert_eq!(cumulative_work, 42000);
             assert_eq!(round, 100);

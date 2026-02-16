@@ -3394,6 +3394,8 @@ async fn handle_command(
                             #[serde(default)]
                             cluster_chain_value: Option<String>,
                             #[serde(default)]
+                            cluster_chain_epoch_origin: Option<String>,
+                            #[serde(default)]
                             cluster_chain_round: Option<u64>,
                             #[serde(default)]
                             cluster_chain_work: Option<u64>,
@@ -3440,6 +3442,7 @@ async fn handle_command(
                                     cluster_vdf_work: hello.cluster_vdf_work,
                                     assigned_slot: hello.assigned_slot,
                                     cluster_chain_value: hello.cluster_chain_value,
+                                    cluster_chain_epoch_origin: hello.cluster_chain_epoch_origin,
                                     cluster_chain_round: hello.cluster_chain_round,
                                     cluster_chain_work: hello.cluster_chain_work,
                                     cluster_round_seed: hello.cluster_round_seed,

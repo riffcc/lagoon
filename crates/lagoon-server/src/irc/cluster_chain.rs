@@ -163,10 +163,11 @@ impl ChainBlock {
 /// is encoded in the merged genesis hash itself.
 #[derive(Debug, Clone)]
 pub struct ClusterChain {
-    /// Current epoch genesis — the seed this epoch started from.
+    /// Current epoch origin — the seed this epoch started from.
     /// Set to the merged value on epoch reset. Both sides of a merge
-    /// compute the same genesis, so they advance in lockstep.
-    pub genesis: [u8; 32],
+    /// compute the same origin, so they advance in lockstep.
+    /// Stable across advances — only changes on merge/adopt.
+    pub epoch_origin: [u8; 32],
     /// Current chain value (256-bit blake3 hash).
     pub value: [u8; 32],
     /// Current round number (monotonic across epochs).
@@ -216,7 +217,7 @@ impl ClusterChain {
         let mut work_contributions = BTreeMap::new();
         work_contributions.insert(seed, 0);
         Self {
-            genesis: seed,
+            epoch_origin: seed,
             value: seed,
             round: 0,
             cumulative_work: 0,
@@ -255,7 +256,7 @@ impl ClusterChain {
         };
         self.value = new_value;
         self.round += 1;
-        *self.work_contributions.entry(self.genesis).or_insert(0) += 1;
+        *self.work_contributions.entry(self.epoch_origin).or_insert(0) += 1;
         self.cumulative_work = self.work_contributions.values().sum();
         self.epoch_chain.push(new_value);
         self.history.insert(0, block);
@@ -289,8 +290,10 @@ impl ClusterChain {
             },
             cluster_size: merged_size,
         };
+        self.epoch_origin = merged_seed;
         self.value = merged_seed;
         self.round += 1;
+        self.epoch_chain = vec![merged_seed];
         self.history.insert(0, block);
         self.enforce_history_limit();
     }
@@ -342,7 +345,7 @@ impl ClusterChain {
         // Epoch reset: merged value becomes the new genesis.
         // Both sides compute the same merged seed (commutative),
         // so they advance in lockstep from the next quantum tick.
-        self.genesis = merged;
+        self.epoch_origin = merged;
         self.value = merged;
         self.round = new_round;
         // Union contributions: take max per key (idempotent).
@@ -380,7 +383,7 @@ impl ClusterChain {
         };
         self.value = new_value;
         self.round += 1;
-        *self.work_contributions.entry(self.genesis).or_insert(0) += 1;
+        *self.work_contributions.entry(self.epoch_origin).or_insert(0) += 1;
         self.cumulative_work = self.work_contributions.values().sum();
         self.epoch_chain.push(new_value);
         self.history.insert(0, block);
@@ -399,12 +402,13 @@ impl ClusterChain {
         peer_value: [u8; 32],
         peer_round: u64,
         peer_contributions: BTreeMap<[u8; 32], u64>,
+        peer_epoch_origin: Option<[u8; 32]>,
     ) -> bool {
         let peer_work: u64 = peer_contributions.values().sum();
         if peer_work <= self.cumulative_work && peer_value == self.value {
             return false; // Already at this state or ahead.
         }
-        self.genesis = peer_value;
+        self.epoch_origin = peer_epoch_origin.unwrap_or(peer_value);
         self.value = peer_value;
         self.round = peer_round;
         self.work_contributions = peer_contributions;
@@ -459,10 +463,10 @@ impl ClusterChain {
     }
 
     /// Compare our chain with a remote peer's chain from HELLO.
-    pub fn compare(&self, remote_value: Option<&[u8; 32]>) -> ChainComparison {
-        match remote_value {
-            Some(rv) => {
-                if self.value == *rv {
+    pub fn compare(&self, remote_genesis: Option<&[u8; 32]>) -> ChainComparison {
+        match remote_genesis {
+            Some(rg) => {
+                if self.epoch_origin == *rg {
                     ChainComparison::SameCluster
                 } else {
                     ChainComparison::DifferentCluster
@@ -554,12 +558,12 @@ impl ClusterChain {
         let epoch_steps = self.epoch_steps();
         if epoch_steps == 0 {
             return ClusterChainProof {
-                genesis: self.genesis,
+                epoch_origin: self.epoch_origin,
                 tip: self.value,
                 epoch_steps: 0,
                 cumulative_work: self.cumulative_work,
                 epoch_start_quantum: self.epoch_start_quantum,
-                merkle_root: self.genesis,
+                merkle_root: self.epoch_origin,
                 challenges: Vec::new(),
             };
         }
@@ -570,7 +574,7 @@ impl ClusterChain {
         let mut challenges = Vec::with_capacity(num_challenges);
         for k in 0..num_challenges {
             let raw_idx = chain_fiat_shamir_challenge(
-                root, self.genesis, self.value, epoch_steps, k as u64,
+                root, self.epoch_origin, self.value, epoch_steps, k as u64,
             );
             let idx = (raw_idx % epoch_steps) as usize;
 
@@ -584,7 +588,7 @@ impl ClusterChain {
         }
 
         ClusterChainProof {
-            genesis: self.genesis,
+            epoch_origin: self.epoch_origin,
             tip: self.value,
             epoch_steps,
             cumulative_work: self.cumulative_work,
@@ -679,8 +683,8 @@ pub struct ClusterChainChallenge {
 /// Wire size: ~500 bytes with 3 challenges, regardless of epoch length.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterChainProof {
-    /// Genesis value of the current epoch.
-    pub genesis: [u8; 32],
+    /// Epoch origin — the seed value of the current epoch.
+    pub epoch_origin: [u8; 32],
     /// Current tip value.
     pub tip: [u8; 32],
     /// Number of advance steps in this epoch.
@@ -708,14 +712,14 @@ impl ClusterChainProof {
     /// For small epochs, also recomputes the full chain from genesis.
     pub fn verify(&self) -> bool {
         if self.epoch_steps == 0 {
-            return self.genesis == self.tip;
+            return self.epoch_origin == self.tip;
         }
 
         // Fiat-Shamir spot checks.
         for (k, challenge) in self.challenges.iter().enumerate() {
             // 1. Re-derive expected challenge index.
             let expected_raw = chain_fiat_shamir_challenge(
-                self.merkle_root, self.genesis, self.tip,
+                self.merkle_root, self.epoch_origin, self.tip,
                 self.epoch_steps, k as u64,
             );
             if challenge.index != expected_raw % self.epoch_steps {
@@ -754,7 +758,7 @@ impl ClusterChainProof {
 
         // Endpoint recompute for small epochs — 100% secure.
         if self.epoch_steps <= EPOCH_RECOMPUTE_LIMIT {
-            let mut h = self.genesis;
+            let mut h = self.epoch_origin;
             for i in 0..self.epoch_steps {
                 let seed = derive_round_seed(self.epoch_start_quantum, i);
                 h = advance_chain(&h, &seed);
@@ -895,7 +899,7 @@ mod tests {
         let peer_value = blake3::hash(b"peer-chain-tip").as_bytes().to_owned();
         let mut contributions = BTreeMap::new();
         contributions.insert(peer_value, 100);
-        chain.adopt(peer_value, 42, contributions);
+        chain.adopt(peer_value, 42, contributions, None);
         assert_eq!(chain.value, peer_value);
         assert_eq!(chain.round, 42);
         assert_eq!(chain.cumulative_work, 100);
@@ -991,7 +995,7 @@ mod tests {
         assert_ne!(expected, seed_a); // combined value differs from both inputs
         assert_ne!(expected, seed_b);
         // Epoch reset: genesis is now the merged value
-        assert_eq!(chain.genesis, expected);
+        assert_eq!(chain.epoch_origin, expected);
         assert!(matches!(chain.history[0].event, ChainEvent::FungibleMerge { .. }));
         assert_eq!(chain.merge_events().len(), 1);
         // blake3 combine always changes both sides (neither input survives)
@@ -1014,7 +1018,7 @@ mod tests {
 
         // Now they're SameCluster with the same genesis
         assert_eq!(chain_a.compare(Some(&chain_b.value)), ChainComparison::SameCluster);
-        assert_eq!(chain_a.genesis, chain_b.genesis);
+        assert_eq!(chain_a.epoch_origin, chain_b.epoch_origin);
     }
 
     #[test]
@@ -1032,7 +1036,7 @@ mod tests {
         chain_a.fungible_adopt(&seed_b, chain_b.round, &b_contribs, 100, 3);
         chain_b.fungible_adopt(&seed_a, chain_a.round, &a_contribs, 100, 3);
         assert_eq!(chain_a.value, chain_b.value);
-        assert_eq!(chain_a.genesis, chain_b.genesis);
+        assert_eq!(chain_a.epoch_origin, chain_b.epoch_origin);
 
         // The combined value is neither original
         assert_ne!(chain_a.value, seed_a);
@@ -1203,7 +1207,7 @@ mod tests {
 
         // Tamper: change the genesis.
         let mut bad_genesis = proof.clone();
-        bad_genesis.genesis = blake3::hash(b"fake-genesis").as_bytes().to_owned();
+        bad_genesis.epoch_origin = blake3::hash(b"fake-genesis").as_bytes().to_owned();
         assert!(!bad_genesis.verify(), "tampered genesis should fail");
 
         // Tamper: inflate epoch_steps.
@@ -1235,7 +1239,7 @@ mod tests {
 
         // Verify round_seed derivation matches.
         let seed_0 = derive_round_seed(500, 0);
-        let expected_first = advance_chain(&chain.genesis, &seed_0);
+        let expected_first = advance_chain(&chain.epoch_origin, &seed_0);
         assert_eq!(chain.epoch_chain[1], expected_first);
     }
 }

@@ -139,6 +139,7 @@ pub fn dispatch_mesh_message(
                 cluster_vdf_work: hello.cluster_vdf_work,
                 assigned_slot: hello.assigned_slot,
                 cluster_chain_value: hello.cluster_chain_value.clone(),
+                cluster_chain_epoch_origin: hello.cluster_chain_epoch_origin.clone(),
                 cluster_chain_round: hello.cluster_chain_round,
                 cluster_chain_work: hello.cluster_chain_work,
                 cluster_round_seed: hello.cluster_round_seed.clone(),
@@ -290,7 +291,7 @@ pub fn dispatch_mesh_message(
             });
             None
         }
-        MeshMessage::ChainUpdate { value, cumulative_work, round, proof, work_contributions } => {
+        MeshMessage::ChainUpdate { value, cumulative_work, round, proof, work_contributions, epoch_origin } => {
             let _ = event_tx.send(RelayEvent::ChainUpdate {
                 remote_host: remote_host.to_string(),
                 value,
@@ -298,6 +299,7 @@ pub fn dispatch_mesh_message(
                 round,
                 proof,
                 work_contributions,
+                epoch_origin,
             });
             None
         }
@@ -770,8 +772,11 @@ pub enum RelayEvent {
         cluster_vdf_work: Option<f64>,
         /// Concierge slot assignment — first empty slot in sender's topology.
         assigned_slot: Option<u64>,
-        /// Cluster identity chain value (hex-encoded blake3 hash).
+        /// Cluster identity chain value (hex-encoded blake3 hash, current tip).
         cluster_chain_value: Option<String>,
+        /// Cluster epoch origin (hex-encoded blake3 hash).
+        /// Stable across advances — only changes on merge/adopt.
+        cluster_chain_epoch_origin: Option<String>,
         /// Cluster identity chain round number.
         cluster_chain_round: Option<u64>,
         /// Cluster chain cumulative work (advance steps across all epochs).
@@ -923,6 +928,8 @@ pub enum RelayEvent {
         proof: Option<String>,
         /// Work contributions ledger: genesis_hash(hex) → advance_steps.
         work_contributions: Option<std::collections::HashMap<String, u64>>,
+        /// Epoch origin (hex string). Stable across advances — only changes on merge/adopt.
+        epoch_origin: Option<String>,
     },
 }
 
@@ -1349,6 +1356,7 @@ pub fn spawn_event_processor(
                     cluster_vdf_work,
                     assigned_slot,
                     cluster_chain_value,
+                    cluster_chain_epoch_origin,
                     cluster_chain_round,
                     cluster_chain_work,
                     cluster_round_seed: _,
@@ -1605,8 +1613,11 @@ pub fn spawn_event_processor(
                                     // Synthesize single-entry contributions from HELLO.
                                     let mut contribs = std::collections::BTreeMap::new();
                                     contribs.insert(value, work);
+                                    let origin = cluster_chain_epoch_origin.as_ref()
+                                        .and_then(|h| hex::decode(h).ok())
+                                        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
                                     let mut cc = super::cluster_chain::ClusterChain::genesis(value, round, 1);
-                                    cc.adopt(value, round, contribs);
+                                    cc.adopt(value, round, contribs, origin);
                                     st.mesh.cluster_chain = Some(cc);
                                     info!(chain = &hex_val[..8.min(hex_val.len())], work, "cluster chain: adopted from first peer (fresh join)");
                                     broadcast_chain_update(&st);
@@ -1637,9 +1648,18 @@ pub fn spawn_event_processor(
                             <[u8; 32]>::try_from(bytes.as_slice()).ok()
                         })
                     });
+                    // Use epoch_origin for comparison (stable across advances).
+                    // Fall back to chain_value for old nodes that don't send it.
+                    let remote_origin_bytes = cluster_chain_epoch_origin.as_ref()
+                        .and_then(|hex_str| {
+                            hex::decode(hex_str).ok().and_then(|bytes| {
+                                <[u8; 32]>::try_from(bytes.as_slice()).ok()
+                            })
+                        })
+                        .or(remote_chain_bytes);
 
                     if let Some(ref mut cc) = st.mesh.cluster_chain {
-                        let comparison = cc.compare(remote_chain_bytes.as_ref());
+                        let comparison = cc.compare(remote_origin_bytes.as_ref());
                         match comparison {
                             super::cluster_chain::ChainComparison::SameCluster => {
                                 // Chains match. Nothing to do — Universal Clock
@@ -3295,7 +3315,7 @@ pub fn spawn_event_processor(
                     }
                 }
 
-                RelayEvent::ChainUpdate { remote_host, value, cumulative_work, round, proof, work_contributions } => {
+                RelayEvent::ChainUpdate { remote_host, value, cumulative_work, round, proof, work_contributions, epoch_origin } => {
                     // SPORE cascade: a peer merged and is broadcasting the result.
                     // If their work > ours, adopt — no re-merge, no double-counting.
                     //
@@ -3356,10 +3376,17 @@ pub fn spawn_event_processor(
                                     m
                                 });
 
+                        // Decode epoch_origin from hex → [u8; 32].
+                        let epoch_origin_bytes: Option<[u8; 32]> = epoch_origin.as_ref()
+                            .and_then(|hex_str| {
+                                hex::decode(hex_str).ok()
+                                    .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                            });
+
                         let mut st = state.write().await;
                         let adopted = if let Some(ref mut cc) = st.mesh.cluster_chain {
                             if cumulative_work > cc.cumulative_work {
-                                cc.adopt(new_value, round, peer_contributions);
+                                cc.adopt(new_value, round, peer_contributions, epoch_origin_bytes);
                                 true
                             } else {
                                 false
@@ -3368,7 +3395,7 @@ pub fn spawn_event_processor(
                             // We have no chain — adopt theirs.
                             let mut cc = super::cluster_chain::ClusterChain::genesis(
                                 new_value, round, 1);
-                            cc.adopt(new_value, round, peer_contributions);
+                            cc.adopt(new_value, round, peer_contributions, epoch_origin_bytes);
                             st.mesh.cluster_chain = Some(cc);
                             true
                         };
@@ -3815,6 +3842,7 @@ pub fn broadcast_chain_update(st: &super::server::ServerState) {
         round: cc.round,
         proof: proof_b64,
         work_contributions: Some(cc.contributions_hex()),
+        epoch_origin: Some(hex::encode(cc.epoch_origin)),
     };
     for (_key, relay) in &st.federation.relays {
         // Skip relays that haven't completed Hello handshake.
@@ -5502,6 +5530,7 @@ async fn relay_task(
                                             cluster_vdf_work: hello.cluster_vdf_work,
                                             assigned_slot: hello.assigned_slot,
                                             cluster_chain_value: hello.cluster_chain_value,
+                                            cluster_chain_epoch_origin: hello.cluster_chain_epoch_origin,
                                             cluster_chain_round: hello.cluster_chain_round,
                                             cluster_chain_work: hello.cluster_chain_work,
                                             cluster_round_seed: hello.cluster_round_seed,
@@ -5811,10 +5840,14 @@ struct MeshHelloPayload {
     /// Included when the sender has a claimed SPIRAL slot. Joiner takes it.
     #[serde(default)]
     pub assigned_slot: Option<u64>,
-    /// Cluster identity chain value (hex-encoded blake3 hash).
-    /// Same value → same cluster. Different → merge trigger.
+    /// Cluster identity chain value (hex-encoded blake3 hash, current tip).
     #[serde(default)]
     pub cluster_chain_value: Option<String>,
+    /// Cluster epoch origin (hex-encoded blake3 hash).
+    /// Stable across advances — only changes on merge/adopt.
+    /// Same origin → same cluster. Different → merge trigger.
+    #[serde(default)]
+    pub cluster_chain_epoch_origin: Option<String>,
     /// Cluster identity chain round number.
     #[serde(default)]
     pub cluster_chain_round: Option<u64>,
@@ -5855,6 +5888,7 @@ pub fn build_wire_hello(st: &mut super::server::ServerState) -> HelloPayload {
         cluster_vdf_work: hp.cluster_vdf_work,
         assigned_slot: hp.assigned_slot,
         cluster_chain_value: hp.cluster_chain_value,
+        cluster_chain_epoch_origin: hp.cluster_chain_epoch_origin,
         cluster_chain_round: hp.cluster_chain_round,
         cluster_chain_work: hp.cluster_chain_work,
         cluster_round_seed: hp.cluster_round_seed,
@@ -6697,6 +6731,7 @@ fn build_hello_payload(st: &mut super::server::ServerState) -> MeshHelloPayload 
         cluster_vdf_work,
         assigned_slot,
         cluster_chain_value: st.mesh.cluster_chain.as_ref().map(|cc| cc.value_hex()),
+        cluster_chain_epoch_origin: st.mesh.cluster_chain.as_ref().map(|cc| hex::encode(cc.epoch_origin)),
         cluster_chain_round: st.mesh.cluster_chain.as_ref().map(|cc| cc.round),
         cluster_chain_work: st.mesh.cluster_chain.as_ref().map(|cc| cc.cumulative_work),
         cluster_round_seed: st.mesh.cluster_round_seed.map(|s| hex::encode(s)),
@@ -6833,10 +6868,11 @@ fn mesh_message_to_irc(msg: &MeshMessage) -> Message {
         MeshMessage::VdfWindow { .. } => {
             ("VDF_WINDOW".into(), String::new())
         }
-        MeshMessage::ChainUpdate { value, cumulative_work, round, proof, work_contributions } => {
+        MeshMessage::ChainUpdate { value, cumulative_work, round, proof, work_contributions, epoch_origin } => {
             ("CHAIN_UPDATE".into(), serde_json::json!({
                 "value": value, "cumulative_work": cumulative_work, "round": round,
                 "proof": proof, "work_contributions": work_contributions,
+                "epoch_origin": epoch_origin,
             }).to_string())
         }
     };

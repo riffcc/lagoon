@@ -65,9 +65,13 @@ pub struct HelloPayload {
     /// One integer. O(1). Scales to millions of nodes.
     #[serde(default)]
     pub assigned_slot: Option<u64>,
-    /// Cluster identity chain value (hex-encoded blake3 hash).
+    /// Cluster identity chain value (hex-encoded blake3 hash, current tip).
     #[serde(default)]
     pub cluster_chain_value: Option<String>,
+    /// Cluster epoch origin (hex-encoded blake3 hash).
+    /// Stable across advances — only changes on merge/adopt.
+    #[serde(default)]
+    pub cluster_chain_epoch_origin: Option<String>,
     /// Cluster identity chain round number.
     #[serde(default)]
     pub cluster_chain_round: Option<u64>,
@@ -201,6 +205,11 @@ pub enum MeshMessage {
         /// receivers synthesize a single-entry map from cumulative_work.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         work_contributions: Option<std::collections::HashMap<String, u64>>,
+        /// Epoch origin (hex-encoded 32 bytes). Stable across advances — only
+        /// changes on merge/adopt. Used by receivers to set their epoch_origin
+        /// correctly when adopting via SPORE cascade.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        epoch_origin: Option<String>,
     },
 
     /// CVDF cooperative VDF message — attestations, rounds, sync.
@@ -405,6 +414,7 @@ mod tests {
             cluster_vdf_work: Some(1000.5),
             assigned_slot: Some(3),
             cluster_chain_value: Some("deadbeefcafe".into()),
+            cluster_chain_epoch_origin: Some("cafebabe1234".into()),
             cluster_chain_round: Some(99),
             cluster_chain_work: Some(42),
             cluster_round_seed: Some("abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234".into()),
@@ -732,6 +742,7 @@ mod tests {
             round: 42,
             proof: Some("c29tZXByb29m".into()),
             work_contributions: Some(contribs),
+            epoch_origin: Some("dd".repeat(32)),
         };
         let json = msg.to_json().unwrap();
         assert!(json.contains(r#""type":"chain_update""#));
@@ -740,7 +751,7 @@ mod tests {
         assert!(json.contains(r#""work_contributions""#));
         let decoded = MeshMessage::from_json(&json).unwrap();
         match decoded {
-            MeshMessage::ChainUpdate { value, cumulative_work, round, proof, work_contributions } => {
+            MeshMessage::ChainUpdate { value, cumulative_work, round, proof, work_contributions, epoch_origin } => {
                 assert_eq!(value, "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233");
                 assert_eq!(cumulative_work, 5300);
                 assert_eq!(round, 42);
@@ -748,6 +759,7 @@ mod tests {
                 let wc = work_contributions.unwrap();
                 assert_eq!(wc.get(&"aa".repeat(32)), Some(&3000));
                 assert_eq!(wc.get(&"bb".repeat(32)), Some(&2300));
+                assert_eq!(epoch_origin.as_deref(), Some(&*"dd".repeat(32)));
             }
             other => panic!("expected ChainUpdate, got {other:?}"),
         }
@@ -761,10 +773,12 @@ mod tests {
             round: 0,
             proof: None,
             work_contributions: None,
+            epoch_origin: None,
         };
         let json = msg.to_json().unwrap();
         assert!(!json.contains("proof")); // skip_serializing_if = None
         assert!(!json.contains("work_contributions"));
+        assert!(!json.contains("epoch_origin"));
         let decoded = MeshMessage::from_json(&json).unwrap();
         match decoded {
             MeshMessage::ChainUpdate { proof, .. } => {
