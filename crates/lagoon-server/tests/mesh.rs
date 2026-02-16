@@ -2858,3 +2858,194 @@ async fn forty_node_spiral_mesh() {
     );
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// Cluster chain merge protocol tests
+// ═══════════════════════════════════════════════════════════════════════
+
+use lagoon_server::irc::cluster_chain::{ChainComparison, ClusterChain};
+
+#[test]
+fn cluster_chain_merge_protocol() {
+    // Two clusters with different genesis seeds.
+    let seed_alpha = blake3::hash(b"cluster-alpha").as_bytes().to_owned();
+    let seed_beta = blake3::hash(b"cluster-beta").as_bytes().to_owned();
+
+    let mut alpha = ClusterChain::genesis(seed_alpha, 0, 3);
+    let mut beta = ClusterChain::genesis(seed_beta, 0, 2);
+
+    // Advance both chains a few rounds (simulating VDF ticks).
+    for ts in [10, 20, 30] {
+        alpha.advance(ts, 3);
+        beta.advance(ts, 2);
+    }
+
+    // Pre-merge: chains are different.
+    assert_eq!(alpha.compare(Some(&beta.value)), ChainComparison::DifferentCluster);
+    assert_eq!(beta.compare(Some(&alpha.value)), ChainComparison::DifferentCluster);
+
+    // Alpha wins (more nodes → more VDF work in real scenario).
+    // Winner records merge with loser's chain value.
+    let topo_hash = blake3::hash(b"merged-topology").as_bytes().to_owned();
+    let loser_value = beta.value;
+    let loser_round = beta.round;
+
+    alpha.record_merge(&loser_value, loser_round, &topo_hash, 40, 5);
+    assert_eq!(alpha.summary().merge_count, 1);
+
+    // Loser adopts the winner's NEW (post-merge) chain value.
+    // In real protocol: loser first adopts winner's old value from HELLO,
+    // then on next HELLO sees winner's merged value and adopts again.
+    // Here we test the final state: loser has winner's merged value.
+    beta.adopt(alpha.value, alpha.round);
+
+    // Post-merge: both chains match.
+    assert_eq!(alpha.compare(Some(&beta.value)), ChainComparison::SameCluster);
+    assert_eq!(beta.compare(Some(&alpha.value)), ChainComparison::SameCluster);
+
+    // Both advance together — chains stay in sync.
+    alpha.advance(50, 5);
+    beta.advance(50, 5);
+    assert_eq!(alpha.value, beta.value);
+    assert_eq!(alpha.round, beta.round);
+
+    eprintln!(
+        "\n=== CLUSTER CHAIN MERGE PROTOCOL: VERIFIED ===\n\
+         Alpha merges: {}\n\
+         Beta adopts:  chain matches alpha\n\
+         Post-merge:   SameCluster ✓\n\
+         Sync advance: chains identical ✓\n\
+         ============================================",
+        alpha.summary().merge_count,
+    );
+}
+
+#[test]
+fn cluster_chain_fresh_join_adoption() {
+    // Established node has a chain, fresh node has none.
+    let seed = blake3::hash(b"established-cluster").as_bytes().to_owned();
+    let mut established = ClusterChain::genesis(seed, 0, 3);
+    for ts in [10, 20, 30] {
+        established.advance(ts, 3);
+    }
+
+    // Fresh node sees established node's chain → adopts it.
+    assert_eq!(established.compare(None), ChainComparison::FreshJoin);
+
+    // Simulate adoption: fresh node creates genesis then adopts.
+    let mut joiner = ClusterChain::genesis(established.value, established.round, 1);
+    joiner.adopt(established.value, established.round);
+
+    // Now they're the same cluster.
+    assert_eq!(established.compare(Some(&joiner.value)), ChainComparison::SameCluster);
+    assert_eq!(joiner.compare(Some(&established.value)), ChainComparison::SameCluster);
+
+    // They advance together.
+    established.advance(40, 4);
+    joiner.advance(40, 4);
+    assert_eq!(established.value, joiner.value);
+
+    eprintln!(
+        "\n=== CLUSTER CHAIN FRESH JOIN: VERIFIED ===\n\
+         Joiner adopted established chain ✓\n\
+         Post-join:   SameCluster ✓\n\
+         Sync advance: chains identical ✓\n\
+         =========================================="
+    );
+}
+
+#[test]
+fn cluster_chain_merge_deterministic() {
+    // The merged seed is deterministic: two nodes computing the same merge
+    // independently arrive at the same chain value.
+    let seed_a = blake3::hash(b"cluster-a").as_bytes().to_owned();
+    let seed_b = blake3::hash(b"cluster-b").as_bytes().to_owned();
+
+    let mut node1 = ClusterChain::genesis(seed_a, 0, 3);
+    let mut node2 = ClusterChain::genesis(seed_a, 0, 3);
+
+    // Both advance identically.
+    for ts in [10, 20, 30] {
+        node1.advance(ts, 3);
+        node2.advance(ts, 3);
+    }
+    assert_eq!(node1.value, node2.value);
+
+    // Both record the same merge (loser = cluster B).
+    let topo = blake3::hash(b"same-topology").as_bytes().to_owned();
+    let loser = blake3::hash(b"cluster-b-tip").as_bytes().to_owned();
+    node1.record_merge(&loser, 3, &topo, 40, 5);
+    node2.record_merge(&loser, 3, &topo, 40, 5);
+
+    // Both arrive at the same merged chain value.
+    assert_eq!(node1.value, node2.value);
+    assert_eq!(node1.round, node2.round);
+
+    eprintln!(
+        "\n=== CLUSTER CHAIN MERGE DETERMINISM: VERIFIED ===\n\
+         Node1 chain: {}\n\
+         Node2 chain: {}\n\
+         Match: ✓\n\
+         =================================================",
+        node1.value_short(),
+        node2.value_short(),
+    );
+}
+
+#[test]
+fn cluster_chain_cascading_merge() {
+    // Simulate 3-cluster cascading merge:
+    // Alpha (3 nodes), Beta (2 nodes), Gamma (1 node).
+    // Alpha wins all merges (most VDF work).
+    let seed_a = blake3::hash(b"alpha").as_bytes().to_owned();
+    let seed_b = blake3::hash(b"beta").as_bytes().to_owned();
+    let seed_c = blake3::hash(b"gamma").as_bytes().to_owned();
+
+    let mut alpha = ClusterChain::genesis(seed_a, 0, 3);
+    let mut beta = ClusterChain::genesis(seed_b, 0, 2);
+    let mut gamma = ClusterChain::genesis(seed_c, 0, 1);
+
+    for ts in [10, 20, 30] {
+        alpha.advance(ts, 3);
+        beta.advance(ts, 2);
+        gamma.advance(ts, 1);
+    }
+
+    // Step 1: Alpha merges Beta.
+    let topo1 = blake3::hash(b"alpha-beta-topo").as_bytes().to_owned();
+    let beta_value = beta.value;
+    alpha.record_merge(&beta_value, beta.round, &topo1, 40, 5);
+    beta.adopt(alpha.value, alpha.round);
+
+    assert_eq!(alpha.compare(Some(&beta.value)), ChainComparison::SameCluster);
+
+    // Step 2: Alpha (now includes Beta) merges Gamma.
+    let topo2 = blake3::hash(b"alpha-beta-gamma-topo").as_bytes().to_owned();
+    let gamma_value = gamma.value;
+    alpha.record_merge(&gamma_value, gamma.round, &topo2, 50, 6);
+    gamma.adopt(alpha.value, alpha.round);
+    beta.adopt(alpha.value, alpha.round);
+
+    // All three chains now match.
+    assert_eq!(alpha.compare(Some(&beta.value)), ChainComparison::SameCluster);
+    assert_eq!(alpha.compare(Some(&gamma.value)), ChainComparison::SameCluster);
+    assert_eq!(beta.compare(Some(&gamma.value)), ChainComparison::SameCluster);
+
+    assert_eq!(alpha.summary().merge_count, 2);
+
+    // All advance together.
+    alpha.advance(60, 6);
+    beta.advance(60, 6);
+    gamma.advance(60, 6);
+    assert_eq!(alpha.value, beta.value);
+    assert_eq!(alpha.value, gamma.value);
+
+    eprintln!(
+        "\n=== CLUSTER CHAIN CASCADING MERGE: VERIFIED ===\n\
+         Alpha merges: {}\n\
+         All 3 chains converged: ✓\n\
+         Sync advance: all identical ✓\n\
+         ===============================================",
+        alpha.summary().merge_count,
+    );
+}
+

@@ -234,6 +234,12 @@ pub struct MeshPeerInfo {
     /// if this hasn't updated in 10 seconds, the peer is dead.
     #[serde(skip)]
     pub last_vdf_advance: u64,
+    /// Cluster identity chain value (hex-encoded blake3 hash).
+    #[serde(default)]
+    pub cluster_chain_value: Option<String>,
+    /// Cluster identity chain round number.
+    #[serde(default)]
+    pub cluster_chain_round: Option<u64>,
 }
 
 fn default_peer_port() -> u16 {
@@ -263,6 +269,8 @@ impl Default for MeshPeerInfo {
             underlay_uri: None,
             prev_vdf_step: None,
             last_vdf_advance: 0,
+            cluster_chain_value: None,
+            cluster_chain_round: None,
         }
     }
 }
@@ -713,7 +721,14 @@ impl ServerState {
                 connected_count: None,
                 ygg_up_count: None,
                 disconnected_count: None,
-                cluster_chain: None,
+                cluster_chain: peer_info.cluster_chain_value.as_ref().map(|v| {
+                    super::cluster_chain::ChainSummary {
+                        chain_value_hex: v.clone(),
+                        round: peer_info.cluster_chain_round.unwrap_or(0),
+                        merge_count: 0,
+                        split_count: 0,
+                    }
+                }),
             });
             if connected {
                 // Latency priority: proof_store → relay PING/PONG → Yggdrasil.

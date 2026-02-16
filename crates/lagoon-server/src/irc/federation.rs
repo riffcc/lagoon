@@ -1486,6 +1486,8 @@ pub fn spawn_event_processor(
                             underlay_uri,
                             prev_vdf_step,
                             last_vdf_advance,
+                            cluster_chain_value: cluster_chain_value.clone(),
+                            cluster_chain_round,
                         },
                     );
                     st.mesh
@@ -1552,10 +1554,49 @@ pub fn spawn_event_processor(
                         state.clone(),
                     );
 
-                    // Cluster identity chain comparison.
-                    // Same chain → same cluster. Different → merge trigger.
-                    // Fresh (no chain) → joiner adopts our chain.
-                    if let Some(ref cc) = st.mesh.cluster_chain {
+                    // Cluster identity chain: merge / adopt protocol.
+                    //
+                    // If WE have no chain but remote does, adopt theirs (we're the joiner).
+                    if st.mesh.cluster_chain.is_none() {
+                        if let Some(ref hex_val) = cluster_chain_value {
+                            if let Ok(bytes) = hex::decode(hex_val) {
+                                if let Ok(value) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                                    let round = cluster_chain_round.unwrap_or(0);
+                                    let mut cc = super::cluster_chain::ClusterChain::genesis(value, round, 1);
+                                    cc.adopt(value, round);
+                                    st.mesh.cluster_chain = Some(cc);
+                                    info!(chain = &hex_val[..8.min(hex_val.len())], "cluster chain: adopted from first peer (fresh join)");
+                                }
+                            }
+                        }
+                    }
+
+                    // Compare our chain with remote's chain.
+                    // Same → same cluster. Different → merge/adopt. Fresh → they adopt ours.
+                    //
+                    // Extract values needed for merge BEFORE borrowing cluster_chain mutably
+                    // (borrow checker: cc borrows st.mesh.cluster_chain, so we can't also
+                    // read st.mesh.known_peers / st.mesh.spiral / st.mesh.vdf_state_rx).
+                    let chain_merge_ctx = {
+                        let our_work = st.mesh.our_cluster_vdf_work;
+                        let their_work = cluster_vdf_work.unwrap_or(0.0);
+                        let our_vdf_hash: Option<Vec<u8>> = st.mesh.vdf_state_rx.as_ref()
+                            .map(|rx| rx.borrow().current_hash.to_vec());
+                        let their_vdf_hash: Option<Vec<u8>> = remote_vdf_hash_for_merge
+                            .as_deref().and_then(|h| hex::decode(h).ok());
+                        let our_pid = st.lens.peer_id.clone();
+                        let we_win = our_work > their_work
+                            || (our_work == their_work && vdf_tiebreak_wins(
+                                &our_pid, &peer_id,
+                                our_vdf_hash.as_deref(), their_vdf_hash.as_deref()));
+                        let ts = st.mesh.vdf_state_rx.as_ref()
+                            .map(|rx| rx.borrow().total_steps).unwrap_or(0);
+                        let size = (st.mesh.known_peers.len() + 1) as u32;
+                        let topo = compute_topology_hash(&st.mesh.spiral);
+                        (we_win, ts, size, topo)
+                    };
+
+                    if let Some(ref mut cc) = st.mesh.cluster_chain {
                         let remote_bytes = cluster_chain_value.as_ref().and_then(|hex_str| {
                             hex::decode(hex_str).ok().and_then(|bytes| {
                                 <[u8; 32]>::try_from(bytes.as_slice()).ok()
@@ -1563,27 +1604,26 @@ pub fn spawn_event_processor(
                         });
                         let comparison = cc.compare(remote_bytes.as_ref());
                         match comparison {
-                            super::cluster_chain::ChainComparison::SameCluster => {
-                                // Same cluster — no action needed.
-                            }
+                            super::cluster_chain::ChainComparison::SameCluster => {}
                             super::cluster_chain::ChainComparison::DifferentCluster => {
-                                info!(
-                                    peer = %mkey,
-                                    our_chain = %cc.value_short(),
-                                    their_chain = %cluster_chain_value.as_deref().unwrap_or("?")[..8.min(cluster_chain_value.as_ref().map_or(0, |s| s.len()))],
-                                    our_round = cc.round,
-                                    their_round = cluster_chain_round.unwrap_or(0),
-                                    "cluster chain: DIFFERENT CLUSTER detected — merge triggered"
-                                );
-                                // The merge itself is handled by evaluate_spiral_merge above.
-                                // The chain comparison confirms the merge decision.
+                                let (we_win, ts, size, topo) = chain_merge_ctx;
+                                if we_win {
+                                    if let Some(loser_value) = remote_bytes {
+                                        cc.record_merge(&loser_value, cluster_chain_round.unwrap_or(0),
+                                                        &topo, ts, size);
+                                        info!(new_chain = %cc.value_short(),
+                                              merge_count = cc.summary().merge_count,
+                                              "cluster chain: recorded merge — we won");
+                                    }
+                                } else if let Some(winner_value) = remote_bytes {
+                                    cc.adopt(winner_value, cluster_chain_round.unwrap_or(0));
+                                    info!(adopted = %cc.value_short(),
+                                          "cluster chain: adopted winner's chain — we lost");
+                                }
                             }
                             super::cluster_chain::ChainComparison::FreshJoin => {
-                                info!(
-                                    peer = %mkey,
-                                    our_chain = %cc.value_short(),
-                                    "cluster chain: fresh node joining — they will adopt our chain"
-                                );
+                                info!(peer = %mkey, our_chain = %cc.value_short(),
+                                      "cluster chain: fresh node joining — they will adopt our chain");
                             }
                         }
                     }
@@ -2120,6 +2160,12 @@ pub fn spawn_event_processor(
                                 if peer.spiral_index.is_some() && existing.spiral_index != peer.spiral_index {
                                     existing.spiral_index = peer.spiral_index;
                                     changed = true;
+                                }
+                                // Cluster chain: propagate via gossip so all
+                                // nodes see every peer's cluster identity.
+                                if peer.cluster_chain_value.is_some() {
+                                    existing.cluster_chain_value = peer.cluster_chain_value.clone();
+                                    existing.cluster_chain_round = peer.cluster_chain_round;
                                 }
                             }
                         }
@@ -5626,6 +5672,19 @@ fn vdf_tiebreak_wins(
     }
     // Fallback: no VDF hashes available — raw peer_id comparison.
     our_pid > their_pid
+}
+
+/// Hash the current SPIRAL topology for cluster chain merge records.
+///
+/// Deterministic: sorted occupied slots → blake3 hash.
+fn compute_topology_hash(spiral: &super::spiral::SpiralTopology) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    let slots = spiral.occupied_slots();
+    for (idx, key) in &slots {
+        hasher.update(&idx.to_le_bytes());
+        hasher.update(key.as_bytes());
+    }
+    *hasher.finalize().as_bytes()
 }
 
 /// Evaluate SPIRAL merge protocol when a new peer is encountered.
