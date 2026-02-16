@@ -831,16 +831,32 @@ async fn disconnect_reclaims_spiral_slot() {
         assert_eq!(st.mesh.spiral.occupied_count(), 2); // us + peer
     }
 
-    // Simulate disconnect — exactly what spawn_event_processor does
-    // on RelayEvent::Disconnected (federation.rs:407-458).
+    // Simulate transient disconnect (RelayEvent::Disconnected).
+    // SPIRAL slot is PRESERVED — the relay task is still alive (reconnecting).
     {
         let mut st = state.write().await;
+        st.mesh.connections.remove(&peer.peer_id);
+        st.notify_topology_change();
+    }
+
+    // Verify SPIRAL slot is preserved after transient disconnect.
+    {
+        let st = state.read().await;
+        assert!(st.mesh.spiral.peer_index(&peer.peer_id).is_some());
+        assert_eq!(st.mesh.spiral.occupied_count(), 2); // us + peer — PRESERVED
+    }
+
+    // Simulate permanent exit (RelayEvent::PeerGone).
+    // NOW the SPIRAL slot is released.
+    {
+        let mut st = state.write().await;
+        st.federation.managed_peers.remove(&peer.peer_id);
         st.mesh.connections.remove(&peer.peer_id);
         st.mesh.spiral.remove_peer(&peer.peer_id);
         st.notify_topology_change();
     }
 
-    // Verify slot is freed immediately.
+    // Verify slot is freed after PeerGone.
     let st = state.read().await;
     assert!(st.mesh.spiral.peer_index(&peer.peer_id).is_none());
     assert_eq!(st.mesh.spiral.occupied_count(), 1); // just us

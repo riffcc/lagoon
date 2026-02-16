@@ -931,6 +931,10 @@ pub enum RelayEvent {
         /// Epoch origin (hex string). Stable across advances — only changes on merge/adopt.
         epoch_origin: Option<String>,
     },
+    /// Relay task has permanently exited — peer should be removed from topology.
+    /// Sent ONCE, at task exit. Never on transient drops. This is THE signal
+    /// that a peer is genuinely gone and its SPIRAL slot should be released.
+    PeerGone { remote_host: String },
 }
 
 /// Manages all federated channel relay connections.
@@ -950,6 +954,10 @@ pub struct FederationManager {
     /// for the same peer before the first task completes its HELLO exchange.
     /// Key = connect_target (node_name or server_name), not peer_id (unknown until HELLO).
     pub pending_dials: HashSet<String>,
+    /// Peer IDs with an active relay task (survives reconnect cycles).
+    /// Inserted after first HELLO, removed at permanent task exit (PeerGone).
+    /// evict_dead_peers() skips managed peers — the relay task handles lifecycle.
+    pub managed_peers: HashSet<String>,
 }
 
 impl FederationManager {
@@ -958,6 +966,7 @@ impl FederationManager {
             relays: HashMap::new(),
             active_dial_count: 0,
             pending_dials: HashSet::new(),
+            managed_peers: HashSet::new(),
         }
     }
 }
@@ -1288,25 +1297,52 @@ pub fn spawn_event_processor(
                         let _ = relay.outgoing_tx.send(RelayCommand::Shutdown);
                     }
 
-                    // remote_host IS the peer_id — direct lookup in known_peers.
+                    // Remove from active connections — but PRESERVE SPIRAL slot.
+                    // The relay task is still alive (reconnecting with backoff).
+                    // SPIRAL slot is only released when PeerGone fires (permanent exit).
+                    st.mesh.connections.remove(&remote_host);
+
+                    // APE: if disconnection dropped us below threshold, recover.
+                    attempt_mesh_rejoin(&mut st, state.clone());
+                    publish_connection_snapshot(&mut st);
+                    st.notify_topology_change();
+
+                }
+                RelayEvent::PeerGone { remote_host } => {
+                    // Relay task has PERMANENTLY exited — this peer is genuinely gone.
+                    // NOW we release the SPIRAL slot and reconverge (once).
+                    let ygg_peers = refresh_ygg_metrics_embedded(&ygg_node).await;
+                    let mut st = state.write().await;
+
+                    if let Some(yp) = ygg_peers {
+                        st.mesh.ygg_peer_count = yp.len() as u32;
+                        st.mesh.ygg_metrics.update(yp);
+                    }
+
+                    // Final relay cleanup (may already be gone).
+                    if let Some(relay) = st.federation.relays.remove(&remote_host) {
+                        let _ = relay.outgoing_tx.send(RelayCommand::Shutdown);
+                    }
+                    st.federation.managed_peers.remove(&remote_host);
                     st.mesh.connections.remove(&remote_host);
                     st.mesh.spiral.remove_peer(&remote_host);
 
                     if st.mesh.known_peers.contains_key(&remote_host) {
-                        // SPIRAL convergence: peer left, slot freed.
-                        // If their slot was lower than ours, move inward.
                         reconverge_spiral(&mut st, state.clone());
                         let neighbors = st.mesh.spiral.neighbors().clone();
                         st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
                         st.mesh.connection_gossip.set_spiral_neighbors(neighbors.clone());
                         st.mesh.liveness_gossip.set_spiral_neighbors(neighbors);
                         dial_missing_spiral_neighbors(&mut st, state.clone());
-                        // APE: if disconnection dropped us below threshold, recover.
                         attempt_mesh_rejoin(&mut st, state.clone());
                         publish_connection_snapshot(&mut st);
                         st.notify_topology_change();
                     }
 
+                    tracing::info!(
+                        peer = %remote_host,
+                        "PeerGone: relay task permanently exited, SPIRAL slot released"
+                    );
                 }
                 RelayEvent::Connected { local_channel } => {
                     let st = state.read().await;
@@ -4182,6 +4218,9 @@ async fn relay_task_native(
     let mut consecutive_failures: u32 = 0;
     let mut self_hits: u32 = 0;
     let mut current_peer_id: Option<String> = None;
+    // Persists across reconnect iterations — carries identity forward for
+    // should_keep_retrying and PeerGone even after current_peer_id is cleared.
+    let mut last_known_peer_id: Option<String> = None;
 
     'reconnect: loop {
         let connected_at = std::time::Instant::now();
@@ -4257,8 +4296,10 @@ async fn relay_task_native(
                     break;
                 }
                 // Check if we should still be trying to reach this peer.
-                if !is_bootstrap && !should_keep_retrying(&state, &current_peer_id, &connect_target).await {
-                    info!(%connect_target, peer_id = ?current_peer_id,
+                // Use last_known_peer_id — current_peer_id may be None if we never connected.
+                let retry_pid = last_known_peer_id.as_ref().or(current_peer_id.as_ref()).cloned();
+                if !is_bootstrap && !should_keep_retrying(&state, &retry_pid, &connect_target).await {
+                    info!(%connect_target, peer_id = ?retry_pid,
                         "native relay: peer removed from mesh, stopping retries");
                     break;
                 }
@@ -4267,6 +4308,7 @@ async fn relay_task_native(
         };
 
         // Clean up relay from the map (task inserted it after HELLO).
+        // Sends Disconnected (transient) — SPIRAL slot is PRESERVED.
         if let Some(ref pid) = current_peer_id {
             let mut st = state.write().await;
             if st.federation.relays.remove(pid).is_some() {
@@ -4276,7 +4318,12 @@ async fn relay_task_native(
                 });
             }
         }
-        current_peer_id = None;
+        // Carry identity forward for should_keep_retrying and PeerGone.
+        if current_peer_id.is_some() {
+            last_known_peer_id = current_peer_id.take();
+        } else {
+            current_peer_id = None;
+        }
 
         // Only reset failure counter if the connection lived long enough to be
         // productive. Self-connections (anycast routes to self) succeed at the
@@ -4300,8 +4347,9 @@ async fn relay_task_native(
                     break;
                 }
                 // Check if we should still be trying to reach this peer.
-                if !is_bootstrap && !should_keep_retrying(&state, &current_peer_id, &connect_target).await {
-                    info!(%connect_target, peer_id = ?current_peer_id,
+                // current_peer_id was moved to last_known_peer_id above.
+                if !is_bootstrap && !should_keep_retrying(&state, &last_known_peer_id, &connect_target).await {
+                    info!(%connect_target, peer_id = ?last_known_peer_id,
                         "native relay: peer removed from mesh, stopping retries");
                     break;
                 }
@@ -4309,12 +4357,16 @@ async fn relay_task_native(
         }
     }
 
-    // Final cleanup: if we're exiting permanently and relay is still in map.
-    if let Some(ref pid) = current_peer_id {
-        let mut st = state.write().await;
-        if st.federation.relays.remove(pid).is_some() {
+    // Final cleanup: relay task permanently exiting.
+    // Send PeerGone (not Disconnected) — this triggers SPIRAL slot release.
+    {
+        let peer_id_for_gone = last_known_peer_id.or(current_peer_id);
+        if let Some(ref pid) = peer_id_for_gone {
+            let mut st = state.write().await;
+            st.federation.managed_peers.remove(pid);
+            st.federation.relays.remove(pid);
             drop(st);
-            let _ = event_tx.send(RelayEvent::Disconnected {
+            let _ = event_tx.send(RelayEvent::PeerGone {
                 remote_host: pid.clone(),
             });
         }
@@ -4507,6 +4559,9 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
                 },
             );
             *current_peer_id = Some(remote_peer_id.clone());
+            // Track in managed_peers — survives reconnect cycles.
+            // evict_dead_peers() skips managed peers; only PeerGone clears this.
+            st.federation.managed_peers.insert(remote_peer_id.clone());
         }
         // NOTE: do NOT remove from pending_dials here. The entry must persist
         // for the entire relay_task_native lifetime. Otherwise, when the WS drops
@@ -4607,6 +4662,7 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
                                             },
                                         );
                                         *current_peer_id = Some(remote_peer_id.clone());
+                                        st.federation.managed_peers.insert(remote_peer_id.clone());
                                     }
                                 }
                             }
@@ -4850,6 +4906,7 @@ async fn native_raw_loop(
                 },
             );
             *current_peer_id = Some(remote_peer_id.clone());
+            st.federation.managed_peers.insert(remote_peer_id.clone());
         }
     }
 
@@ -4964,6 +5021,7 @@ async fn native_raw_loop(
                                             },
                                         );
                                         *current_peer_id = Some(remote_peer_id.clone());
+                                        st.federation.managed_peers.insert(remote_peer_id.clone());
                                     }
                                 }
                             }
@@ -5075,20 +5133,39 @@ async fn backoff_drain_native(
 
 /// Check if a relay task should keep retrying or if the peer has been evicted.
 ///
-/// Returns `true` if the peer is still known to the mesh (in known_peers,
-/// or its node_name is still relevant). Returns `false` if the peer has
-/// been removed — the relay task should exit.
+/// Returns `true` if the peer is still known to the mesh AND its VDF is fresh.
+/// Returns `false` if the peer has been removed or its VDF has been silent
+/// for 60 seconds (genuinely dead — relay task should exit, sending PeerGone).
 async fn should_keep_retrying(
     state: &Arc<tokio::sync::RwLock<super::server::ServerState>>,
     current_peer_id: &Option<String>,
     connect_target: &str,
 ) -> bool {
     let st = state.read().await;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
     // If we know the peer_id (from a previous successful HELLO), check
     // if it's still in known_peers or is a SPIRAL neighbor.
     if let Some(pid) = current_peer_id {
-        if st.mesh.known_peers.contains_key(pid) {
+        if let Some(peer) = st.mesh.known_peers.get(pid) {
+            // VDF staleness check: if the peer's VDF hasn't advanced in 60s,
+            // they're dead. Give up retrying — PeerGone will release the slot.
+            let fresh_at = if peer.last_vdf_advance > 0 {
+                peer.last_vdf_advance
+            } else {
+                peer.last_seen
+            };
+            if now_secs.saturating_sub(fresh_at) >= 60 {
+                info!(
+                    peer_id = %pid,
+                    vdf_stale_secs = now_secs.saturating_sub(fresh_at),
+                    "should_keep_retrying: VDF stale 60s, giving up"
+                );
+                return false;
+            }
             return true;
         }
         if st.mesh.spiral.is_neighbor(pid) {
@@ -6172,11 +6249,8 @@ fn evaluate_spiral_merge(
 ///
 /// Returns the list of evicted peer keys.
 fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
-    // Connected peers: 10s — we directly observe their VDF via window proofs.
-    const CONNECTED_DEAD_SECS: u64 = 10;
-    // Ghost peers: 20s — freshness comes from SPORE liveness gossip which
-    // propagates VDF attestations mesh-wide. VDF is the authority. The bitmap
-    // is the gossip transport; last_seen (refreshed by gossip) is the truth.
+    // Ghost peers: 20s — gossip-learned peers with no relay task.
+    // Timer is the right mechanism for these — no relay task to manage lifecycle.
     const GHOST_DEAD_SECS: u64 = 20;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -6189,32 +6263,31 @@ fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
     st.mesh.liveness_bitmap.decay(now);
 
     // Prune expired tombstones. 30s = bitmap decay (20s) + propagation margin.
-    // Covers the full gossip convergence window: after 30s, every node's bitmap
-    // has decayed this peer's bit to 0, so gossip won't carry its stale entry.
-    // New pods get new peer_ids, so this only blocks the OLD peer_id.
-    // Direct HELLO always clears tombstones instantly (proof of life).
     st.mesh.eviction_tombstones.retain(|_, ts| ts.elapsed() < std::time::Duration::from_secs(30));
 
-    let spiral_neighbors = st.mesh.spiral.neighbors().clone();
-
-    for (peer_mkey, peer) in &st.mesh.known_peers {
+    for (peer_mkey, _peer) in &st.mesh.known_peers {
         if *peer_mkey == our_pid {
             continue;
         }
-        let is_connected = spiral_neighbors.contains(peer_mkey)
-            || st.federation.relays.contains_key(peer_mkey);
 
-        // VDF is the eviction authority. The bitmap is gossip transport.
-        // Connected peers: direct VDF observation (last_vdf_advance).
-        // Ghost peers: last_seen refreshed by SPORE liveness gossip
-        // (which carries VDF-derived attestations mesh-wide).
-        let (fresh_at, timeout) = if is_connected {
-            let ts = if peer.last_vdf_advance > 0 { peer.last_vdf_advance } else { peer.last_seen };
-            (ts, CONNECTED_DEAD_SECS)
+        // Relay task manages this peer's lifecycle — never timer-evict.
+        // The relay task will send PeerGone when it permanently exits.
+        if st.federation.managed_peers.contains(peer_mkey) {
+            continue;
+        }
+
+        // Live relay in map = alive. Period.
+        if st.federation.relays.contains_key(peer_mkey) {
+            continue;
+        }
+
+        // Ghost peer: no relay, no relay task. Timer is the authority.
+        let fresh_at = if _peer.last_vdf_advance > 0 {
+            _peer.last_vdf_advance
         } else {
-            (peer.last_seen, GHOST_DEAD_SECS)
+            _peer.last_seen
         };
-        if now.saturating_sub(fresh_at) < timeout {
+        if now.saturating_sub(fresh_at) < GHOST_DEAD_SECS {
             continue;
         }
         evicted.push(peer_mkey.clone());
@@ -6222,11 +6295,8 @@ fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
 
     for evicted_key in &evicted {
         // Tombstone: prevent stale gossip from resurrecting this peer.
-        // 250ms — one SPORE convergence cycle. Direct HELLO clears it instantly.
         st.mesh.eviction_tombstones.insert(evicted_key.clone(), std::time::Instant::now());
         if let Some(peer) = st.mesh.known_peers.remove(evicted_key) {
-            let is_connected = spiral_neighbors.contains(evicted_key)
-                || st.federation.relays.contains_key(evicted_key);
             info!(
                 mesh_key = %evicted_key,
                 server_name = %peer.server_name,
@@ -6234,8 +6304,7 @@ fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
                 vdf_step = ?peer.vdf_step,
                 last_vdf_advance = peer.last_vdf_advance,
                 last_seen = peer.last_seen,
-                connected = is_connected,
-                "mesh: evicting dead peer"
+                "mesh: evicting ghost peer (no relay task)"
             );
             st.mesh.connections.remove(evicted_key);
             st.mesh.spiral.remove_peer(evicted_key);
