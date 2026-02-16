@@ -6249,9 +6249,6 @@ fn evaluate_spiral_merge(
 ///
 /// Returns the list of evicted peer keys.
 fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
-    // Ghost peers: 20s — gossip-learned peers with no relay task.
-    // Timer is the right mechanism for these — no relay task to manage lifecycle.
-    const GHOST_DEAD_SECS: u64 = 20;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -6260,6 +6257,9 @@ fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
     let mut evicted = Vec::new();
 
     // Run bitmap decay — stale bits flip to 0, SPORE rebuilt.
+    // The bitmap is the mesh's collective liveness signal: each node's SPIRAL
+    // neighbors attest its liveness → SPORE propagates → bit stays 1.
+    // When nobody attests → bit decays to 0 → the mesh says they're dead.
     st.mesh.liveness_bitmap.decay(now);
 
     // Prune expired tombstones. 30s = bitmap decay (20s) + propagation margin.
@@ -6281,14 +6281,15 @@ fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
             continue;
         }
 
-        // Ghost peer: no relay, no relay task. Timer is the authority.
-        let fresh_at = if _peer.last_vdf_advance > 0 {
-            _peer.last_vdf_advance
-        } else {
-            _peer.last_seen
-        };
-        if now.saturating_sub(fresh_at) < GHOST_DEAD_SECS {
-            continue;
+        // Ghost peer: no relay, no relay task.
+        // We can't observe their liveness directly — we rely on their SPIRAL
+        // neighbors to attest via the liveness bitmap (SPORE gossip).
+        // Bitmap bit=1 means SOMEONE in the mesh can see them. Trust the mesh.
+        // Bitmap bit=0 (decayed) means nobody can see them. Then evict.
+        if let Some(idx) = st.mesh.spiral.peer_index(peer_mkey) {
+            if st.mesh.liveness_bitmap.get(idx.value()) {
+                continue; // Mesh says alive — not our call.
+            }
         }
         evicted.push(peer_mkey.clone());
     }
@@ -6297,53 +6298,18 @@ fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
         // Tombstone: prevent stale gossip from resurrecting this peer.
         st.mesh.eviction_tombstones.insert(evicted_key.clone(), std::time::Instant::now());
         if let Some(peer) = st.mesh.known_peers.remove(evicted_key) {
-            info!(
+            tracing::debug!(
                 mesh_key = %evicted_key,
-                server_name = %peer.server_name,
                 node_name = %peer.node_name,
                 vdf_step = ?peer.vdf_step,
-                last_vdf_advance = peer.last_vdf_advance,
-                last_seen = peer.last_seen,
-                "mesh: evicting ghost peer (no relay task)"
+                "mesh: removing ghost peer from local view (bitmap decayed)"
             );
+            // Local view cleanup only. We have no connection to this peer,
+            // so there's nothing to shut down. The SPIRAL slot is released
+            // so reconverge can reclaim it. If the peer comes back (new gossip
+            // or direct HELLO), tombstone clears and they re-enter.
             st.mesh.connections.remove(evicted_key);
             st.mesh.spiral.remove_peer(evicted_key);
-
-            // Cut the Ygg overlay connection — dead nodes don't get to stay peered.
-            // Also clear `ygg_peered_uris` so dial_missing_spiral_neighbors can
-            // re-add this peer when it comes back online.
-            if let Some(ref underlay) = peer.underlay_uri {
-                st.mesh.ygg_peered_uris.remove(underlay.as_str());
-            }
-            if let Some(ref ygg) = st.transport_config.ygg_node {
-                if let Some(ref uri) = peer.ygg_peer_uri {
-                    let ygg = ygg.clone();
-                    let uri = uri.clone();
-                    let node_name = peer.node_name.clone();
-                    tokio::spawn(async move {
-                        match ygg.remove_peer(&uri).await {
-                            Ok(()) => info!(
-                                uri,
-                                node_name = %node_name,
-                                "APE: removed dead peer from Ygg overlay"
-                            ),
-                            Err(e) => tracing::debug!(
-                                uri,
-                                error = %e,
-                                "APE: remove_peer failed (may already be gone)"
-                            ),
-                        }
-                    });
-                }
-            }
-
-            // Shut down the relay task if one exists for this peer.
-            // No relay is immortal — bootstrap or otherwise. The APE recovery
-            // mechanism (attempt_mesh_rejoin) handles getting back on the mesh
-            // by trying known peers, then falling back to seed addresses.
-            if let Some(relay) = st.federation.relays.remove(evicted_key) {
-                let _ = relay.outgoing_tx.send(RelayCommand::Shutdown);
-            }
         }
     }
 
