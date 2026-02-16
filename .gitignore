@@ -25,6 +25,9 @@ target
 CLAUDE.md
 .mcp.json
 
+# Unfiltered work-in-progress
+synthesis/
+
 # Yggdrasil private keys — NEVER commit these
 infra/yggdrasil/*.conf
 
