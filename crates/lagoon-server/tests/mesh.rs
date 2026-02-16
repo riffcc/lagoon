@@ -897,6 +897,8 @@ fn make_hello() -> HelloPayload {
         cvdf_genesis_hex: None,
         cluster_vdf_work: None,
         assigned_slot: None,
+        cluster_chain_value: None,
+        cluster_chain_round: None,
     }
 }
 
@@ -2154,6 +2156,8 @@ async fn underlay_uri_stored_from_hello_relay_peer_addr() {
         cvdf_genesis_hex: None,
         cluster_vdf_work: None,
         assigned_slot: None,
+        cluster_chain_value: None,
+        cluster_chain_round: None,
     };
     let msg = MeshMessage::Hello(hello);
     let peer_addr: SocketAddr = "10.0.0.5:8080".parse().unwrap();

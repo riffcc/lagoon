@@ -65,6 +65,12 @@ pub struct HelloPayload {
     /// One integer. O(1). Scales to millions of nodes.
     #[serde(default)]
     pub assigned_slot: Option<u64>,
+    /// Cluster identity chain value (hex-encoded blake3 hash).
+    #[serde(default)]
+    pub cluster_chain_value: Option<String>,
+    /// Cluster identity chain round number.
+    #[serde(default)]
+    pub cluster_chain_round: Option<u64>,
 }
 
 /// Native mesh protocol message — the sole on-the-wire type.
@@ -361,6 +367,8 @@ mod tests {
             cvdf_genesis_hex: Some("11223344".into()),
             cluster_vdf_work: Some(1000.5),
             assigned_slot: Some(3),
+            cluster_chain_value: Some("deadbeefcafe".into()),
+            cluster_chain_round: Some(99),
         });
 
         let json = msg.to_json().unwrap();

@@ -138,6 +138,8 @@ pub fn dispatch_mesh_message(
                 cvdf_genesis_hex: hello.cvdf_genesis_hex.clone(),
                 cluster_vdf_work: hello.cluster_vdf_work,
                 assigned_slot: hello.assigned_slot,
+                cluster_chain_value: hello.cluster_chain_value.clone(),
+                cluster_chain_round: hello.cluster_chain_round,
             });
             Some(hello)
         }
@@ -755,6 +757,10 @@ pub enum RelayEvent {
         cluster_vdf_work: Option<f64>,
         /// Concierge slot assignment — first empty slot in sender's topology.
         assigned_slot: Option<u64>,
+        /// Cluster identity chain value (hex-encoded blake3 hash).
+        cluster_chain_value: Option<String>,
+        /// Cluster identity chain round number.
+        cluster_chain_round: Option<u64>,
     },
     /// Received MESH PEERS from a remote peer.
     MeshPeers {
@@ -1310,6 +1316,8 @@ pub fn spawn_event_processor(
                     cvdf_genesis_hex,
                     cluster_vdf_work,
                     assigned_slot,
+                    cluster_chain_value,
+                    cluster_chain_round,
                 } => {
                     // Backfill node_name/site_name for old peers that don't send them.
                     let node_name = if node_name.is_empty() {
@@ -1543,6 +1551,42 @@ pub fn spawn_event_processor(
                         assigned_slot,
                         state.clone(),
                     );
+
+                    // Cluster identity chain comparison.
+                    // Same chain → same cluster. Different → merge trigger.
+                    // Fresh (no chain) → joiner adopts our chain.
+                    if let Some(ref cc) = st.mesh.cluster_chain {
+                        let remote_bytes = cluster_chain_value.as_ref().and_then(|hex_str| {
+                            hex::decode(hex_str).ok().and_then(|bytes| {
+                                <[u8; 32]>::try_from(bytes.as_slice()).ok()
+                            })
+                        });
+                        let comparison = cc.compare(remote_bytes.as_ref());
+                        match comparison {
+                            super::cluster_chain::ChainComparison::SameCluster => {
+                                // Same cluster — no action needed.
+                            }
+                            super::cluster_chain::ChainComparison::DifferentCluster => {
+                                info!(
+                                    peer = %mkey,
+                                    our_chain = %cc.value_short(),
+                                    their_chain = %cluster_chain_value.as_deref().unwrap_or("?")[..8.min(cluster_chain_value.as_ref().map_or(0, |s| s.len()))],
+                                    our_round = cc.round,
+                                    their_round = cluster_chain_round.unwrap_or(0),
+                                    "cluster chain: DIFFERENT CLUSTER detected — merge triggered"
+                                );
+                                // The merge itself is handled by evaluate_spiral_merge above.
+                                // The chain comparison confirms the merge decision.
+                            }
+                            super::cluster_chain::ChainComparison::FreshJoin => {
+                                info!(
+                                    peer = %mkey,
+                                    our_chain = %cc.value_short(),
+                                    "cluster chain: fresh node joining — they will adopt our chain"
+                                );
+                            }
+                        }
+                    }
 
                     // Reconverge: repack fills gaps left by stale peers so the
                     // neighbor set is correct BEFORE any prune decision runs.
@@ -3213,6 +3257,19 @@ pub fn spawn_event_processor(
                 } else {
                     None
                 };
+
+                // Advance cluster identity chain on each VDF window tick.
+                // Uses VDF total_steps as the timestamp input — monotonically
+                // increasing, VDF-anchored, same for all nodes at same tick.
+                {
+                    let timestamp_round = st.mesh.vdf_state_rx.as_ref()
+                        .map(|rx| rx.borrow().total_steps)
+                        .unwrap_or(0);
+                    let cluster_size = (st.mesh.known_peers.len() + 1) as u32;
+                    if let Some(ref mut cc) = st.mesh.cluster_chain {
+                        cc.advance(timestamp_round, cluster_size);
+                    }
+                }
 
                 // Broadcast to SPIRAL neighbors.
                 if let Some((msg, height, steps)) = window_msg {
@@ -5188,6 +5245,8 @@ async fn relay_task(
                                             cvdf_genesis_hex: hello.cvdf_genesis_hex,
                                             cluster_vdf_work: hello.cluster_vdf_work,
                                             assigned_slot: hello.assigned_slot,
+                                            cluster_chain_value: hello.cluster_chain_value,
+                                            cluster_chain_round: hello.cluster_chain_round,
                                         });
                                     } else {
                                         warn!(remote_host, "mesh: invalid HELLO payload");
@@ -5494,6 +5553,13 @@ struct MeshHelloPayload {
     /// Included when the sender has a claimed SPIRAL slot. Joiner takes it.
     #[serde(default)]
     pub assigned_slot: Option<u64>,
+    /// Cluster identity chain value (hex-encoded blake3 hash).
+    /// Same value → same cluster. Different → merge trigger.
+    #[serde(default)]
+    pub cluster_chain_value: Option<String>,
+    /// Cluster identity chain round number.
+    #[serde(default)]
+    pub cluster_chain_round: Option<u64>,
 }
 
 /// Build a native `wire::HelloPayload` from server state (use inside read lock).
@@ -5522,6 +5588,8 @@ pub fn build_wire_hello(st: &mut super::server::ServerState) -> HelloPayload {
         cvdf_genesis_hex: hp.cvdf_genesis_hex,
         cluster_vdf_work: hp.cluster_vdf_work,
         assigned_slot: hp.assigned_slot,
+        cluster_chain_value: hp.cluster_chain_value,
+        cluster_chain_round: hp.cluster_chain_round,
     }
 }
 
@@ -6360,6 +6428,8 @@ fn build_hello_payload(st: &mut super::server::ServerState) -> MeshHelloPayload 
         cvdf_genesis_hex,
         cluster_vdf_work,
         assigned_slot,
+        cluster_chain_value: st.mesh.cluster_chain.as_ref().map(|cc| cc.value_hex()),
+        cluster_chain_round: st.mesh.cluster_chain.as_ref().map(|cc| cc.round),
     }
 }
 

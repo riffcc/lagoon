@@ -363,6 +363,9 @@ pub struct MeshState {
     /// the last verified `h_end` from a VdfWindowProof. Chain continuity:
     /// each new proof's `h_start` must match this tip.
     pub verified_vdf_tips: HashMap<String, [u8; 32]>,
+    /// Cluster identity chain — rotating blake3 hash for merge/split detection.
+    /// Advances on VDF window ticks, carried in HELLO, compared on connection.
+    pub cluster_chain: Option<super::cluster_chain::ClusterChain>,
 }
 
 impl MeshState {
@@ -398,6 +401,7 @@ impl MeshState {
             ygg_peer_count: 0,
             last_hello_broadcast: None,
             verified_vdf_tips: HashMap::new(),
+            cluster_chain: None,
         }
     }
 }
@@ -458,6 +462,10 @@ pub struct MeshNodeReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub disconnected_count: Option<u32>,
+    /// Cluster identity chain summary (debug visualization).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub cluster_chain: Option<super::cluster_chain::ChainSummary>,
 }
 
 /// A single link in a mesh topology snapshot.
@@ -480,6 +488,10 @@ pub struct MeshLinkReport {
     /// Link type: "relay" (active IRC connection) or "spiral" (geometric neighbor).
     #[serde(default = "default_link_type")]
     pub link_type: String,
+    /// Whether this link is routed through a switchboard L4 splice (not direct).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub spliced: Option<bool>,
 }
 
 fn default_link_type() -> String {
@@ -672,6 +684,7 @@ impl ServerState {
             connected_count: Some(connected_peers),
             ygg_up_count: Some(ygg_up),
             disconnected_count: Some(total_peers - connected_peers),
+            cluster_chain: self.mesh.cluster_chain.as_ref().map(|cc| cc.summary()),
         });
 
         // Add known peers.
@@ -700,6 +713,7 @@ impl ServerState {
                 connected_count: None,
                 ygg_up_count: None,
                 disconnected_count: None,
+                cluster_chain: None,
             });
             if connected {
                 // Latency priority: proof_store → relay PING/PONG → Yggdrasil.
@@ -726,6 +740,11 @@ impl ServerState {
                 } else {
                     "relay"
                 };
+                // Detect spliced connections: relay's connect_target matches
+                // our switchboard address → traffic goes through L4 splice.
+                let spliced = self.transport_config.switchboard_addr.as_ref().and_then(|sb| {
+                    self.federation.relays.get(mkey).map(|r| r.connect_target == *sb)
+                });
                 links.push(MeshLinkReport {
                     source: our_pid.clone(),
                     target: mkey.clone(),
@@ -733,6 +752,7 @@ impl ServerState {
                     download_bps,
                     latency_ms,
                     link_type: lt.into(),
+                    spliced,
                 });
             }
         }
@@ -757,6 +777,7 @@ impl ServerState {
                 connected_count: None,
                 ygg_up_count: None,
                 disconnected_count: None,
+                cluster_chain: None,
             });
             links.push(MeshLinkReport {
                 source: our_pid.clone(),
@@ -765,6 +786,7 @@ impl ServerState {
                 download_bps: None,
                 latency_ms: None,
                 link_type: "relay".into(),
+                spliced: None,
             });
         }
 
@@ -779,6 +801,7 @@ impl ServerState {
                     download_bps: None,
                     latency_ms: None,
                     link_type: "spiral".into(),
+                    spliced: None,
                 });
             }
         }
@@ -820,6 +843,7 @@ impl ServerState {
                         download_bps: None,
                         latency_ms: Some(*rtt_ms),
                         link_type: "proof".into(),
+                        spliced: None,
                     });
                 }
             }
@@ -862,6 +886,7 @@ impl ServerState {
                         download_bps: None,
                         latency_ms: None,
                         link_type: "gossip".into(),
+                        spliced: None,
                     });
                 }
             }
@@ -988,6 +1013,11 @@ pub async fn start(
         });
         st.mesh.vdf_state_rx = Some(vdf_state_rx);
         st.mesh.vdf_chain = Some(Arc::clone(&chain));
+        // Initialize cluster identity chain from VDF genesis hash.
+        // The chain advances on VDF window ticks and is carried in HELLO.
+        st.mesh.cluster_chain = Some(super::cluster_chain::ClusterChain::genesis(
+            genesis, 0, 1,
+        ));
         let shutdown_rx = _vdf_shutdown_tx.subscribe();
         tokio::spawn(super::vdf::run_vdf_engine(
             genesis,
@@ -3335,6 +3365,10 @@ async fn handle_command(
                             cluster_vdf_work: Option<f64>,
                             #[serde(default)]
                             assigned_slot: Option<u64>,
+                            #[serde(default)]
+                            cluster_chain_value: Option<String>,
+                            #[serde(default)]
+                            cluster_chain_round: Option<u64>,
                         }
                         if let Ok(hello) = serde_json::from_str::<HelloPayload>(json) {
                             // Use node_name from HELLO if present, else derive from server_name.
@@ -3375,6 +3409,8 @@ async fn handle_command(
                                     cvdf_genesis_hex: hello.cvdf_genesis_hex,
                                     cluster_vdf_work: hello.cluster_vdf_work,
                                     assigned_slot: hello.assigned_slot,
+                                    cluster_chain_value: hello.cluster_chain_value,
+                                    cluster_chain_round: hello.cluster_chain_round,
                                 },
                             );
 
@@ -3442,6 +3478,8 @@ async fn handle_command(
                                 "site_name": st.lens.site_name,
                                 "node_name": st.lens.node_name,
                                 "assigned_slot": our_assigned_slot,
+                                "cluster_chain_value": st.mesh.cluster_chain.as_ref().map(|cc| cc.value_hex()),
+                                "cluster_chain_round": st.mesh.cluster_chain.as_ref().map(|cc| cc.round),
                             });
 
                             // Collect peer list for MESH PEERS exchange.

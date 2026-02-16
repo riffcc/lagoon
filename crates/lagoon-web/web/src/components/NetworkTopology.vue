@@ -15,7 +15,7 @@ let showBeams = true
 let showNodes = true
 
 // Mesh stats — updated on every snapshot.
-const stats = ref({ nodes: 0, connected: 0, disconnected: 0, links: 0, spiralLinks: 0 })
+const stats = ref({ nodes: 0, connected: 0, disconnected: 0, links: 0, spiralLinks: 0, clusters: 0 })
 
 // Color palette — Tokyo Night theme.
 const COLORS = {
@@ -38,6 +38,25 @@ function nodeColor(node) {
   const liveness = vdfLiveness(node)
   if (liveness === 'ticking') return COLORS.pruning
   return COLORS.offline
+}
+
+/** Derive a consistent HSL hue from a hex string (cluster identity).
+ *  Same chain_value_hex → same color. Different values → different hues.
+ *  Returns an HSL color string or null if no cluster chain data. */
+function clusterRingColor(node) {
+  const hex = node.cluster_chain?.chain_value_hex
+  if (!hex || hex.length < 8) return null
+  // Use first 8 hex chars as a 32-bit number → map to hue [0, 360).
+  const n = parseInt(hex.substring(0, 8), 16)
+  const hue = n % 360
+  return `hsl(${hue}, 70%, 55%)`
+}
+
+/** Short display of cluster chain value (first 8 hex chars). */
+function clusterValueShort(node) {
+  const hex = node.cluster_chain?.chain_value_hex
+  if (!hex) return null
+  return hex.substring(0, 8) + '...'
 }
 
 function nodeLabel(node) {
@@ -156,6 +175,7 @@ function formatBps(bps) {
 function linkTooltip(link) {
   const parts = []
   if (link.link_type === 'spiral') parts.push('SPIRAL geometric neighbor')
+  if (link.spliced) parts.push('Spliced (L4 proxy)')
   if (link.latency_ms) parts.push(`Latency: ${link.latency_ms.toFixed(1)}ms`)
   if (link.upload_bps) parts.push(`Up: ${formatBps(link.upload_bps)}`)
   if (link.download_bps) parts.push(`Down: ${formatBps(link.download_bps)}`)
@@ -199,6 +219,12 @@ function linkOpacityByType(link) {
   if (link.link_type === 'spiral') return 0.7
   if (link.link_type === 'proof') return 0.4
   return 0.5
+}
+
+/** Dash pattern for spliced (L4-proxied) links. null = solid line. */
+function linkDashByType(link) {
+  if (link.spliced) return [4, 2]
+  return null
 }
 
 /** Configure d3 forces for latency-proportional layout (PoLP).
@@ -263,6 +289,22 @@ async function try3D() {
       .linkOpacity(linkOpacityByType)
       .linkWidth(linkWidthByType)
       .linkLabel(linkTooltip)
+      .linkMaterial(link => {
+        if (!link.spliced) return null
+        return new THREE.LineDashedMaterial({
+          color: linkColorByType(link),
+          dashSize: 3,
+          gapSize: 2,
+          transparent: true,
+          opacity: linkOpacityByType(link),
+        })
+      })
+      .linkPositionUpdate((lineObj, _coords, link) => {
+        if (link.spliced && lineObj.computeLineDistances) {
+          lineObj.computeLineDistances()
+        }
+        return false
+      })
       .nodeThreeObject(node => {
         const group = new THREE.Group()
         const isBrowser = node.node_type === 'browser'
@@ -271,6 +313,14 @@ async function try3D() {
         const color = nodeColor(node)
         const mat = new THREE.MeshLambertMaterial({ color, transparent: true, opacity: 0.9 })
         group.add(new THREE.Mesh(geo, mat))
+
+        // Cluster identity ring — colored by chain_value_hex.
+        const cRing = clusterRingColor(node)
+        if (cRing && !isBrowser) {
+          const ringGeo = new THREE.RingGeometry(size + 1.5, size + 2.5, 32)
+          const ringMat = new THREE.MeshBasicMaterial({ color: cRing, transparent: true, opacity: 0.6, side: THREE.DoubleSide })
+          group.add(new THREE.Mesh(ringGeo, ringMat))
+        }
 
         // Text sprite for label.
         const canvas = document.createElement('canvas')
@@ -346,6 +396,7 @@ async function try2D() {
     .linkVisibility(() => showBeams)
     .linkColor(linkColorByType)
     .linkWidth(linkWidthByType)
+    .linkLineDash(linkDashByType)
     .linkLabel(linkTooltip)
     .nodeCanvasObject((node, ctx, globalScale) => {
       const isBrowser = node.node_type === 'browser'
@@ -359,6 +410,18 @@ async function try2D() {
       ctx.globalAlpha = isBrowser ? 0.8 : 0.9
       ctx.fill()
       ctx.globalAlpha = 1
+
+      // Cluster identity ring — same cluster value → same hue.
+      const cRing = clusterRingColor(node)
+      if (cRing && !isBrowser) {
+        ctx.beginPath()
+        ctx.arc(node.x, node.y, size + 2.5, 0, 2 * Math.PI)
+        ctx.strokeStyle = cRing
+        ctx.lineWidth = 1.5
+        ctx.globalAlpha = 0.7
+        ctx.stroke()
+        ctx.globalAlpha = 1
+      }
 
       // Glow ring for self node.
       if (node.is_self) {
@@ -433,12 +496,18 @@ function updateGraph(snapshot) {
   const serverNodes = snapshot.nodes.filter(n => (n.node_type || 'server') === 'server')
   const connCount = serverNodes.filter(n => n.connected || n.is_self).length
   const spiralCount = snapshot.links.filter(l => l.link_type === 'spiral').length
+  const clusterValues = new Set(
+    serverNodes
+      .map(n => n.cluster_chain?.chain_value_hex)
+      .filter(v => v != null)
+  )
   stats.value = {
     nodes: serverNodes.length,
     connected: connCount,
     disconnected: serverNodes.length - connCount,
     links: snapshot.links.length,
     spiralLinks: spiralCount,
+    clusters: clusterValues.size,
   }
 
   if (!graph) return
@@ -465,6 +534,7 @@ function updateGraph(snapshot) {
     download_bps: l.download_bps || 0,
     latency_ms: l.latency_ms || null,
     link_type: l.link_type || 'relay',
+    spliced: !!l.spliced,
   }))
   const incomingLinkKeys = new Set(incomingLinks.map(l => `${l.source}\0${l.target}`))
 
@@ -492,6 +562,7 @@ function updateGraph(snapshot) {
       existing.connected_count = n.connected_count ?? null
       existing.ygg_up_count = n.ygg_up_count ?? null
       existing.disconnected_count = n.disconnected_count ?? null
+      existing.cluster_chain = n.cluster_chain ?? null
       updateVdfLiveness(existing)
     } else {
       // New node — must rebuild.
@@ -520,6 +591,7 @@ function updateGraph(snapshot) {
       existing.download_bps = l.download_bps
       existing.latency_ms = l.latency_ms
       existing.link_type = l.link_type
+      existing.spliced = l.spliced
     } else {
       structureChanged = true
     }
@@ -561,6 +633,7 @@ function updateGraph(snapshot) {
         connected_count: n.connected_count ?? null,
         ygg_up_count: n.ygg_up_count ?? null,
         disconnected_count: n.disconnected_count ?? null,
+        cluster_chain: n.cluster_chain ?? null,
       }
       updateVdfLiveness(base)
       // Preserve previous position so d3 doesn't reset the simulation.
@@ -671,6 +744,10 @@ onUnmounted(() => {
       <span class="stats-value spiral-tag">{{ stats.spiralLinks }}</span>
       <span class="stats-label">SPIRAL</span>
     </div>
+    <div v-if="stats.clusters > 0" class="stats-row">
+      <span class="stats-value cluster-tag">{{ stats.clusters }}</span>
+      <span class="stats-label">{{ stats.clusters === 1 ? 'cluster' : 'clusters' }}</span>
+    </div>
   </div>
 
   <!-- Node hover info panel -->
@@ -721,6 +798,28 @@ onUnmounted(() => {
       <span class="panel-value" :class="vdfLiveness(hoveredNode) === 'ticking' ? 'status-up' : 'status-down'">
         {{ vdfLiveness(hoveredNode) === 'ticking' ? 'ticking' : 'STALLED — eject' }}
       </span>
+    </div>
+    <!-- Cluster chain identity -->
+    <div v-if="hoveredNode.cluster_chain" class="panel-section">
+      <div class="panel-divider"></div>
+      <div class="panel-row">
+        <span class="panel-label">Cluster</span>
+        <span class="panel-value mono" :style="{ color: clusterRingColor(hoveredNode) || '#c0caf5' }">
+          {{ clusterValueShort(hoveredNode) }}
+        </span>
+      </div>
+      <div class="panel-row">
+        <span class="panel-label">Chain Round</span>
+        <span class="panel-value">{{ hoveredNode.cluster_chain.round?.toLocaleString() }}</span>
+      </div>
+      <div v-if="hoveredNode.cluster_chain.merge_count > 0" class="panel-row">
+        <span class="panel-label">Merges</span>
+        <span class="panel-value" style="color: #e0af68;">{{ hoveredNode.cluster_chain.merge_count }}</span>
+      </div>
+      <div v-if="hoveredNode.cluster_chain.split_count > 0" class="panel-row">
+        <span class="panel-label">Splits</span>
+        <span class="panel-value status-down">{{ hoveredNode.cluster_chain.split_count }}</span>
+      </div>
     </div>
     <!-- Self node peer stats -->
     <div v-if="hoveredNode.peer_count != null" class="panel-section">
@@ -838,6 +937,7 @@ onUnmounted(() => {
 .credit-ok { color: #e0af68; }
 .credit-bad { color: #f7768e; }
 .spiral-tag { color: #7aa2f7; }
+.cluster-tag { color: #e0af68; }
 
 .panel-divider {
   height: 1px;
