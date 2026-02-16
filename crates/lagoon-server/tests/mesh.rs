@@ -3195,3 +3195,161 @@ fn chain_update_wire_round_trip() {
     }
 }
 
+/// Cluster count invariant: once N nodes converge to 1 cluster, the number
+/// of distinct clusters (by epoch_origin) always equals the number of fully
+/// partitioned groups — even when nodes advance at staggered times within
+/// a single round.
+///
+/// This is the property that the epoch_origin fix guarantees: advance steps
+/// change the chain tip but NOT the epoch_origin, so staggered advances
+/// within the same round never cause false DifferentCluster detection.
+#[test]
+fn cluster_count_equals_partition_count() {
+    /// Count distinct clusters by grouping nodes by epoch_origin.
+    fn count_clusters(nodes: &[&ClusterChain]) -> usize {
+        let mut origins = std::collections::HashSet::new();
+        for node in nodes {
+            origins.insert(node.epoch_origin);
+        }
+        origins.len()
+    }
+
+    // Phase 1: Create 3 independent clusters (A=3 nodes, B=2 nodes, C=1 node).
+    let seed_a = blake3::hash(b"partition-test-alpha").as_bytes().to_owned();
+    let seed_b = blake3::hash(b"partition-test-beta").as_bytes().to_owned();
+    let seed_c = blake3::hash(b"partition-test-gamma").as_bytes().to_owned();
+
+    let mut a1 = ClusterChain::genesis(seed_a, 0, 3);
+    let mut a2 = ClusterChain::genesis(seed_a, 0, 3);
+    let mut a3 = ClusterChain::genesis(seed_a, 0, 3);
+    let mut b1 = ClusterChain::genesis(seed_b, 0, 2);
+    let mut b2 = ClusterChain::genesis(seed_b, 0, 2);
+    let mut c1 = ClusterChain::genesis(seed_c, 0, 1);
+
+    // Advance each cluster independently.
+    for i in 1..=20 {
+        let s = test_seed(i * 100);
+        a1.advance(&s, i * 100, 3);
+        a2.advance(&s, i * 100, 3);
+        a3.advance(&s, i * 100, 3);
+    }
+    for i in 1..=15 {
+        let s = test_seed(i * 100);
+        b1.advance(&s, i * 100, 2);
+        b2.advance(&s, i * 100, 2);
+    }
+    for i in 1..=10 {
+        let s = test_seed(i * 100);
+        c1.advance(&s, i * 100, 1);
+    }
+
+    // 3 partitions → 3 clusters.
+    assert_eq!(count_clusters(&[&a1, &a2, &a3, &b1, &b2, &c1]), 3,
+        "3 independent clusters before any merge");
+
+    // Phase 2: Merge A + B at the contact point (a1 meets b1).
+    let pre_a = a1.value;
+    let pre_b = b1.value;
+    let a_contribs = a1.work_contributions.clone();
+    let b_contribs = b1.work_contributions.clone();
+    a1.fungible_adopt(&pre_b, b1.round, &b_contribs, 3000, 5);
+    b1.fungible_adopt(&pre_a, a1.round, &a_contribs, 3000, 5);
+
+    // SPORE cascade: army members adopt from their scouts.
+    let ab_origin = a1.epoch_origin;
+    a2.adopt(a1.value, a1.round, a1.work_contributions.clone(), Some(ab_origin));
+    a3.adopt(a1.value, a1.round, a1.work_contributions.clone(), Some(ab_origin));
+    b2.adopt(b1.value, b1.round, b1.work_contributions.clone(), Some(ab_origin));
+
+    // 2 partitions (A+B merged, C still separate) → 2 clusters.
+    assert_eq!(count_clusters(&[&a1, &a2, &a3, &b1, &b2, &c1]), 2,
+        "A+B merged into 1 cluster, C still separate");
+
+    // Phase 3: Merge (A+B) + C at the contact point (a1 meets c1).
+    let pre_ab = a1.value;
+    let pre_c = c1.value;
+    let ab_contribs = a1.work_contributions.clone();
+    let c_contribs = c1.work_contributions.clone();
+    a1.fungible_adopt(&pre_c, c1.round, &c_contribs, 4000, 6);
+    c1.fungible_adopt(&pre_ab, a1.round, &ab_contribs, 4000, 6);
+
+    // SPORE cascade to all army members.
+    let all_origin = a1.epoch_origin;
+    a2.adopt(a1.value, a1.round, a1.work_contributions.clone(), Some(all_origin));
+    a3.adopt(a1.value, a1.round, a1.work_contributions.clone(), Some(all_origin));
+    b1.adopt(a1.value, a1.round, a1.work_contributions.clone(), Some(all_origin));
+    b2.adopt(a1.value, a1.round, a1.work_contributions.clone(), Some(all_origin));
+
+    // 1 partition (all connected) → 1 cluster.
+    assert_eq!(count_clusters(&[&a1, &a2, &a3, &b1, &b2, &c1]), 1,
+        "all 6 nodes in 1 cluster after full convergence");
+
+    // Phase 4: THE KEY TEST — staggered advances within one round.
+    // Some nodes advance, others haven't yet. This is the exact scenario
+    // that caused the converge-then-split bug before the epoch_origin fix.
+    let round_seed = test_seed(5000);
+
+    // Only a1 and b2 advance (the others are "lagging" within this round).
+    a1.advance(&round_seed, 5000, 6);
+    b2.advance(&round_seed, 5000, 6);
+
+    // Despite staggered advance, all still share the same epoch_origin.
+    assert_eq!(count_clusters(&[&a1, &a2, &a3, &b1, &b2, &c1]), 1,
+        "staggered advance within 1 round must NOT create spurious clusters");
+
+    // Pairwise: advanced nodes vs lagging nodes → still SameCluster.
+    assert_eq!(a1.compare(Some(&a2.epoch_origin)), ChainComparison::SameCluster,
+        "advanced a1 vs lagging a2: SameCluster");
+    assert_eq!(b2.compare(Some(&c1.epoch_origin)), ChainComparison::SameCluster,
+        "advanced b2 vs lagging c1: SameCluster");
+    assert_eq!(a2.compare(Some(&b1.epoch_origin)), ChainComparison::SameCluster,
+        "lagging a2 vs lagging b1: SameCluster");
+
+    // Verify tips ARE different (the old bug would have triggered here).
+    assert_ne!(a1.value, a2.value,
+        "advanced and lagging nodes have different tip values");
+
+    // Now the rest catch up.
+    a2.advance(&round_seed, 5000, 6);
+    a3.advance(&round_seed, 5000, 6);
+    b1.advance(&round_seed, 5000, 6);
+    c1.advance(&round_seed, 5000, 6);
+
+    // All tips converge, all still 1 cluster.
+    assert_eq!(a1.value, a2.value);
+    assert_eq!(a1.value, b1.value);
+    assert_eq!(a1.value, c1.value);
+    assert_eq!(count_clusters(&[&a1, &a2, &a3, &b1, &b2, &c1]), 1,
+        "after all nodes advance: still 1 cluster");
+
+    // Phase 5: Multiple rounds of staggered advances — invariant holds.
+    for round in 1..=10u64 {
+        let ts = 5000 + round * 100;
+        let s = test_seed(ts);
+
+        // Advance nodes in random-ish order (not all at once).
+        a1.advance(&s, ts, 6);
+        b1.advance(&s, ts, 6);
+        // Mid-round check: still 1 cluster despite 4 nodes lagging.
+        assert_eq!(count_clusters(&[&a1, &a2, &a3, &b1, &b2, &c1]), 1,
+            "mid-round {round}: 2 advanced, 4 lagging — still 1 cluster");
+
+        a2.advance(&s, ts, 6);
+        c1.advance(&s, ts, 6);
+        a3.advance(&s, ts, 6);
+        b2.advance(&s, ts, 6);
+    }
+
+    assert_eq!(count_clusters(&[&a1, &a2, &a3, &b1, &b2, &c1]), 1,
+        "after 10 rounds of staggered advances: still 1 cluster");
+
+    eprintln!(
+        "\n=== CLUSTER COUNT INVARIANT: VERIFIED ===\n\
+         6 nodes across 3 initial clusters\n\
+         Merged: 3 → 2 → 1 cluster ✓\n\
+         Staggered advances (1 round): 1 cluster ✓\n\
+         Staggered advances (10 rounds): 1 cluster ✓\n\
+         Cluster count always == partition count ✓\n\
+         =========================================",
+    );
+}
