@@ -1609,16 +1609,22 @@ pub fn spawn_event_processor(
                                 let (we_win, ts, size, topo) = chain_merge_ctx;
                                 if we_win {
                                     if let Some(loser_value) = remote_bytes {
-                                        cc.record_merge(&loser_value, cluster_chain_round.unwrap_or(0),
+                                        cc.update_history(&loser_value, cluster_chain_round.unwrap_or(0),
                                                         &topo, ts, size);
                                         info!(new_chain = %cc.value_short(),
                                               merge_count = cc.summary().merge_count,
                                               "cluster chain: recorded merge — we won");
                                     }
                                 } else if let Some(winner_value) = remote_bytes {
-                                    cc.adopt(winner_value, cluster_chain_round.unwrap_or(0));
+                                    // Loser computes the SAME merged seed as the winner.
+                                    // Both sides have identical inputs: winner, loser, topo.
+                                    // Converges in ONE hello round instead of two.
+                                    let our_value = cc.value;
+                                    let merged = super::cluster_chain::merge_chain_seed(
+                                        &winner_value, &our_value, &topo);
+                                    cc.adopt(merged, cc.round + 1);
                                     info!(adopted = %cc.value_short(),
-                                          "cluster chain: adopted winner's chain — we lost");
+                                          "cluster chain: computed merged identity — we lost");
                                 }
                             }
                             super::cluster_chain::ChainComparison::FreshJoin => {

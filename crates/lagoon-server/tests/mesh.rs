@@ -2889,7 +2889,7 @@ fn cluster_chain_merge_protocol() {
     let loser_value = beta.value;
     let loser_round = beta.round;
 
-    alpha.record_merge(&loser_value, loser_round, &topo_hash, 40, 5);
+    alpha.update_history(&loser_value, loser_round, &topo_hash, 40, 5);
     assert_eq!(alpha.summary().merge_count, 1);
 
     // Loser adopts the winner's NEW (post-merge) chain value.
@@ -2973,8 +2973,8 @@ fn cluster_chain_merge_deterministic() {
     // Both record the same merge (loser = cluster B).
     let topo = blake3::hash(b"same-topology").as_bytes().to_owned();
     let loser = blake3::hash(b"cluster-b-tip").as_bytes().to_owned();
-    node1.record_merge(&loser, 3, &topo, 40, 5);
-    node2.record_merge(&loser, 3, &topo, 40, 5);
+    node1.update_history(&loser, 3, &topo, 40, 5);
+    node2.update_history(&loser, 3, &topo, 40, 5);
 
     // Both arrive at the same merged chain value.
     assert_eq!(node1.value, node2.value);
@@ -3013,7 +3013,7 @@ fn cluster_chain_cascading_merge() {
     // Step 1: Alpha merges Beta.
     let topo1 = blake3::hash(b"alpha-beta-topo").as_bytes().to_owned();
     let beta_value = beta.value;
-    alpha.record_merge(&beta_value, beta.round, &topo1, 40, 5);
+    alpha.update_history(&beta_value, beta.round, &topo1, 40, 5);
     beta.adopt(alpha.value, alpha.round);
 
     assert_eq!(alpha.compare(Some(&beta.value)), ChainComparison::SameCluster);
@@ -3021,7 +3021,7 @@ fn cluster_chain_cascading_merge() {
     // Step 2: Alpha (now includes Beta) merges Gamma.
     let topo2 = blake3::hash(b"alpha-beta-gamma-topo").as_bytes().to_owned();
     let gamma_value = gamma.value;
-    alpha.record_merge(&gamma_value, gamma.round, &topo2, 50, 6);
+    alpha.update_history(&gamma_value, gamma.round, &topo2, 50, 6);
     gamma.adopt(alpha.value, alpha.round);
     beta.adopt(alpha.value, alpha.round);
 

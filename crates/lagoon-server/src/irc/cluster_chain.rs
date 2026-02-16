@@ -168,8 +168,9 @@ impl ClusterChain {
         self.enforce_history_limit();
     }
 
-    /// Record a merge event: this cluster absorbed another.
-    pub fn record_merge(
+    /// Update the chain history after a merge (the actual mesh rearrangement
+    /// is handled by `evaluate_spiral_merge`).
+    pub fn update_history(
         &mut self,
         loser_value: &[u8; 32],
         loser_round: u64,
@@ -405,7 +406,7 @@ mod tests {
         let topo_hash = blake3::hash(b"merged-topology").as_bytes().to_owned();
 
         let pre_merge = winner.value;
-        winner.record_merge(&loser.value, loser.round, &topo_hash, 100, 5);
+        winner.update_history(&loser.value, loser.round, &topo_hash, 100, 5);
 
         assert_ne!(winner.value, pre_merge);
         assert_ne!(winner.value, loser.value);
@@ -458,7 +459,7 @@ mod tests {
         chain.advance(10, 3);
         let loser = blake3::hash(b"loser").as_bytes().to_owned();
         let topo = blake3::hash(b"topo").as_bytes().to_owned();
-        chain.record_merge(&loser, 5, &topo, 20, 5);
+        chain.update_history(&loser, 5, &topo, 20, 5);
         chain.advance(30, 5);
         chain.record_split(40, 3);
 
