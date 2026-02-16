@@ -3282,10 +3282,32 @@ pub fn spawn_event_processor(
             // O(1) per node (≤20 neighbors), not O(N) flooding.
             _ = vdf_window_interval.tick() => {
                 // Generate window proof from accumulated chain steps.
+                // IMPORTANT: Extract the quantum boundary VDF hash BEFORE
+                // trim_to(1) discards historical hashes.
                 let mut st = state.write().await;
+                let mut quantum_hash_cached: Option<(u64, [u8; 32])> = None;
                 let window_msg = if let Some(ref chain) = st.mesh.vdf_chain {
                     let mut c = chain.write().await;
                     if c.window_len() >= 2 {
+                        // Universal Clock: extract VDF hash at quantum boundary.
+                        //
+                        // The round seed for cluster chain advance is the VDF
+                        // hash at the quantized height. This hash is:
+                        // - Deterministic: all nodes at the same height produce it
+                        // - Unpredictable: VDF is sequential, can't precompute
+                        // - Agreed-upon: quantizing eliminates minor drift
+                        //
+                        // Must extract BEFORE trim_to(1) or the hash is lost.
+                        const ROUND_QUANTUM: u64 = 30; // 1 VDF window = 30 steps
+                        let chain_height = c.height();
+                        let quantized = (chain_height / ROUND_QUANTUM) * ROUND_QUANTUM;
+                        if quantized >= c.height_start() {
+                            let idx = (quantized - c.height_start()) as usize;
+                            if idx < c.hashes.len() {
+                                quantum_hash_cached = Some((quantized, c.hashes[idx]));
+                            }
+                        }
+
                         let spiral_slot = st.lens.spiral_index;
                         let proof = c.generate_window_proof(spiral_slot, 3);
                         // Trim chain: keep only the tip as anchor for next window.
@@ -3310,36 +3332,32 @@ pub fn spawn_event_processor(
                     None
                 };
 
+                // Cache quantum hash for use in cluster chain advance.
+                if let Some(qh) = quantum_hash_cached {
+                    st.mesh.last_quantum_hash = Some(qh);
+                }
+
                 // Advance cluster identity chain on each VDF window tick.
                 //
-                // The round seed is the VDF height quantized to the window
+                // The round seed is the VDF HASH at the quantized height
                 // boundary (30 steps = 1 window ≈ 3s at 10 Hz). All nodes
                 // snap to the same boundary: node at height 571 and node at
-                // 574 both use quantum 570. The chain only advances when we
-                // cross into a NEW quantum — not every tick.
+                // 574 both use quantum 570. The hash at that quantum is
+                // deterministic and identical across nodes.
                 //
-                // This is the Universal Clock: VDF height is deterministic
-                // (sequential, non-parallelizable), and quantizing eliminates
-                // minor drift between nodes. After merge, both sides agree on
-                // (value, round) and the next quantum boundary produces the
-                // same advance seed on both.
-                //
-                // TODO: Replace quantized height with the actual VDF hash at
-                // that height once CVDF (cooperative VDF) provides a shared
-                // chain tip that all cluster members agree on. The hash is
-                // unpredictable (VDF is sequential) — using it as the seed
-                // prevents precomputation of future chain values.
+                // This is the Universal Clock: VDF height maps to wall-clock
+                // time, the hash at each quantum boundary is unpredictable
+                // (sequential VDF), and quantizing eliminates minor drift.
+                // After merge, both sides agree on (value, round) and the
+                // next quantum boundary produces the same advance seed.
                 {
-                    const ROUND_QUANTUM: u64 = 30; // 1 VDF window = 30 steps
-                    let vdf_height = st.mesh.vdf_state_rx.as_ref()
-                        .map(|rx| rx.borrow().total_steps)
-                        .unwrap_or(0);
-                    let quantized = (vdf_height / ROUND_QUANTUM) * ROUND_QUANTUM;
-                    let cluster_size = (st.mesh.known_peers.len() + 1) as u32;
-                    if let Some(ref mut cc) = st.mesh.cluster_chain {
-                        // Only advance when crossing a quantum boundary.
-                        if quantized > cc.last_timestamp_round() {
-                            cc.advance(quantized, cluster_size);
+                    if let Some((quantized, round_seed)) = st.mesh.last_quantum_hash {
+                        let cluster_size = (st.mesh.known_peers.len() + 1) as u32;
+                        if let Some(ref mut cc) = st.mesh.cluster_chain {
+                            // Only advance when crossing a quantum boundary.
+                            if quantized > cc.last_timestamp_round() {
+                                cc.advance(&round_seed, quantized, cluster_size);
+                            }
                         }
                     }
                 }

@@ -2864,6 +2864,11 @@ async fn forty_node_spiral_mesh() {
 
 use lagoon_server::irc::cluster_chain::{ChainComparison, ClusterChain};
 
+/// Derive a deterministic round seed from a test timestamp.
+fn test_seed(ts: u64) -> [u8; 32] {
+    *blake3::hash(&ts.to_le_bytes()).as_bytes()
+}
+
 #[test]
 fn cluster_chain_merge_protocol() {
     // Two clusters with different genesis seeds.
@@ -2875,8 +2880,8 @@ fn cluster_chain_merge_protocol() {
 
     // Advance both chains a few rounds (simulating VDF ticks).
     for ts in [10, 20, 30] {
-        alpha.advance(ts, 3);
-        beta.advance(ts, 2);
+        alpha.advance(&test_seed(ts), ts, 3);
+        beta.advance(&test_seed(ts), ts, 2);
     }
 
     // Pre-merge: chains are different.
@@ -2903,8 +2908,8 @@ fn cluster_chain_merge_protocol() {
     assert_eq!(beta.compare(Some(&alpha.value)), ChainComparison::SameCluster);
 
     // Both advance together — chains stay in sync.
-    alpha.advance(50, 5);
-    beta.advance(50, 5);
+    alpha.advance(&test_seed(50), 50, 5);
+    beta.advance(&test_seed(50), 50, 5);
     assert_eq!(alpha.value, beta.value);
     assert_eq!(alpha.round, beta.round);
 
@@ -2925,7 +2930,7 @@ fn cluster_chain_fresh_join_adoption() {
     let seed = blake3::hash(b"established-cluster").as_bytes().to_owned();
     let mut established = ClusterChain::genesis(seed, 0, 3);
     for ts in [10, 20, 30] {
-        established.advance(ts, 3);
+        established.advance(&test_seed(ts), ts, 3);
     }
 
     // Fresh node sees established node's chain → adopts it.
@@ -2940,8 +2945,8 @@ fn cluster_chain_fresh_join_adoption() {
     assert_eq!(joiner.compare(Some(&established.value)), ChainComparison::SameCluster);
 
     // They advance together.
-    established.advance(40, 4);
-    joiner.advance(40, 4);
+    established.advance(&test_seed(40), 40, 4);
+    joiner.advance(&test_seed(40), 40, 4);
     assert_eq!(established.value, joiner.value);
 
     eprintln!(
@@ -2965,8 +2970,8 @@ fn cluster_chain_merge_deterministic() {
 
     // Both advance identically.
     for ts in [10, 20, 30] {
-        node1.advance(ts, 3);
-        node2.advance(ts, 3);
+        node1.advance(&test_seed(ts), ts, 3);
+        node2.advance(&test_seed(ts), ts, 3);
     }
     assert_eq!(node1.value, node2.value);
 
@@ -3005,9 +3010,9 @@ fn cluster_chain_cascading_merge() {
     let mut gamma = ClusterChain::genesis(seed_c, 0, 1);
 
     for ts in [10, 20, 30] {
-        alpha.advance(ts, 3);
-        beta.advance(ts, 2);
-        gamma.advance(ts, 1);
+        alpha.advance(&test_seed(ts), ts, 3);
+        beta.advance(&test_seed(ts), ts, 2);
+        gamma.advance(&test_seed(ts), ts, 1);
     }
 
     // Step 1: Alpha merges Beta.
@@ -3033,9 +3038,9 @@ fn cluster_chain_cascading_merge() {
     assert_eq!(alpha.summary().merge_count, 2);
 
     // All advance together.
-    alpha.advance(60, 6);
-    beta.advance(60, 6);
-    gamma.advance(60, 6);
+    alpha.advance(&test_seed(60), 60, 6);
+    beta.advance(&test_seed(60), 60, 6);
+    gamma.advance(&test_seed(60), 60, 6);
     assert_eq!(alpha.value, beta.value);
     assert_eq!(alpha.value, gamma.value);
 

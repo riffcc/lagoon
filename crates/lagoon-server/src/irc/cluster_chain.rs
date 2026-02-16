@@ -21,13 +21,15 @@ use serde::{Deserialize, Serialize};
 
 /// Advance a cluster chain by one round.
 ///
-/// `chain(n+1) = blake3(blake3(chain(n) ++ timestamp_bytes))`
+/// `chain(n+1) = blake3(blake3(chain(n) ++ round_seed))`
 ///
+/// The `round_seed` is the VDF hash at the quantized round boundary — a
+/// deterministic value that all cluster members agree on (Universal Clock).
 /// The double-hash prevents length-extension attacks.
-pub fn advance_chain(prev: &[u8; 32], timestamp_round: u64) -> [u8; 32] {
+pub fn advance_chain(prev: &[u8; 32], round_seed: &[u8; 32]) -> [u8; 32] {
     let mut inner = blake3::Hasher::new();
     inner.update(prev);
-    inner.update(&timestamp_round.to_le_bytes());
+    inner.update(round_seed);
     let inner_hash = inner.finalize();
 
     *blake3::hash(inner_hash.as_bytes()).as_bytes()
@@ -145,10 +147,10 @@ impl ClusterChain {
     /// Advance the chain by one round.
     ///
     /// Called on each VDF window tick (every ~3 seconds).
-    /// The `timestamp_round` should be the VDF total_steps or another
-    /// monotonically increasing VDF-anchored value.
-    pub fn advance(&mut self, timestamp_round: u64, cluster_size: u32) {
-        let new_value = advance_chain(&self.value, timestamp_round);
+    /// `round_seed` is the VDF hash at the quantized round boundary (Universal Clock).
+    /// `timestamp_round` is the quantized VDF height (for history bookkeeping).
+    pub fn advance(&mut self, round_seed: &[u8; 32], timestamp_round: u64, cluster_size: u32) {
+        let new_value = advance_chain(&self.value, round_seed);
         let prev_hash = self
             .history
             .first()
@@ -202,8 +204,8 @@ impl ClusterChain {
     }
 
     /// Record a split event (partition detected).
-    pub fn record_split(&mut self, timestamp_round: u64, remaining_size: u32) {
-        let new_value = advance_chain(&self.value, timestamp_round);
+    pub fn record_split(&mut self, round_seed: &[u8; 32], timestamp_round: u64, remaining_size: u32) {
+        let new_value = advance_chain(&self.value, round_seed);
         let prev_hash = self
             .history
             .first()
@@ -354,6 +356,11 @@ impl ClusterChain {
 mod tests {
     use super::*;
 
+    /// Derive a deterministic round seed from a test timestamp.
+    fn test_seed(ts: u64) -> [u8; 32] {
+        *blake3::hash(&ts.to_le_bytes()).as_bytes()
+    }
+
     #[test]
     fn genesis_creates_chain() {
         let seed = blake3::hash(b"test-genesis").as_bytes().to_owned();
@@ -369,7 +376,7 @@ mod tests {
         let seed = blake3::hash(b"test-advance").as_bytes().to_owned();
         let mut chain = ClusterChain::genesis(seed, 0, 1);
         let before = chain.value;
-        chain.advance(100, 1);
+        chain.advance(&test_seed(100), 100, 1);
         assert_ne!(chain.value, before);
         assert_eq!(chain.round, 1);
         assert_eq!(chain.history.len(), 2);
@@ -381,8 +388,8 @@ mod tests {
         let mut a = ClusterChain::genesis(seed, 0, 1);
         let mut b = ClusterChain::genesis(seed, 0, 1);
         for ts in [10, 20, 30] {
-            a.advance(ts, 2);
-            b.advance(ts, 2);
+            a.advance(&test_seed(ts), ts, 2);
+            b.advance(&test_seed(ts), ts, 2);
         }
         assert_eq!(a.value, b.value);
         assert_eq!(a.round, b.round);
@@ -395,8 +402,8 @@ mod tests {
         let mut a = ClusterChain::genesis(seed_a, 0, 1);
         let mut b = ClusterChain::genesis(seed_b, 0, 1);
         for ts in [10, 20, 30] {
-            a.advance(ts, 1);
-            b.advance(ts, 1);
+            a.advance(&test_seed(ts), ts, 1);
+            b.advance(&test_seed(ts), ts, 1);
         }
         assert_ne!(a.value, b.value);
         assert_eq!(a.compare(Some(&b.value)), ChainComparison::DifferentCluster);
@@ -450,7 +457,7 @@ mod tests {
         // Override limit for test
         chain.max_history_blocks = 10;
         for i in 1..=20 {
-            chain.advance(i, 1);
+            chain.advance(&test_seed(i), i, 1);
         }
         assert!(chain.history.len() <= 10);
         // Most recent block should be round 20
@@ -461,12 +468,12 @@ mod tests {
     fn summary_counts_events() {
         let seed = blake3::hash(b"summary").as_bytes().to_owned();
         let mut chain = ClusterChain::genesis(seed, 0, 3);
-        chain.advance(10, 3);
+        chain.advance(&test_seed(10), 10, 3);
         let loser = blake3::hash(b"loser").as_bytes().to_owned();
         let topo = blake3::hash(b"topo").as_bytes().to_owned();
         chain.update_history(&loser, 5, &topo, 20, 5);
-        chain.advance(30, 5);
-        chain.record_split(40, 3);
+        chain.advance(&test_seed(30), 30, 5);
+        chain.record_split(&test_seed(40), 40, 3);
 
         let summary = chain.summary();
         assert_eq!(summary.round, 4);

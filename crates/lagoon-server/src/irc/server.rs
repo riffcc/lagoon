@@ -374,6 +374,12 @@ pub struct MeshState {
     /// Cluster identity chain — rotating blake3 hash for merge/split detection.
     /// Advances on VDF window ticks, carried in HELLO, compared on connection.
     pub cluster_chain: Option<super::cluster_chain::ClusterChain>,
+    /// Cached VDF hash at the most recent quantum boundary (Universal Clock).
+    /// Extracted from VdfChain BEFORE trim_to(1) discards historical hashes.
+    /// Used as the round_seed for cluster chain advance — all nodes at the
+    /// same quantized height use the same deterministic VDF hash.
+    /// Format: (quantized_height, vdf_hash_at_that_height).
+    pub last_quantum_hash: Option<(u64, [u8; 32])>,
 }
 
 impl MeshState {
@@ -410,6 +416,7 @@ impl MeshState {
             last_hello_broadcast: None,
             verified_vdf_tips: HashMap::new(),
             cluster_chain: None,
+            last_quantum_hash: None,
         }
     }
 }
