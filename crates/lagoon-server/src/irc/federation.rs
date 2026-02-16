@@ -3564,6 +3564,7 @@ pub fn spawn_event_processor(
                     let mut dead_relays: Vec<String> = Vec::new();
                     for nkey in &neighbor_keys {
                         if let Some(relay) = st.federation.relays.get(nkey) {
+                            if !relay.mesh_connected { continue; }
                             if relay.outgoing_tx.send(RelayCommand::SendMesh(
                                 msg.clone(),
                             )).is_err() {
@@ -3650,6 +3651,7 @@ pub fn spawn_event_processor(
                                 if let Some(relay) = st.federation.relays
                                     .get(&peer.node_name)
                                 {
+                                    if !relay.mesh_connected { continue; }
                                     let _ = relay.outgoing_tx.send(
                                         RelayCommand::SendMesh(mesh_msg.clone()),
                                     );
@@ -3666,9 +3668,11 @@ pub fn spawn_event_processor(
                             if let Some(relay) = st.federation.relays
                                 .get(&peer.node_name)
                             {
-                                let _ = relay.outgoing_tx.send(
-                                    RelayCommand::SendMesh(mesh_msg),
-                                );
+                                if relay.mesh_connected {
+                                    let _ = relay.outgoing_tx.send(
+                                        RelayCommand::SendMesh(mesh_msg),
+                                    );
+                                }
                             }
                         }
                     }
@@ -3848,6 +3852,7 @@ pub fn broadcast_profile_have_to_cluster(
             .unwrap_or(false);
 
         if is_cluster {
+            if !relay.mesh_connected { continue; }
             let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(msg.clone()));
         }
     }
@@ -3914,6 +3919,7 @@ fn execute_latency_gossip_actions(
             }
         };
         if let Some(relay) = st.federation.relays.get(&peer_id) {
+            if !relay.mesh_connected { continue; }
             let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(mesh_msg));
         }
     }
@@ -3944,6 +3950,7 @@ fn execute_connection_gossip_actions(
             }
         };
         if let Some(relay) = st.federation.relays.get(&peer_id) {
+            if !relay.mesh_connected { continue; }
             let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(mesh_msg));
         }
     }
@@ -3974,6 +3981,7 @@ fn execute_liveness_gossip_actions(
             }
         };
         if let Some(relay) = st.federation.relays.get(&peer_id) {
+            if !relay.mesh_connected { continue; }
             let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(mesh_msg));
         }
     }
@@ -6649,6 +6657,7 @@ fn announce_hello_to_all_relays(st: &mut super::server::ServerState) {
 
     let hello_json = serde_json::to_string(&build_hello_payload(st)).unwrap_or_default();
     for relay in st.federation.relays.values() {
+        if !relay.mesh_connected { continue; }
         let _ = relay.outgoing_tx.send(RelayCommand::MeshHello {
             json: hello_json.clone(),
         });
