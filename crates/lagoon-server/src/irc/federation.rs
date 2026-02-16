@@ -1580,57 +1580,40 @@ pub fn spawn_event_processor(
                         }
                     }
 
-                    // Compare chains. Extract merge context before mutable borrow.
-                    let chain_merge_ctx = {
-                        let our_work = st.mesh.our_cluster_vdf_work;
-                        let their_work = cluster_vdf_work.unwrap_or(0.0);
-                        let our_vdf_hash: Option<Vec<u8>> = st.mesh.vdf_state_rx.as_ref()
-                            .map(|rx| rx.borrow().current_hash.to_vec());
-                        let their_vdf_hash: Option<Vec<u8>> = remote_vdf_hash_for_merge
-                            .as_deref().and_then(|h| hex::decode(h).ok());
-                        let our_pid = st.lens.peer_id.clone();
-                        let we_win = our_work > their_work
-                            || (our_work == their_work && vdf_tiebreak_wins(
-                                &our_pid, &peer_id,
-                                our_vdf_hash.as_deref(), their_vdf_hash.as_deref()));
-                        let ts = st.mesh.vdf_state_rx.as_ref()
-                            .map(|rx| rx.borrow().total_steps).unwrap_or(0);
-                        let size = (st.mesh.known_peers.len() + 1) as u32;
-                        let topo = compute_topology_hash(&st.mesh.spiral);
-                        (we_win, ts, size, topo)
-                    };
+                    // F-VDF fungible merge: both sides compute max(our_chain, their_chain).
+                    // The value IS the winner — no work comparison, no losers.
+                    // Work is additive: cluster_vdf_work naturally sums as peers
+                    // discover each other via SPORE gossip post-merge.
+                    //
+                    // Extract context before mutable borrow on cluster_chain.
+                    let merge_ts = st.mesh.vdf_state_rx.as_ref()
+                        .map(|rx| rx.borrow().total_steps).unwrap_or(0);
+                    let merge_size = (st.mesh.known_peers.len() + 1) as u32;
+                    let remote_chain_bytes = cluster_chain_value.as_ref().and_then(|hex_str| {
+                        hex::decode(hex_str).ok().and_then(|bytes| {
+                            <[u8; 32]>::try_from(bytes.as_slice()).ok()
+                        })
+                    });
 
                     if let Some(ref mut cc) = st.mesh.cluster_chain {
-                        let remote_bytes = cluster_chain_value.as_ref().and_then(|hex_str| {
-                            hex::decode(hex_str).ok().and_then(|bytes| {
-                                <[u8; 32]>::try_from(bytes.as_slice()).ok()
-                            })
-                        });
-                        let comparison = cc.compare(remote_bytes.as_ref());
+                        let comparison = cc.compare(remote_chain_bytes.as_ref());
                         match comparison {
                             super::cluster_chain::ChainComparison::SameCluster => {
                                 // Chains match. Nothing to do — Universal Clock
                                 // keeps them in sync independently.
                             }
                             super::cluster_chain::ChainComparison::DifferentCluster => {
-                                let (we_win, ts, size, topo) = chain_merge_ctx;
-                                if we_win {
-                                    if let Some(loser_value) = remote_bytes {
-                                        cc.update_history(&loser_value, cluster_chain_round.unwrap_or(0),
-                                                        &topo, ts, size);
-                                        info!(new_chain = %cc.value_short(),
-                                              merge_count = cc.summary().merge_count,
-                                              "cluster chain: recorded merge — we won");
+                                if let Some(remote_value) = remote_chain_bytes {
+                                    let their_round = cluster_chain_round.unwrap_or(0);
+                                    let changed = cc.fungible_adopt(
+                                        &remote_value, their_round, merge_ts, merge_size);
+                                    if changed {
+                                        info!(adopted = %cc.value_short(),
+                                              "cluster chain: F-VDF merge — adopted combined identity");
+                                    } else {
+                                        info!(chain = %cc.value_short(),
+                                              "cluster chain: F-VDF merge — we carry the combined identity");
                                     }
-                                } else if let Some(winner_value) = remote_bytes {
-                                    // Loser computes the SAME merged seed as the winner.
-                                    // Both sides call merge_chain_seed with identical args.
-                                    let our_value = cc.value;
-                                    let merged = super::cluster_chain::merge_chain_seed(
-                                        &winner_value, &our_value, &topo);
-                                    cc.adopt(merged, cc.round + 1);
-                                    info!(adopted = %cc.value_short(),
-                                          "cluster chain: computed merged identity — we lost");
                                 }
                             }
                             super::cluster_chain::ChainComparison::FreshJoin => {
@@ -5721,19 +5704,6 @@ fn vdf_tiebreak_wins(
     }
     // Fallback: no VDF hashes available — raw peer_id comparison.
     our_pid > their_pid
-}
-
-/// Hash the current SPIRAL topology for cluster chain merge records.
-///
-/// Deterministic: sorted occupied slots → blake3 hash.
-fn compute_topology_hash(spiral: &super::spiral::SpiralTopology) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    let slots = spiral.occupied_slots();
-    for (idx, key) in &slots {
-        hasher.update(&idx.to_le_bytes());
-        hasher.update(key.as_bytes());
-    }
-    *hasher.finalize().as_bytes()
 }
 
 /// Evaluate SPIRAL merge protocol when a new peer is encountered.

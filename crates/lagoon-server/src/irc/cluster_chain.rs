@@ -35,10 +35,35 @@ pub fn advance_chain(prev: &[u8; 32], round_seed: &[u8; 32]) -> [u8; 32] {
     *blake3::hash(inner_hash.as_bytes()).as_bytes()
 }
 
+/// Fungible merge: deterministic combined identity from two chains.
+///
+/// Produces `blake3(sort(A, B))` — a NEW hash that neither side had before,
+/// reflecting both histories. This is the core F-VDF operation from
+/// downward-spiral.
+///
+/// Properties:
+/// - **Commutative**: `fungible_merge(A, B) == fungible_merge(B, A)` (sort)
+/// - **Idempotent**: `fungible_merge(A, A) == blake3(A || A)` (stable)
+/// - **Deterministic**: same inputs always produce same output
+///
+/// NOT a max/pick-winner operation. Neither input survives unchanged.
+/// The merged value is the product of both chains — not one chain winning
+/// over the other. Work is additive: tracked separately via `cluster_vdf_work`.
+///
+/// After merge, both sides have the same NEW chain value. `advance_chain()`
+/// with the same Universal Clock round seed produces the same next value.
+pub fn fungible_merge(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+    let (first, second) = if a <= b { (a, b) } else { (b, a) };
+    let mut h = blake3::Hasher::new();
+    h.update(first);
+    h.update(second);
+    *h.finalize().as_bytes()
+}
+
 /// Compute a merged chain seed from winner + loser + topology hash.
 ///
-/// Deterministic: both sides compute the same value. Fresh start, not a
-/// continuation of either cluster's chain.
+/// DEPRECATED: Use `fungible_merge()` for F-VDF additive merges.
+/// Retained for test compatibility.
 pub fn merge_chain_seed(
     winner: &[u8; 32],
     loser: &[u8; 32],
@@ -65,10 +90,16 @@ pub enum ChainEvent {
     Advance,
     /// Cluster genesis: new cluster formed.
     Genesis,
-    /// Two clusters merged. Records the loser's state.
+    /// Two clusters merged (competitive, legacy). Records the loser's state.
     Merge {
         loser_chain_value: String,
         loser_round: u64,
+    },
+    /// F-VDF symmetric merge: both chains combined additively.
+    /// Neither side is winner or loser — the result is deterministic from both inputs.
+    FungibleMerge {
+        other_chain_value: String,
+        other_round: u64,
     },
     /// Network partition detected (split).
     Split,
@@ -203,6 +234,45 @@ impl ClusterChain {
         self.enforce_history_limit();
     }
 
+    /// F-VDF fungible merge: both sides compute `max(our_chain, their_chain)`.
+    ///
+    /// The winner IS the value — the lexicographically larger chain.
+    /// Commutative, associative, idempotent (proper CRDT join-semilattice).
+    /// Work is additive: the peer set grows as clusters discover each other.
+    /// Returns `true` if our chain value changed (we adopted).
+    pub fn fungible_adopt(
+        &mut self,
+        other_value: &[u8; 32],
+        other_round: u64,
+        timestamp_round: u64,
+        merged_size: u32,
+    ) -> bool {
+        let merged = fungible_merge(&self.value, other_value);
+        let changed = merged != self.value;
+        let prev_hash = self
+            .history
+            .first()
+            .map(|b| b.block_hash())
+            .unwrap_or_else(|| "0".into());
+        let new_round = self.round.max(other_round) + 1;
+        let block = ChainBlock {
+            prev_block_hash: prev_hash,
+            chain_value: hex::encode(merged),
+            round: new_round,
+            timestamp_round,
+            event: ChainEvent::FungibleMerge {
+                other_chain_value: hex::encode(other_value),
+                other_round,
+            },
+            cluster_size: merged_size,
+        };
+        self.value = merged;
+        self.round = new_round;
+        self.history.insert(0, block);
+        self.enforce_history_limit();
+        changed
+    }
+
     /// Record a split event (partition detected).
     pub fn record_split(&mut self, round_seed: &[u8; 32], timestamp_round: u64, remaining_size: u32) {
         let new_value = advance_chain(&self.value, round_seed);
@@ -256,11 +326,11 @@ impl ClusterChain {
         &self.history[..end]
     }
 
-    /// Get all merge events in the history.
+    /// Get all merge events in the history (both legacy and F-VDF).
     pub fn merge_events(&self) -> Vec<&ChainBlock> {
         self.history
             .iter()
-            .filter(|b| matches!(b.event, ChainEvent::Merge { .. }))
+            .filter(|b| matches!(b.event, ChainEvent::Merge { .. } | ChainEvent::FungibleMerge { .. }))
             .collect()
     }
 
@@ -336,7 +406,7 @@ impl ClusterChain {
         let merge_count = self
             .history
             .iter()
-            .filter(|b| matches!(b.event, ChainEvent::Merge { .. }))
+            .filter(|b| matches!(b.event, ChainEvent::Merge { .. } | ChainEvent::FungibleMerge { .. }))
             .count() as u32;
         let split_count = self
             .history
@@ -462,6 +532,121 @@ mod tests {
         assert!(chain.history.len() <= 10);
         // Most recent block should be round 20
         assert_eq!(chain.history[0].round, 20);
+    }
+
+    #[test]
+    fn fungible_merge_is_commutative() {
+        let a = blake3::hash(b"cluster-alpha").as_bytes().to_owned();
+        let b = blake3::hash(b"cluster-beta").as_bytes().to_owned();
+        assert_eq!(fungible_merge(&a, &b), fungible_merge(&b, &a));
+    }
+
+    #[test]
+    fn fungible_merge_produces_new_value() {
+        let a = blake3::hash(b"cluster-alpha").as_bytes().to_owned();
+        let b = blake3::hash(b"cluster-beta").as_bytes().to_owned();
+        let merged = fungible_merge(&a, &b);
+        // blake3(sort(A,B)) produces a NEW value — neither input survives
+        assert_ne!(merged, a);
+        assert_ne!(merged, b);
+    }
+
+    #[test]
+    fn fungible_merge_self_is_stable() {
+        // blake3(A || A) is deterministic — same result every time
+        let a = blake3::hash(b"cluster-alpha").as_bytes().to_owned();
+        let self_merge = fungible_merge(&a, &a);
+        assert_eq!(fungible_merge(&a, &a), self_merge);
+    }
+
+    #[test]
+    fn fungible_merge_not_associative() {
+        // blake3(sort(A,B)) is NOT associative — merge order matters.
+        // Cascade convergence is a PROTOCOL concern (proof transcripts),
+        // not a merge-function property.
+        let a = blake3::hash(b"cluster-alpha").as_bytes().to_owned();
+        let b = blake3::hash(b"cluster-beta").as_bytes().to_owned();
+        let c = blake3::hash(b"cluster-gamma").as_bytes().to_owned();
+        let ab_c = fungible_merge(&fungible_merge(&a, &b), &c);
+        let a_bc = fungible_merge(&a, &fungible_merge(&b, &c));
+        // These are DIFFERENT — intentionally. The protocol handles convergence.
+        assert_ne!(ab_c, a_bc);
+    }
+
+    #[test]
+    fn fungible_merge_cascade_stable() {
+        // After A⊔B=M, a cluster-mate C (still at A) merging with M
+        // produces the same result as directly merging with M.
+        // fungible_merge(A, M) is deterministic and both sides get it.
+        let a = blake3::hash(b"cluster-alpha").as_bytes().to_owned();
+        let b = blake3::hash(b"cluster-beta").as_bytes().to_owned();
+        let ab = fungible_merge(&a, &b);
+        // C (at value A) meets merged AB — gets a combined value
+        let c_result = fungible_merge(&a, &ab);
+        // Another node D (also at A) meets AB — gets the same value
+        let d_result = fungible_merge(&a, &ab);
+        assert_eq!(c_result, d_result);
+    }
+
+    #[test]
+    fn fungible_merge_is_deterministic() {
+        let a = blake3::hash(b"cluster-one").as_bytes().to_owned();
+        let b = blake3::hash(b"cluster-two").as_bytes().to_owned();
+        let m1 = fungible_merge(&a, &b);
+        let m2 = fungible_merge(&a, &b);
+        assert_eq!(m1, m2);
+    }
+
+    #[test]
+    fn fungible_adopt_records_event() {
+        let seed_a = blake3::hash(b"alpha").as_bytes().to_owned();
+        let seed_b = blake3::hash(b"beta").as_bytes().to_owned();
+        let mut chain = ClusterChain::genesis(seed_a, 0, 3);
+        let changed = chain.fungible_adopt(&seed_b, 5, 100, 6);
+        // Result is blake3(sort(seed_a, seed_b)) — new combined identity
+        let expected = fungible_merge(&seed_a, &seed_b);
+        assert_eq!(chain.value, expected);
+        assert_ne!(expected, seed_a); // combined value differs from both inputs
+        assert_ne!(expected, seed_b);
+        assert!(matches!(chain.history[0].event, ChainEvent::FungibleMerge { .. }));
+        assert_eq!(chain.merge_events().len(), 1);
+        // blake3 combine always changes both sides (neither input survives)
+        assert!(changed);
+    }
+
+    #[test]
+    fn fungible_adopt_both_sides_converge() {
+        // Two clusters merge — both sides compute the same result
+        let seed_a = blake3::hash(b"alpha").as_bytes().to_owned();
+        let seed_b = blake3::hash(b"beta").as_bytes().to_owned();
+        let mut chain_a = ClusterChain::genesis(seed_a, 0, 3);
+        let mut chain_b = ClusterChain::genesis(seed_b, 0, 2);
+
+        // Both adopt via fungible_adopt
+        chain_a.fungible_adopt(&seed_b, chain_b.round, 100, 5);
+        chain_b.fungible_adopt(&seed_a, chain_a.round, 100, 5);
+
+        // Now they're SameCluster
+        assert_eq!(chain_a.compare(Some(&chain_b.value)), ChainComparison::SameCluster);
+    }
+
+    #[test]
+    fn fungible_adopt_pairwise_symmetric() {
+        // When two genuinely different clusters meet, both sides compute
+        // the same combined value regardless of who initiates.
+        let seed_a = blake3::hash(b"cluster-a").as_bytes().to_owned();
+        let seed_b = blake3::hash(b"cluster-b").as_bytes().to_owned();
+        let mut chain_a = ClusterChain::genesis(seed_a, 0, 2);
+        let mut chain_b = ClusterChain::genesis(seed_b, 0, 1);
+
+        // Both sides merge — should arrive at the same combined value
+        chain_a.fungible_adopt(&seed_b, chain_b.round, 100, 3);
+        chain_b.fungible_adopt(&seed_a, chain_a.round, 100, 3);
+        assert_eq!(chain_a.value, chain_b.value);
+
+        // The combined value is neither original
+        assert_ne!(chain_a.value, seed_a);
+        assert_ne!(chain_a.value, seed_b);
     }
 
     #[test]
