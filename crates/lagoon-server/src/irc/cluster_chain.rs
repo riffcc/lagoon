@@ -25,6 +25,7 @@
 //! (block chain integrity, pruning soundness, history tracking).
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// VDF quantum window size in ticks. At 10 Hz, 100 ticks = 10 seconds.
 ///
@@ -174,6 +175,15 @@ pub struct ClusterChain {
     /// it's the cluster's rolling work counter. On merge, both sides'
     /// cumulative_work values are added (fungible work conservation).
     pub cumulative_work: u64,
+    /// Work contributions ledger: maps each pre-merge cluster genesis hash
+    /// to the number of advance steps performed under that genesis.
+    ///
+    /// On merge, contributions are UNIONED (take max per key) — not added.
+    /// This makes double-counting structurally impossible: the same genesis
+    /// hash is only counted once regardless of how many merge paths reach it.
+    ///
+    /// Size: O(merge_count). 32 nodes ≈ 32 entries × 40 bytes = 1.3 KB.
+    pub work_contributions: BTreeMap<[u8; 32], u64>,
     /// All chain values in the current epoch (genesis, v1, v2, ..., tip).
     /// Reset on merge (epoch reset). Used to generate ZK proofs.
     /// At 10-second intervals: ~8640 entries/day, ~270 KB/day. Manageable.
@@ -203,11 +213,14 @@ impl ClusterChain {
             event: ChainEvent::Genesis,
             cluster_size,
         };
+        let mut work_contributions = BTreeMap::new();
+        work_contributions.insert(seed, 0);
         Self {
             genesis: seed,
             value: seed,
             round: 0,
             cumulative_work: 0,
+            work_contributions,
             epoch_chain: vec![seed],
             epoch_start_quantum: timestamp_round,
             history: vec![block],
@@ -242,7 +255,8 @@ impl ClusterChain {
         };
         self.value = new_value;
         self.round += 1;
-        self.cumulative_work += 1;
+        *self.work_contributions.entry(self.genesis).or_insert(0) += 1;
+        self.cumulative_work = self.work_contributions.values().sum();
         self.epoch_chain.push(new_value);
         self.history.insert(0, block);
         self.enforce_history_limit();
@@ -302,7 +316,7 @@ impl ClusterChain {
         &mut self,
         other_value: &[u8; 32],
         other_round: u64,
-        other_cumulative_work: u64,
+        other_contributions: &BTreeMap<[u8; 32], u64>,
         timestamp_round: u64,
         merged_size: u32,
     ) -> bool {
@@ -331,7 +345,15 @@ impl ClusterChain {
         self.genesis = merged;
         self.value = merged;
         self.round = new_round;
-        self.cumulative_work += other_cumulative_work;
+        // Union contributions: take max per key (idempotent).
+        // If the same genesis appears in both maps, it's counted once.
+        for (k, v) in other_contributions {
+            let entry = self.work_contributions.entry(*k).or_insert(0);
+            *entry = (*entry).max(*v);
+        }
+        // New epoch: add entry for merged genesis (0 steps so far).
+        self.work_contributions.insert(merged, 0);
+        self.cumulative_work = self.work_contributions.values().sum();
         // New epoch: reset the chain to just the merged genesis.
         self.epoch_chain = vec![merged];
         self.epoch_start_quantum = timestamp_round;
@@ -358,7 +380,8 @@ impl ClusterChain {
         };
         self.value = new_value;
         self.round += 1;
-        self.cumulative_work += 1;
+        *self.work_contributions.entry(self.genesis).or_insert(0) += 1;
+        self.cumulative_work = self.work_contributions.values().sum();
         self.epoch_chain.push(new_value);
         self.history.insert(0, block);
         self.enforce_history_limit();
@@ -371,14 +394,21 @@ impl ClusterChain {
     /// Also sets genesis — we're joining their epoch.
     ///
     /// Returns `true` if we actually changed (their work was higher).
-    pub fn adopt(&mut self, peer_value: [u8; 32], peer_round: u64, peer_work: u64) -> bool {
+    pub fn adopt(
+        &mut self,
+        peer_value: [u8; 32],
+        peer_round: u64,
+        peer_contributions: BTreeMap<[u8; 32], u64>,
+    ) -> bool {
+        let peer_work: u64 = peer_contributions.values().sum();
         if peer_work <= self.cumulative_work && peer_value == self.value {
             return false; // Already at this state or ahead.
         }
         self.genesis = peer_value;
         self.value = peer_value;
         self.round = peer_round;
-        self.cumulative_work = peer_work;
+        self.work_contributions = peer_contributions;
+        self.cumulative_work = self.work_contributions.values().sum();
         // Reset epoch chain — we don't have the intermediates.
         // We trust the peer's proof (which should accompany ChainUpdate).
         // Our own epoch chain restarts from their tip.
@@ -492,6 +522,20 @@ impl ClusterChain {
     /// Number of advance steps in the current epoch.
     pub fn epoch_steps(&self) -> u64 {
         self.epoch_chain.len().saturating_sub(1) as u64
+    }
+
+    /// Whether this chain has advanced at least once since the last merge/genesis.
+    /// Used to prevent cascading re-merges before ChainUpdate propagates.
+    pub fn can_merge(&self) -> bool {
+        self.epoch_steps() > 0
+    }
+
+    /// Get work contributions as hex-keyed map (for wire serialization).
+    pub fn contributions_hex(&self) -> std::collections::HashMap<String, u64> {
+        self.work_contributions
+            .iter()
+            .map(|(k, v)| (hex::encode(k), *v))
+            .collect()
     }
 
     /// Generate a ZK proof of the current epoch's chain computation.
@@ -849,7 +893,9 @@ mod tests {
         let seed = blake3::hash(b"adopter").as_bytes().to_owned();
         let mut chain = ClusterChain::genesis(seed, 0, 1);
         let peer_value = blake3::hash(b"peer-chain-tip").as_bytes().to_owned();
-        chain.adopt(peer_value, 42, 100);
+        let mut contributions = BTreeMap::new();
+        contributions.insert(peer_value, 100);
+        chain.adopt(peer_value, 42, contributions);
         assert_eq!(chain.value, peer_value);
         assert_eq!(chain.round, 42);
         assert_eq!(chain.cumulative_work, 100);
@@ -937,7 +983,8 @@ mod tests {
         let seed_a = blake3::hash(b"alpha").as_bytes().to_owned();
         let seed_b = blake3::hash(b"beta").as_bytes().to_owned();
         let mut chain = ClusterChain::genesis(seed_a, 0, 3);
-        let changed = chain.fungible_adopt(&seed_b, 5, 0, 100, 6);
+        let other_contribs = BTreeMap::from([(seed_b, 0u64)]);
+        let changed = chain.fungible_adopt(&seed_b, 5, &other_contribs, 100, 6);
         // Result is blake3(sort(seed_a, seed_b)) — new combined identity
         let expected = fungible_merge(&seed_a, &seed_b);
         assert_eq!(chain.value, expected);
@@ -960,8 +1007,10 @@ mod tests {
         let mut chain_b = ClusterChain::genesis(seed_b, 0, 2);
 
         // Both adopt via fungible_adopt — epoch reset
-        chain_a.fungible_adopt(&seed_b, chain_b.round, 0, 100, 5);
-        chain_b.fungible_adopt(&seed_a, chain_a.round, 0, 100, 5);
+        let b_contribs = BTreeMap::from([(seed_b, 0u64)]);
+        let a_contribs = BTreeMap::from([(seed_a, 0u64)]);
+        chain_a.fungible_adopt(&seed_b, chain_b.round, &b_contribs, 100, 5);
+        chain_b.fungible_adopt(&seed_a, chain_a.round, &a_contribs, 100, 5);
 
         // Now they're SameCluster with the same genesis
         assert_eq!(chain_a.compare(Some(&chain_b.value)), ChainComparison::SameCluster);
@@ -978,8 +1027,10 @@ mod tests {
         let mut chain_b = ClusterChain::genesis(seed_b, 0, 1);
 
         // Both sides merge — epoch reset, same combined value
-        chain_a.fungible_adopt(&seed_b, chain_b.round, 0, 100, 3);
-        chain_b.fungible_adopt(&seed_a, chain_a.round, 0, 100, 3);
+        let b_contribs = BTreeMap::from([(seed_b, 0u64)]);
+        let a_contribs = BTreeMap::from([(seed_a, 0u64)]);
+        chain_a.fungible_adopt(&seed_b, chain_b.round, &b_contribs, 100, 3);
+        chain_b.fungible_adopt(&seed_a, chain_a.round, &a_contribs, 100, 3);
         assert_eq!(chain_a.value, chain_b.value);
         assert_eq!(chain_a.genesis, chain_b.genesis);
 
@@ -998,8 +1049,10 @@ mod tests {
         let mut chain_b = ClusterChain::genesis(seed_b, 0, 2);
 
         // Epoch reset on both sides
-        chain_a.fungible_adopt(&seed_b, 0, 0, 100, 4);
-        chain_b.fungible_adopt(&seed_a, 0, 0, 100, 4);
+        let b_contribs = BTreeMap::from([(seed_b, 0u64)]);
+        let a_contribs = BTreeMap::from([(seed_a, 0u64)]);
+        chain_a.fungible_adopt(&seed_b, 0, &b_contribs, 100, 4);
+        chain_b.fungible_adopt(&seed_a, 0, &a_contribs, 100, 4);
         assert_eq!(chain_a.value, chain_b.value);
 
         // Now advance both with the same round seed — should stay in sync
@@ -1035,8 +1088,9 @@ mod tests {
         }
         assert_eq!(chain_b.cumulative_work, 3);
 
-        // Merge: A adopts B's work additively
-        chain_a.fungible_adopt(&chain_b.value, chain_b.round, chain_b.cumulative_work, 600, 2);
+        // Merge: A adopts B's work via union
+        chain_a.fungible_adopt(&chain_b.value, chain_b.round,
+                               &chain_b.work_contributions, 600, 2);
         assert_eq!(chain_a.cumulative_work, 8); // 5 + 3
     }
 
@@ -1107,7 +1161,7 @@ mod tests {
         // Merge: epoch reset.
         let pre_b_value = chain_b.value;
         chain_a.fungible_adopt(
-            &pre_b_value, chain_b.round, chain_b.cumulative_work, 1000, 5);
+            &pre_b_value, chain_b.round, &chain_b.work_contributions, 1000, 5);
 
         // After merge: epoch_chain has just the merged genesis.
         assert_eq!(chain_a.epoch_chain.len(), 1);

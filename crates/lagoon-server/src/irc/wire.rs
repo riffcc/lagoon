@@ -196,6 +196,11 @@ pub enum MeshMessage {
         /// claim is just a number someone made up.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         proof: Option<String>,
+        /// Work contributions ledger: genesis_hash(hex) → advance_steps.
+        /// Enables idempotent merge (union, not addition). If absent (old nodes),
+        /// receivers synthesize a single-entry map from cumulative_work.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        work_contributions: Option<std::collections::HashMap<String, u64>>,
     },
 
     /// CVDF cooperative VDF message — attestations, rounds, sync.
@@ -718,23 +723,31 @@ mod tests {
 
     #[test]
     fn chain_update_round_trip() {
+        let mut contribs = std::collections::HashMap::new();
+        contribs.insert("aa".repeat(32), 3000u64);
+        contribs.insert("bb".repeat(32), 2300u64);
         let msg = MeshMessage::ChainUpdate {
             value: "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233".into(),
             cumulative_work: 5300,
             round: 42,
             proof: Some("c29tZXByb29m".into()),
+            work_contributions: Some(contribs),
         };
         let json = msg.to_json().unwrap();
         assert!(json.contains(r#""type":"chain_update""#));
         assert!(json.contains(r#""cumulative_work":5300"#));
         assert!(json.contains(r#""proof":"c29tZXByb29m""#));
+        assert!(json.contains(r#""work_contributions""#));
         let decoded = MeshMessage::from_json(&json).unwrap();
         match decoded {
-            MeshMessage::ChainUpdate { value, cumulative_work, round, proof } => {
+            MeshMessage::ChainUpdate { value, cumulative_work, round, proof, work_contributions } => {
                 assert_eq!(value, "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233");
                 assert_eq!(cumulative_work, 5300);
                 assert_eq!(round, 42);
                 assert_eq!(proof.as_deref(), Some("c29tZXByb29m"));
+                let wc = work_contributions.unwrap();
+                assert_eq!(wc.get(&"aa".repeat(32)), Some(&3000));
+                assert_eq!(wc.get(&"bb".repeat(32)), Some(&2300));
             }
             other => panic!("expected ChainUpdate, got {other:?}"),
         }
@@ -747,9 +760,11 @@ mod tests {
             cumulative_work: 0,
             round: 0,
             proof: None,
+            work_contributions: None,
         };
         let json = msg.to_json().unwrap();
         assert!(!json.contains("proof")); // skip_serializing_if = None
+        assert!(!json.contains("work_contributions"));
         let decoded = MeshMessage::from_json(&json).unwrap();
         match decoded {
             MeshMessage::ChainUpdate { proof, .. } => {

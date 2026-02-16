@@ -2905,7 +2905,7 @@ fn cluster_chain_merge_protocol() {
     // In real protocol: loser first adopts winner's old value from HELLO,
     // then on next HELLO sees winner's merged value and adopts again.
     // Here we test the final state: loser has winner's merged value.
-    beta.adopt(alpha.value, alpha.round, alpha.cumulative_work);
+    beta.adopt(alpha.value, alpha.round, alpha.work_contributions.clone());
 
     // Post-merge: both chains match.
     assert_eq!(alpha.compare(Some(&beta.value)), ChainComparison::SameCluster);
@@ -2942,7 +2942,7 @@ fn cluster_chain_fresh_join_adoption() {
 
     // Simulate adoption: fresh node creates genesis then adopts.
     let mut joiner = ClusterChain::genesis(established.value, established.round, 1);
-    joiner.adopt(established.value, established.round, established.cumulative_work);
+    joiner.adopt(established.value, established.round, established.work_contributions.clone());
 
     // Now they're the same cluster.
     assert_eq!(established.compare(Some(&joiner.value)), ChainComparison::SameCluster);
@@ -3023,7 +3023,7 @@ fn cluster_chain_cascading_merge() {
     let topo1 = blake3::hash(b"alpha-beta-topo").as_bytes().to_owned();
     let beta_value = beta.value;
     alpha.update_history(&beta_value, beta.round, &topo1, 40, 5);
-    beta.adopt(alpha.value, alpha.round, alpha.cumulative_work);
+    beta.adopt(alpha.value, alpha.round, alpha.work_contributions.clone());
 
     assert_eq!(alpha.compare(Some(&beta.value)), ChainComparison::SameCluster);
 
@@ -3031,8 +3031,8 @@ fn cluster_chain_cascading_merge() {
     let topo2 = blake3::hash(b"alpha-beta-gamma-topo").as_bytes().to_owned();
     let gamma_value = gamma.value;
     alpha.update_history(&gamma_value, gamma.round, &topo2, 50, 6);
-    gamma.adopt(alpha.value, alpha.round, alpha.cumulative_work);
-    beta.adopt(alpha.value, alpha.round, alpha.cumulative_work);
+    gamma.adopt(alpha.value, alpha.round, alpha.work_contributions.clone());
+    beta.adopt(alpha.value, alpha.round, alpha.work_contributions.clone());
 
     // All three chains now match.
     assert_eq!(alpha.compare(Some(&beta.value)), ChainComparison::SameCluster);
@@ -3098,12 +3098,14 @@ fn fvdf_spore_cascade_no_double_counting() {
     let alpha_work_before = alpha_scout.cumulative_work;
     let beta_work_before = beta_scout.cumulative_work;
 
-    // Alpha scout merges.
+    // Alpha scout merges — passes beta's contributions.
+    let beta_contribs_before = beta_scout.work_contributions.clone();
+    let alpha_contribs_before = alpha_scout.work_contributions.clone();
     alpha_scout.fungible_adopt(
-        &pre_beta_value, beta_scout.round, beta_scout.cumulative_work, 5000, 5);
-    // Beta scout merges (uses alpha's PRE-merge work, not post-merge).
+        &pre_beta_value, beta_scout.round, &beta_contribs_before, 5000, 5);
+    // Beta scout merges (uses alpha's PRE-merge contributions).
     beta_scout.fungible_adopt(
-        &pre_alpha_value, 50, alpha_work_before, 5000, 5);
+        &pre_alpha_value, 50, &alpha_contribs_before, 5000, 5);
 
     // Both scouts get the SAME merged value (commutative).
     assert_eq!(alpha_scout.value, beta_scout.value);
@@ -3112,15 +3114,16 @@ fn fvdf_spore_cascade_no_double_counting() {
     assert_eq!(beta_scout.cumulative_work, alpha_work_before + beta_work_before);
 
     let merged_value = alpha_scout.value;
-    let merged_work = alpha_scout.cumulative_work;
+    let _merged_work = alpha_scout.cumulative_work;
     let merged_round = alpha_scout.round;
 
     // SPORE CASCADE: scouts broadcast ChainUpdate to their armies.
     // Army members see higher work → ADOPT (not re-merge).
     // This is the key: adopt() sets value/work/round directly.
-    let adopted_1 = alpha_soldier1.adopt(merged_value, merged_round, merged_work);
-    let adopted_2 = alpha_soldier2.adopt(merged_value, merged_round, merged_work);
-    let adopted_beta = beta_soldier.adopt(merged_value, merged_round, merged_work);
+    let merged_contributions = alpha_scout.work_contributions.clone();
+    let adopted_1 = alpha_soldier1.adopt(merged_value, merged_round, merged_contributions.clone());
+    let adopted_2 = alpha_soldier2.adopt(merged_value, merged_round, merged_contributions.clone());
+    let adopted_beta = beta_soldier.adopt(merged_value, merged_round, merged_contributions.clone());
 
     assert!(adopted_1, "soldier1 should adopt (higher work)");
     assert!(adopted_2, "soldier2 should adopt (higher work)");
@@ -3165,20 +3168,24 @@ fn fvdf_spore_cascade_no_double_counting() {
 fn chain_update_wire_round_trip() {
     use lagoon_server::irc::wire::MeshMessage;
 
+    let mut contribs = std::collections::HashMap::new();
+    contribs.insert("aa".repeat(32), 42000u64);
     let msg = MeshMessage::ChainUpdate {
         value: "aa".repeat(32),
         cumulative_work: 42000,
         round: 100,
         proof: Some("dGVzdA==".into()),
+        work_contributions: Some(contribs),
     };
     let json = msg.to_json().unwrap();
     let decoded = MeshMessage::from_json(&json).unwrap();
     match decoded {
-        MeshMessage::ChainUpdate { value, cumulative_work, round, proof } => {
+        MeshMessage::ChainUpdate { value, cumulative_work, round, proof, work_contributions } => {
             assert_eq!(value, "aa".repeat(32));
             assert_eq!(cumulative_work, 42000);
             assert_eq!(round, 100);
             assert_eq!(proof.as_deref(), Some("dGVzdA=="));
+            assert_eq!(work_contributions.unwrap().get(&"aa".repeat(32)), Some(&42000));
         }
         other => panic!("expected ChainUpdate, got {other:?}"),
     }

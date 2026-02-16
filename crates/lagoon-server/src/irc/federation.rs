@@ -290,13 +290,14 @@ pub fn dispatch_mesh_message(
             });
             None
         }
-        MeshMessage::ChainUpdate { value, cumulative_work, round, proof } => {
+        MeshMessage::ChainUpdate { value, cumulative_work, round, proof, work_contributions } => {
             let _ = event_tx.send(RelayEvent::ChainUpdate {
                 remote_host: remote_host.to_string(),
                 value,
                 cumulative_work,
                 round,
                 proof,
+                work_contributions,
             });
             None
         }
@@ -914,12 +915,14 @@ pub enum RelayEvent {
         remote_host: String,
         /// Chain value as hex string.
         value: String,
-        /// Cumulative work across all epochs.
+        /// Cumulative work across all epochs (derived from contributions).
         cumulative_work: u64,
         /// Current round number.
         round: u64,
         /// Base64-bincode-encoded `ClusterChainProof` (optional during rollout).
         proof: Option<String>,
+        /// Work contributions ledger: genesis_hash(hex) → advance_steps.
+        work_contributions: Option<std::collections::HashMap<String, u64>>,
     },
 }
 
@@ -1599,8 +1602,11 @@ pub fn spawn_event_processor(
                                 if let Ok(value) = <[u8; 32]>::try_from(bytes.as_slice()) {
                                     let round = cluster_chain_round.unwrap_or(0);
                                     let work = cluster_chain_work.unwrap_or(0);
+                                    // Synthesize single-entry contributions from HELLO.
+                                    let mut contribs = std::collections::BTreeMap::new();
+                                    contribs.insert(value, work);
                                     let mut cc = super::cluster_chain::ClusterChain::genesis(value, round, 1);
-                                    cc.adopt(value, round, work);
+                                    cc.adopt(value, round, contribs);
                                     st.mesh.cluster_chain = Some(cc);
                                     info!(chain = &hex_val[..8.min(hex_val.len())], work, "cluster chain: adopted from first peer (fresh join)");
                                     broadcast_chain_update(&st);
@@ -1640,23 +1646,31 @@ pub fn spawn_event_processor(
                                 // keeps them in sync independently.
                             }
                             super::cluster_chain::ChainComparison::DifferentCluster => {
-                                if let Some(remote_value) = remote_chain_bytes {
+                                // EPOCH GUARD: skip merge if we just merged/adopted
+                                // (epoch_steps=0). ChainUpdate from the contact-point
+                                // merge will propagate within one advance cycle (10s).
+                                if !cc.can_merge() {
+                                    info!(peer = %mkey,
+                                          "cluster chain: skipping merge — epoch_steps=0, waiting for advance");
+                                } else if let Some(remote_value) = remote_chain_bytes {
                                     let their_work = cluster_chain_work.unwrap_or(0);
                                     let their_round = cluster_chain_round.unwrap_or(0);
 
-                                    // ALWAYS symmetric merge. ALWAYS additive work.
-                                    // blake3(sort(A,B)), work = ours + theirs.
-                                    // Both sides compute the same merged value.
-                                    // Combined work is strictly higher than either
-                                    // input → cascades through both armies via SPORE.
+                                    // Symmetric merge with idempotent work union.
+                                    // Synthesize contributions from HELLO (single entry).
+                                    // Full ledger propagates via ChainUpdate for adoption.
+                                    let mut their_contributions = std::collections::BTreeMap::new();
+                                    their_contributions.insert(remote_value, their_work);
+
                                     let pre_work = cc.cumulative_work;
                                     cc.fungible_adopt(
-                                        &remote_value, their_round, their_work,
+                                        &remote_value, their_round, &their_contributions,
                                         merge_quantum, merge_size);
                                     info!(merged = %cc.value_short(),
                                           pre_work, their_work,
                                           combined_work = cc.cumulative_work,
-                                          "cluster chain: symmetric merge — additive work, new epoch");
+                                          contributions = cc.work_contributions.len(),
+                                          "cluster chain: symmetric merge — work union, new epoch");
                                     // SPORE cascade: broadcast to all peers so
                                     // army members adopt without re-merging.
                                     broadcast_chain_update(&st);
@@ -3281,7 +3295,7 @@ pub fn spawn_event_processor(
                     }
                 }
 
-                RelayEvent::ChainUpdate { remote_host, value, cumulative_work, round, proof } => {
+                RelayEvent::ChainUpdate { remote_host, value, cumulative_work, round, proof, work_contributions } => {
                     // SPORE cascade: a peer merged and is broadcasting the result.
                     // If their work > ours, adopt — no re-merge, no double-counting.
                     //
@@ -3320,16 +3334,32 @@ pub fn spawn_event_processor(
                             }
                         } else {
                             // No proof attached — accept during rollout.
-                            // TODO: once all nodes carry proofs, reject proofless updates.
                             true
                         };
 
                         if !proof_valid { continue; }
 
+                        // Decode work contributions from hex keys → [u8;32] keys.
+                        // If absent (old nodes during rollout), synthesize single-entry map.
+                        let peer_contributions: std::collections::BTreeMap<[u8; 32], u64> =
+                            work_contributions.as_ref()
+                                .map(|wc| {
+                                    wc.iter().filter_map(|(hex_key, &steps)| {
+                                        hex::decode(hex_key).ok()
+                                            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                                            .map(|k| (k, steps))
+                                    }).collect()
+                                })
+                                .unwrap_or_else(|| {
+                                    let mut m = std::collections::BTreeMap::new();
+                                    m.insert(new_value, cumulative_work);
+                                    m
+                                });
+
                         let mut st = state.write().await;
                         let adopted = if let Some(ref mut cc) = st.mesh.cluster_chain {
                             if cumulative_work > cc.cumulative_work {
-                                cc.adopt(new_value, round, cumulative_work);
+                                cc.adopt(new_value, round, peer_contributions);
                                 true
                             } else {
                                 false
@@ -3338,7 +3368,7 @@ pub fn spawn_event_processor(
                             // We have no chain — adopt theirs.
                             let mut cc = super::cluster_chain::ClusterChain::genesis(
                                 new_value, round, 1);
-                            cc.adopt(new_value, round, cumulative_work);
+                            cc.adopt(new_value, round, peer_contributions);
                             st.mesh.cluster_chain = Some(cc);
                             true
                         };
@@ -3784,8 +3814,13 @@ pub fn broadcast_chain_update(st: &super::server::ServerState) {
         cumulative_work: cc.cumulative_work,
         round: cc.round,
         proof: proof_b64,
+        work_contributions: Some(cc.contributions_hex()),
     };
     for (_key, relay) in &st.federation.relays {
+        // Skip relays that haven't completed Hello handshake.
+        // Without this, ChainUpdate can arrive before our Hello response,
+        // causing "first message must be Hello" on the remote.
+        if !relay.mesh_connected { continue; }
         let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(msg.clone()));
     }
 }
@@ -6798,10 +6833,10 @@ fn mesh_message_to_irc(msg: &MeshMessage) -> Message {
         MeshMessage::VdfWindow { .. } => {
             ("VDF_WINDOW".into(), String::new())
         }
-        MeshMessage::ChainUpdate { value, cumulative_work, round, proof } => {
+        MeshMessage::ChainUpdate { value, cumulative_work, round, proof, work_contributions } => {
             ("CHAIN_UPDATE".into(), serde_json::json!({
                 "value": value, "cumulative_work": cumulative_work, "round": round,
-                "proof": proof,
+                "proof": proof, "work_contributions": work_contributions,
             }).to_string())
         }
     };
