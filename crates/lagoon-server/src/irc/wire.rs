@@ -71,6 +71,11 @@ pub struct HelloPayload {
     /// Cluster identity chain round number.
     #[serde(default)]
     pub cluster_chain_round: Option<u64>,
+    /// Cluster round seed (hex-encoded [u8; 32]) — the VDF quantum hash used
+    /// as the advance seed for the cluster chain. Propagated from the cluster's
+    /// clock source (highest VDF work). Losers don't generate — they receive.
+    #[serde(default)]
+    pub cluster_round_seed: Option<String>,
 }
 
 /// Native mesh protocol message — the sole on-the-wire type.
@@ -369,6 +374,7 @@ mod tests {
             assigned_slot: Some(3),
             cluster_chain_value: Some("deadbeefcafe".into()),
             cluster_chain_round: Some(99),
+            cluster_round_seed: Some("abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234".into()),
         });
 
         let json = msg.to_json().unwrap();

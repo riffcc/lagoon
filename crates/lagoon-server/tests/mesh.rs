@@ -899,6 +899,7 @@ fn make_hello() -> HelloPayload {
         assigned_slot: None,
         cluster_chain_value: None,
         cluster_chain_round: None,
+        cluster_round_seed: None,
     }
 }
 
@@ -2158,6 +2159,7 @@ async fn underlay_uri_stored_from_hello_relay_peer_addr() {
         assigned_slot: None,
         cluster_chain_value: None,
         cluster_chain_round: None,
+        cluster_round_seed: None,
     };
     let msg = MeshMessage::Hello(hello);
     let peer_addr: SocketAddr = "10.0.0.5:8080".parse().unwrap();
@@ -2963,7 +2965,7 @@ fn cluster_chain_merge_deterministic() {
     // The merged seed is deterministic: two nodes computing the same merge
     // independently arrive at the same chain value.
     let seed_a = blake3::hash(b"cluster-a").as_bytes().to_owned();
-    let seed_b = blake3::hash(b"cluster-b").as_bytes().to_owned();
+    let _seed_b = blake3::hash(b"cluster-b").as_bytes().to_owned();
 
     let mut node1 = ClusterChain::genesis(seed_a, 0, 3);
     let mut node2 = ClusterChain::genesis(seed_a, 0, 3);

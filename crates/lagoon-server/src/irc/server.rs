@@ -374,12 +374,12 @@ pub struct MeshState {
     /// Cluster identity chain — rotating blake3 hash for merge/split detection.
     /// Advances on VDF window ticks, carried in HELLO, compared on connection.
     pub cluster_chain: Option<super::cluster_chain::ClusterChain>,
-    /// Cached VDF hash at the most recent quantum boundary (Universal Clock).
-    /// Extracted from VdfChain BEFORE trim_to(1) discards historical hashes.
-    /// Used as the round_seed for cluster chain advance — all nodes at the
-    /// same quantized height use the same deterministic VDF hash.
-    /// Format: (quantized_height, vdf_hash_at_that_height).
-    pub last_quantum_hash: Option<(u64, [u8; 32])>,
+    /// Cluster round seed — locally derived from quantized VDF height.
+    /// Every node independently computes the same seed: blake3(height_bytes).
+    /// No propagation. No clock source. The Universal Clock IS the quantized
+    /// VDF height — every node observes the same quantum boundary.
+    /// HELLO carries cluster_round_seed as a verification hint only.
+    pub cluster_round_seed: Option<[u8; 32]>,
 }
 
 impl MeshState {
@@ -416,7 +416,7 @@ impl MeshState {
             last_hello_broadcast: None,
             verified_vdf_tips: HashMap::new(),
             cluster_chain: None,
-            last_quantum_hash: None,
+            cluster_round_seed: None,
         }
     }
 }
@@ -3391,6 +3391,8 @@ async fn handle_command(
                             cluster_chain_value: Option<String>,
                             #[serde(default)]
                             cluster_chain_round: Option<u64>,
+                            #[serde(default)]
+                            cluster_round_seed: Option<String>,
                         }
                         if let Ok(hello) = serde_json::from_str::<HelloPayload>(json) {
                             // Use node_name from HELLO if present, else derive from server_name.
@@ -3433,6 +3435,7 @@ async fn handle_command(
                                     assigned_slot: hello.assigned_slot,
                                     cluster_chain_value: hello.cluster_chain_value,
                                     cluster_chain_round: hello.cluster_chain_round,
+                                    cluster_round_seed: hello.cluster_round_seed,
                                 },
                             );
 
@@ -3502,6 +3505,7 @@ async fn handle_command(
                                 "assigned_slot": our_assigned_slot,
                                 "cluster_chain_value": st.mesh.cluster_chain.as_ref().map(|cc| cc.value_hex()),
                                 "cluster_chain_round": st.mesh.cluster_chain.as_ref().map(|cc| cc.round),
+                                "cluster_round_seed": st.mesh.cluster_round_seed.map(|s| hex::encode(s)),
                             });
 
                             // Collect peer list for MESH PEERS exchange.

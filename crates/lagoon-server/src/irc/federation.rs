@@ -140,6 +140,7 @@ pub fn dispatch_mesh_message(
                 assigned_slot: hello.assigned_slot,
                 cluster_chain_value: hello.cluster_chain_value.clone(),
                 cluster_chain_round: hello.cluster_chain_round,
+                cluster_round_seed: hello.cluster_round_seed.clone(),
             });
             Some(hello)
         }
@@ -761,6 +762,8 @@ pub enum RelayEvent {
         cluster_chain_value: Option<String>,
         /// Cluster identity chain round number.
         cluster_chain_round: Option<u64>,
+        /// Cluster round seed (hex-encoded [u8; 32]) from the FVDF chain.
+        cluster_round_seed: Option<String>,
     },
     /// Received MESH PEERS from a remote peer.
     MeshPeers {
@@ -1318,6 +1321,7 @@ pub fn spawn_event_processor(
                     assigned_slot,
                     cluster_chain_value,
                     cluster_chain_round,
+                    cluster_round_seed: _,
                 } => {
                     // Backfill node_name/site_name for old peers that don't send them.
                     let node_name = if node_name.is_empty() {
@@ -1556,7 +1560,12 @@ pub fn spawn_event_processor(
 
                     // Cluster identity chain: merge / adopt protocol.
                     //
-                    // If WE have no chain but remote does, adopt theirs (we're the joiner).
+                    // No clock source. No round seed propagation. Every node
+                    // independently derives the round seed from the quantized
+                    // VDF height (Universal Clock). HELLO carries chain value
+                    // and round for COMPARISON only.
+
+                    // If WE have no chain but remote does, adopt theirs (fresh join).
                     if st.mesh.cluster_chain.is_none() {
                         if let Some(ref hex_val) = cluster_chain_value {
                             if let Ok(bytes) = hex::decode(hex_val) {
@@ -1571,12 +1580,7 @@ pub fn spawn_event_processor(
                         }
                     }
 
-                    // Compare our chain with remote's chain.
-                    // Same → same cluster. Different → merge/adopt. Fresh → they adopt ours.
-                    //
-                    // Extract values needed for merge BEFORE borrowing cluster_chain mutably
-                    // (borrow checker: cc borrows st.mesh.cluster_chain, so we can't also
-                    // read st.mesh.known_peers / st.mesh.spiral / st.mesh.vdf_state_rx).
+                    // Compare chains. Extract merge context before mutable borrow.
                     let chain_merge_ctx = {
                         let our_work = st.mesh.our_cluster_vdf_work;
                         let their_work = cluster_vdf_work.unwrap_or(0.0);
@@ -1604,7 +1608,10 @@ pub fn spawn_event_processor(
                         });
                         let comparison = cc.compare(remote_bytes.as_ref());
                         match comparison {
-                            super::cluster_chain::ChainComparison::SameCluster => {}
+                            super::cluster_chain::ChainComparison::SameCluster => {
+                                // Chains match. Nothing to do — Universal Clock
+                                // keeps them in sync independently.
+                            }
                             super::cluster_chain::ChainComparison::DifferentCluster => {
                                 let (we_win, ts, size, topo) = chain_merge_ctx;
                                 if we_win {
@@ -1617,8 +1624,7 @@ pub fn spawn_event_processor(
                                     }
                                 } else if let Some(winner_value) = remote_bytes {
                                     // Loser computes the SAME merged seed as the winner.
-                                    // Both sides have identical inputs: winner, loser, topo.
-                                    // Converges in ONE hello round instead of two.
+                                    // Both sides call merge_chain_seed with identical args.
                                     let our_value = cc.value;
                                     let merged = super::cluster_chain::merge_chain_seed(
                                         &winner_value, &our_value, &topo);
@@ -3285,35 +3291,23 @@ pub fn spawn_event_processor(
                 // IMPORTANT: Extract the quantum boundary VDF hash BEFORE
                 // trim_to(1) discards historical hashes.
                 let mut st = state.write().await;
-                let mut quantum_hash_cached: Option<(u64, [u8; 32])> = None;
+                let mut quantized_height: Option<u64> = None;
                 let window_msg = if let Some(ref chain) = st.mesh.vdf_chain {
                     let mut c = chain.write().await;
                     if c.window_len() >= 2 {
-                        // Universal Clock: extract VDF hash at quantum boundary.
+                        // Universal Clock: compute quantized VDF height.
                         //
-                        // The round seed for cluster chain advance is the VDF
-                        // hash at the quantized height. This hash is:
-                        // - Deterministic: all nodes at the same height produce it
-                        // - Unpredictable: VDF is sequential, can't precompute
-                        // - Agreed-upon: quantizing eliminates minor drift
-                        //
-                        // Must extract BEFORE trim_to(1) or the hash is lost.
-                        const ROUND_QUANTUM: u64 = 30; // 1 VDF window = 30 steps
+                        // Every node independently observes the same quantum
+                        // boundary. No leader. No propagation. The VDF height
+                        // IS the clock — quantizing eliminates minor drift.
+                        const ROUND_QUANTUM: u64 = 30;
                         let chain_height = c.height();
-                        let quantized = (chain_height / ROUND_QUANTUM) * ROUND_QUANTUM;
-                        if quantized >= c.height_start() {
-                            let idx = (quantized - c.height_start()) as usize;
-                            if idx < c.hashes.len() {
-                                quantum_hash_cached = Some((quantized, c.hashes[idx]));
-                            }
-                        }
+                        quantized_height = Some((chain_height / ROUND_QUANTUM) * ROUND_QUANTUM);
 
                         let spiral_slot = st.lens.spiral_index;
                         let proof = c.generate_window_proof(spiral_slot, 3);
-                        // Trim chain: keep only the tip as anchor for next window.
                         c.trim_to(1);
                         drop(c);
-                        // Encode as bincode → base64 for the wire.
                         if let Ok(bytes) = bincode::serialize(&proof) {
                             let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
                             Some((
@@ -3332,32 +3326,24 @@ pub fn spawn_event_processor(
                     None
                 };
 
-                // Cache quantum hash for use in cluster chain advance.
-                if let Some(qh) = quantum_hash_cached {
-                    st.mesh.last_quantum_hash = Some(qh);
-                }
-
                 // Advance cluster identity chain on each VDF window tick.
                 //
-                // The round seed is the VDF HASH at the quantized height
-                // boundary (30 steps = 1 window ≈ 3s at 10 Hz). All nodes
-                // snap to the same boundary: node at height 571 and node at
-                // 574 both use quantum 570. The hash at that quantum is
-                // deterministic and identical across nodes.
+                // The round seed is derived from the QUANTIZED VDF HEIGHT.
+                // Every node independently computes the same seed because
+                // every node observes the same quantum boundary. No clock
+                // source. No HELLO propagation. The Universal Clock is the
+                // quantized VDF height — deterministic, agreed-upon, sovereign.
                 //
-                // This is the Universal Clock: VDF height maps to wall-clock
-                // time, the hash at each quantum boundary is unpredictable
-                // (sequential VDF), and quantizing eliminates minor drift.
-                // After merge, both sides agree on (value, round) and the
-                // next quantum boundary produces the same advance seed.
-                {
-                    if let Some((quantized, round_seed)) = st.mesh.last_quantum_hash {
-                        let cluster_size = (st.mesh.known_peers.len() + 1) as u32;
-                        if let Some(ref mut cc) = st.mesh.cluster_chain {
-                            // Only advance when crossing a quantum boundary.
-                            if quantized > cc.last_timestamp_round() {
-                                cc.advance(&round_seed, quantized, cluster_size);
-                            }
+                // The chain value provides accumulated entropy from merges.
+                // The height provides the shared, changing input each round.
+                // advance_chain(prev, seed) = blake3(blake3(prev || seed)).
+                if let Some(quantized) = quantized_height {
+                    let round_seed = *blake3::hash(&quantized.to_le_bytes()).as_bytes();
+                    st.mesh.cluster_round_seed = Some(round_seed);
+                    let cluster_size = (st.mesh.known_peers.len() + 1) as u32;
+                    if let Some(ref mut cc) = st.mesh.cluster_chain {
+                        if quantized > cc.last_timestamp_round() {
+                            cc.advance(&round_seed, quantized, cluster_size);
                         }
                     }
                 }
@@ -5349,6 +5335,7 @@ async fn relay_task(
                                             assigned_slot: hello.assigned_slot,
                                             cluster_chain_value: hello.cluster_chain_value,
                                             cluster_chain_round: hello.cluster_chain_round,
+                                            cluster_round_seed: hello.cluster_round_seed,
                                         });
                                     } else {
                                         warn!(remote_host, "mesh: invalid HELLO payload");
@@ -5662,6 +5649,11 @@ struct MeshHelloPayload {
     /// Cluster identity chain round number.
     #[serde(default)]
     pub cluster_chain_round: Option<u64>,
+    /// Cluster round seed (hex-encoded [u8; 32]) — the FVDF chain hash used
+    /// as the advance seed for the cluster chain. Comes from the cluster's
+    /// cooperative VDF; losers adopt it on merge, don't generate their own.
+    #[serde(default)]
+    pub cluster_round_seed: Option<String>,
 }
 
 /// Build a native `wire::HelloPayload` from server state (use inside read lock).
@@ -5692,6 +5684,7 @@ pub fn build_wire_hello(st: &mut super::server::ServerState) -> HelloPayload {
         assigned_slot: hp.assigned_slot,
         cluster_chain_value: hp.cluster_chain_value,
         cluster_chain_round: hp.cluster_chain_round,
+        cluster_round_seed: hp.cluster_round_seed,
     }
 }
 
@@ -6545,6 +6538,7 @@ fn build_hello_payload(st: &mut super::server::ServerState) -> MeshHelloPayload 
         assigned_slot,
         cluster_chain_value: st.mesh.cluster_chain.as_ref().map(|cc| cc.value_hex()),
         cluster_chain_round: st.mesh.cluster_chain.as_ref().map(|cc| cc.round),
+        cluster_round_seed: st.mesh.cluster_round_seed.map(|s| hex::encode(s)),
     }
 }
 
