@@ -47,6 +47,21 @@ pub fn ape_peer_uri(
     })
 }
 
+/// Construct a Ygg peer URI from a switchboard address.
+///
+/// The switchboard on port 9443 detects `meta` first bytes and routes
+/// to `ygg_node.accept_inbound()`. This provides cross-provider Ygg
+/// bootstrap when the underlay URI is unreachable (midlay path).
+///
+/// Handles IPv4, IPv6 (bracketed), and hostnames (DNS resolved by Tokio).
+fn switchboard_ygg_uri(addr: &str) -> String {
+    if addr.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("tcp://[{}]:9443", addr)
+    } else {
+        format!("tcp://{}:9443", addr)
+    }
+}
+
 /// Check that a peer URI is a real underlay address, NOT an Ygg overlay.
 ///
 /// Ygg overlay addresses start with 02xx or 03xx (200:/300: in IPv6 notation).
@@ -1453,7 +1468,8 @@ pub fn spawn_event_processor(
                     // APE: dynamically peer with this node's Yggdrasil underlay.
                     // Prefer ygg_peer_uri (self-reported from HELLO) over
                     // relay_peer_addr (TCP peer, may be a proxy IP on Fly).
-                    if let Some(ref ygg) = st.transport_config.ygg_node {
+                    if let Some(ygg) = st.transport_config.ygg_node.clone() {
+                        // Try direct underlay URI (works when on same provider).
                         if let Some(uri) = ygg_peer_uri.clone()
                             .or_else(|| ape_peer_uri(relay_peer_addr))
                             .filter(|u| is_underlay_uri(u))
@@ -1461,11 +1477,32 @@ pub fn spawn_event_processor(
                             if !st.mesh.ygg_peered_uris.contains(uri.as_str()) {
                                 match ygg.add_peer(&uri) {
                                     Ok(()) => {
-                                        info!(uri, peer_id, "APE: added Yggdrasil peer");
+                                        info!(uri, peer_id, "APE: added Yggdrasil peer (underlay)");
                                         st.mesh.ygg_peered_uris.insert(uri.clone());
                                     }
                                     Err(e) => {
                                         warn!(uri, peer_id, error = %e, "APE: failed to add Yggdrasil peer");
+                                    }
+                                }
+                            }
+                        }
+
+                        // Midlay Ygg bootstrap via switchboard. The switchboard on
+                        // :9443 detects 'meta' first bytes and routes to
+                        // ygg_node.accept_inbound(). Provides cross-provider Ygg
+                        // bootstrap when the underlay URI above is unreachable
+                        // (e.g. Bunny → Fly fdaa::). add_peer is fire-and-forget:
+                        // both underlay and switchboard attempts run concurrently.
+                        if let Some(ref sb_addr) = st.transport_config.switchboard_addr {
+                            let sb_uri = switchboard_ygg_uri(sb_addr);
+                            if !st.mesh.ygg_peered_uris.contains(sb_uri.as_str()) {
+                                match ygg.add_peer(&sb_uri) {
+                                    Ok(()) => {
+                                        info!(uri = %sb_uri, peer_id, "APE: Ygg bootstrap via switchboard (midlay)");
+                                        st.mesh.ygg_peered_uris.insert(sb_uri);
+                                    }
+                                    Err(e) => {
+                                        warn!(uri = %sb_uri, error = %e, "APE: switchboard Ygg bootstrap failed");
                                     }
                                 }
                             }
@@ -6610,5 +6647,31 @@ mod tests {
     fn ape_peer_uri_returns_none_without_relay() {
         // No relay_peer_addr = no peering. Never fall back to overlay.
         assert_eq!(ape_peer_uri(None), None);
+    }
+
+    // ── Switchboard Ygg URI construction ──────────────────────────────
+
+    #[test]
+    fn switchboard_ygg_uri_ipv4() {
+        assert_eq!(
+            switchboard_ygg_uri("109.224.228.162"),
+            "tcp://109.224.228.162:9443"
+        );
+    }
+
+    #[test]
+    fn switchboard_ygg_uri_ipv6() {
+        assert_eq!(
+            switchboard_ygg_uri("fdaa:47:35ee:a7b:16a:7de5:43b9:2"),
+            "tcp://[fdaa:47:35ee:a7b:16a:7de5:43b9:2]:9443"
+        );
+    }
+
+    #[test]
+    fn switchboard_ygg_uri_hostname() {
+        assert_eq!(
+            switchboard_ygg_uri("anycast-mesh.fly.dev"),
+            "tcp://anycast-mesh.fly.dev:9443"
+        );
     }
 }

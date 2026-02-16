@@ -75,11 +75,11 @@ pub struct TransportConfig {
     /// Embedded Yggdrasil node for overlay networking.
     /// When present, Ygg-addressed peers are dialed directly through the overlay.
     pub ygg_node: Option<Arc<yggdrasil_rs::YggNode>>,
-    /// Global anycast switchboard IP (e.g. `109.224.228.162`). No port — always 9443.
-    /// When set, `dial_missing_spiral_neighbors` uses this as the dial target
-    /// for peers without a direct underlay route. The switchboard routes the
-    /// TCP connection to the requested peer via half-dial.
-    /// Set via `LAGOON_SWITCHBOARD_ADDR` env var. IP only, no port suffix.
+    /// Global anycast switchboard (e.g. `109.224.228.162` or `anycast-mesh.fly.dev`).
+    /// No port — always 9443. Used for half-dial routing (peers without a direct
+    /// underlay route) AND Ygg midlay bootstrap (cross-provider Ygg peering when
+    /// the underlay URI is unreachable, e.g. Bunny → Fly).
+    /// Set via `LAGOON_SWITCHBOARD_ADDR` env var. IP or hostname, no port suffix.
     pub switchboard_addr: Option<String>,
 }
 
@@ -1120,9 +1120,9 @@ pub fn build_config() -> TransportConfig {
         info!("transport: Yggdrasil connectivity detected (TUN/system)");
     }
 
-    // LAGOON_SWITCHBOARD_ADDR = global anycast switchboard (e.g. "109.224.228.162:9443").
-    // Used by dial_missing_spiral_neighbors to reach peers via half-dial when no
-    // direct underlay route exists. Separate from LAGOON_PEERS (bootstrap/mesh WebSocket).
+    // LAGOON_SWITCHBOARD_ADDR = global anycast switchboard (e.g. "109.224.228.162"
+    // or "anycast-mesh.fly.dev"). IP or hostname, no port suffix (always :9443).
+    // Used for half-dial routing and Ygg midlay bootstrap (cross-provider peering).
     if let Ok(addr) = std::env::var("LAGOON_SWITCHBOARD_ADDR") {
         let addr = addr.trim().to_string();
         if !addr.is_empty() {
