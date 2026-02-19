@@ -1,5 +1,6 @@
 pub mod bot;
 pub mod cluster_chain;
+pub mod metrics;
 pub mod codec;
 pub mod community;
 pub mod federation;

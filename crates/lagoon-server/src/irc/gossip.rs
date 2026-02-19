@@ -21,8 +21,11 @@ use std::collections::HashMap;
 
 use citadel_gossip::{GossipMessage, GossipStore};
 use citadel_spore::{Spore, U256};
+use metrics::{counter, histogram};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
+
+use super::metrics as m;
 
 /// Serializable IRC event for gossip replication.
 ///
@@ -90,6 +93,16 @@ impl GossipIrcEvent {
             | Self::Join { nick, .. }
             | Self::Part { nick, .. }
             | Self::Topic { nick, .. } => nick,
+        }
+    }
+
+    /// A short static label for the event type, used as a Prometheus label.
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            Self::Message { .. } => "message",
+            Self::Join { .. } => "join",
+            Self::Part { .. } => "part",
+            Self::Topic { .. } => "topic",
         }
     }
 }
@@ -250,12 +263,16 @@ impl GossipRouter {
         };
 
         let payload = bincode::serialize(event).expect("GossipIrcEvent serialization cannot fail");
+        let payload_len = payload.len();
         let msg = GossipMessage::new(topic, payload, ttl, self.sender_id);
         let content_id = msg.content_id();
         let id_bytes = *content_id.as_bytes();
 
         self.store.broadcast(msg.clone());
         self.message_cache.insert(id_bytes, (msg, event.clone()));
+
+        counter!(m::GOSSIP_SENT, &[("type", event.event_type())]).increment(1);
+        histogram!(m::GOSSIP_DELTA_BYTES).record(payload_len as f64);
 
         trace!(
             channel = %event.channel(),
@@ -281,6 +298,7 @@ impl GossipRouter {
                 match bincode::deserialize::<GossipIrcEvent>(&msg.payload) {
                     Ok(event) => {
                         self.message_cache.insert(id_bytes, (msg, event.clone()));
+                        counter!(m::GOSSIP_RECV, &[("type", event.event_type())]).increment(1);
                         trace!(
                             channel = %event.channel(),
                             nick = %event.nick(),

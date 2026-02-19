@@ -16,9 +16,12 @@ use tokio_stream::StreamExt;
 use tokio_util::codec::Framed;
 use tracing::{info, warn};
 
+use metrics::counter;
+
 use super::codec::IrcCodec;
 use super::lens;
 use super::message::Message;
+use super::metrics as m;
 use super::server::{broadcast, derive_node_name, MeshConnectionState, MeshPeerInfo, SharedState, SERVER_NAME, SITE_NAME};
 use super::transport::{self, TransportConfig};
 use super::wire::{MeshMessage, HelloPayload};
@@ -4234,6 +4237,7 @@ async fn relay_task_native(
 
     'reconnect: loop {
         let connected_at = std::time::Instant::now();
+        counter!(m::RELAY_CONNECT_ATTEMPT, &[("target", connect_target.clone())]).increment(1);
 
         // Include our peer_id in the URL so the remote listener can detect
         // self-connections at the TCP level (transparent self — drops without
@@ -4295,6 +4299,10 @@ async fn relay_task_native(
                     consecutive_failures = self_hits;
                 }
                 consecutive_failures += 1;
+                {
+                    let reason = if e.to_string().contains("self-connection") { "self_connection" } else { "connect_error" };
+                    counter!(m::RELAY_CONNECT_FAILURE, &[("target", connect_target.clone()), ("reason", reason.to_owned())]).increment(1);
+                }
                 if consecutive_failures <= 3 {
                     warn!(%connect_target, attempt = consecutive_failures,
                         "native relay: connect failed, will retry: {e}");
@@ -4582,6 +4590,7 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
             // Track in managed_peers — survives reconnect cycles.
             // evict_dead_peers() skips managed peers; only PeerGone clears this.
             st.federation.managed_peers.insert(remote_peer_id.clone());
+            counter!(m::RELAY_CONNECT_SUCCESS, &[("target", connect_target.to_owned())]).increment(1);
         }
         // NOTE: do NOT remove from pending_dials here. The entry must persist
         // for the entire relay_task_native lifetime. Otherwise, when the WS drops
@@ -4617,6 +4626,7 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
             ws_msg = futures::StreamExt::next(&mut ws_rx) => {
                 match ws_msg {
                     Some(Ok(TungsMsg::Text(text))) => {
+                        m::relay_bytes_recv(&remote_peer_id, text.len());
                         match MeshMessage::from_json(&text) {
                             Ok(MeshMessage::PolChallenge { nonce }) => {
                                 // Fast path — respond immediately, no dispatch.
@@ -4702,6 +4712,7 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
                     Some(Ok(TungsMsg::Pong(_))) => {
                         // Measure RTT from Ping→Pong round-trip.
                         let rtt_ms = last_ping_sent.elapsed().as_secs_f64() * 1000.0;
+                        m::relay_rtt(&remote_peer_id, rtt_ms);
                         let _ = event_tx.send(RelayEvent::LatencyMeasured {
                             remote_host: remote_peer_id.clone(),
                             rtt_ms,
@@ -4731,6 +4742,7 @@ async fn native_ws_loop<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>
                             pol_pending.insert(*nonce, std::time::Instant::now());
                         }
                         if let Ok(json) = mesh_msg.to_json() {
+                            m::relay_bytes_sent(&remote_peer_id, json.len());
                             if ws_tx.send(TungsMsg::Text(json.into())).await.is_err() {
                                 return NativeLoopOutcome::Reconnect;
                             }

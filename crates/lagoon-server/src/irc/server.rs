@@ -14,8 +14,10 @@ use tokio_util::codec::Framed;
 use tracing::{info, warn};
 
 use base64::Engine as _;
+use metrics::{counter, gauge};
 
 use super::codec::IrcCodec;
+use super::metrics as m;
 use super::community::CommunityStore;
 use super::federation::{self, FederatedChannel, FederationManager, RelayEvent};
 use super::invite::InviteStore;
@@ -1060,6 +1062,16 @@ pub async fn start(
         ));
     }
 
+    // Spawn Prometheus metrics collectors (event-driven; only system uses a timer).
+    {
+        let st = state.read().await;
+        if let Some(vdf_rx) = st.mesh.vdf_state_rx.clone() {
+            tokio::spawn(m::spawn_vdf_metrics_collector(vdf_rx));
+        }
+    }
+    tokio::spawn(m::spawn_mesh_metrics_collector(topology_rx.clone(), Arc::clone(&state)));
+    tokio::spawn(m::spawn_system_collector());
+
     // Load defederated peers.
     {
         let mut st = state.write().await;
@@ -1349,6 +1361,7 @@ async fn handle_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin +
                                     st.mesh.web_clients.insert(irc_lower(&nick));
                                     st.notify_topology_change();
                                 }
+                                gauge!(m::IRC_CLIENTS).set(st.clients.len() as f64);
                             }
 
                             // Send welcome numerics.
@@ -1599,6 +1612,7 @@ async fn handle_command(
     msg: &Message,
     state: &SharedState,
 ) -> Result<CommandResult, Box<dyn std::error::Error>> {
+    counter!(m::IRC_MESSAGES, &[("command", msg.command.to_uppercase())]).increment(1);
     match msg.command.to_uppercase().as_str() {
         "CAP" => {
             // Post-registration CAP — just acknowledge.
@@ -4433,6 +4447,7 @@ async fn cleanup_client(nick: &str, reason: &str, state: &SharedState) {
 
     // Remove from clients.
     st.clients.remove(&nick_key);
+    gauge!(m::IRC_CLIENTS).set(st.clients.len() as f64);
 
     // Remove from web client tracking if applicable.
     if st.mesh.web_clients.remove(&nick_key) {
