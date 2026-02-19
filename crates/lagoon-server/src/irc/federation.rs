@@ -4308,9 +4308,17 @@ async fn relay_task_native(
                 // Check if we should still be trying to reach this peer.
                 // Use last_known_peer_id — current_peer_id may be None if we never connected.
                 let retry_pid = last_known_peer_id.as_ref().or(current_peer_id.as_ref()).cloned();
-                if !is_bootstrap && !should_keep_retrying(&state, &retry_pid, &connect_target).await {
+                // Bootstrap peers also stop retrying once we know the peer_id and VDF is stale.
+                // Without this, bootstrap tasks retry forever even after the target is dead
+                // (was the root cause of the attempt=925350 connection storm).
+                // Exception: if we've NEVER successfully connected (retry_pid is None),
+                // a bootstrap peer keeps trying — it might just be temporarily down.
+                let never_connected_bootstrap = is_bootstrap && retry_pid.is_none();
+                if !never_connected_bootstrap
+                    && !should_keep_retrying(&state, &retry_pid, &connect_target).await
+                {
                     info!(%connect_target, peer_id = ?retry_pid,
-                        "native relay: peer removed from mesh, stopping retries");
+                        "native relay: peer dead or stale, stopping retries");
                     break;
                 }
                 continue 'reconnect;
@@ -4358,9 +4366,11 @@ async fn relay_task_native(
                 }
                 // Check if we should still be trying to reach this peer.
                 // current_peer_id was moved to last_known_peer_id above.
-                if !is_bootstrap && !should_keep_retrying(&state, &last_known_peer_id, &connect_target).await {
+                // In Reconnect: we just had a successful connection, so last_known_peer_id
+                // is always Some. Check VDF staleness for all peer types (bootstrap too).
+                if !should_keep_retrying(&state, &last_known_peer_id, &connect_target).await {
                     info!(%connect_target, peer_id = ?last_known_peer_id,
-                        "native relay: peer removed from mesh, stopping retries");
+                        "native relay: peer dead or stale, stopping retries");
                     break;
                 }
             }
