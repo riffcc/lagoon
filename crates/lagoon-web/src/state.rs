@@ -5,6 +5,7 @@ use uuid::Uuid;
 use webauthn_rs::prelude::*;
 
 use lagoon_server::irc::server::{MeshSnapshot, SharedState};
+use metrics_exporter_prometheus::PrometheusHandle;
 
 /// A registered user — identified by their passkey.
 #[derive(Clone, Debug)]
@@ -36,6 +37,8 @@ pub struct AppState {
     /// True when running in embedded mode (default).
     /// All clients are web gateway users — their IPs are meaningless.
     pub gateway_mode: bool,
+    /// Prometheus metrics handle — renders `/metrics` output.
+    pub prometheus: Option<PrometheusHandle>,
 }
 
 /// Build a WebAuthn instance from an origin URL string.
@@ -78,6 +81,7 @@ impl AppState {
             irc_state: None,
             mesh_watch: None,
             gateway_mode: false,
+            prometheus: None,
         })
     }
 
@@ -91,6 +95,12 @@ impl AppState {
         self.irc_state = Some(irc_state);
         self.mesh_watch = Some(mesh_watch);
         self.gateway_mode = true;
+        self
+    }
+
+    /// Attach a Prometheus handle for the `/metrics` endpoint.
+    pub fn with_prometheus(mut self, handle: PrometheusHandle) -> Self {
+        self.prometheus = Some(handle);
         self
     }
 

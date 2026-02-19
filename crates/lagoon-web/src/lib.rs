@@ -10,6 +10,7 @@ mod topology;
 
 use axum::{
     Router,
+    extract::State,
     routing::{delete, get, patch, post},
 };
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -25,6 +26,9 @@ use crate::state::AppState;
 
 fn build_router(state: AppState) -> Router {
     Router::new()
+        // Observability
+        .route("/metrics", get(metrics_handler))
+        .route("/health", get(health_handler))
         // Auth endpoints
         .route("/api/auth/register/begin", post(auth::register_begin))
         .route("/api/auth/register/complete", post(auth::register_complete))
@@ -66,8 +70,24 @@ fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// `GET /metrics` — renders Prometheus text format.
+async fn metrics_handler(State(state): State<AppState>) -> String {
+    state.prometheus
+        .as_ref()
+        .map(|h| h.render())
+        .unwrap_or_default()
+}
+
+/// `GET /health` — simple liveness check.
+async fn health_handler() -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({"status": "ok"}))
+}
+
 pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let state = AppState::new()?;
+    let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("Prometheus recorder install failed");
+    let state = AppState::new()?.with_prometheus(prometheus_handle);
     let app = build_router(state);
 
     let use_tls = std::env::var("LAGOON_WEB_TLS").is_ok();
@@ -86,6 +106,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 /// IRC binds only on loopback (for the bridge) plus optionally on the Docker
 /// network (for inter-container federation). No external IRC exposure.
 pub async fn run_with_irc() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Install Prometheus recorder before server::start() so background
+    // metric collectors have a recorder to write to from the first tick.
+    let prometheus_handle = metrics_exporter_prometheus::PrometheusBuilder::new()
+        .install_recorder()
+        .expect("Prometheus recorder install failed");
+
     // Start embedded IRC server.
     let bind_addr =
         std::env::var("LAGOON_IRC_BIND").unwrap_or_else(|_| "127.0.0.1:6667".to_string());
@@ -118,7 +144,7 @@ pub async fn run_with_irc() -> Result<(), Box<dyn std::error::Error + Send + Syn
         st.lens.peer_id.clone()
     };
 
-    let state = AppState::new()?.with_irc(irc_state, topology_rx);
+    let state = AppState::new()?.with_irc(irc_state, topology_rx).with_prometheus(prometheus_handle);
     let app = build_router(state);
 
     let use_tls = std::env::var("LAGOON_WEB_TLS").is_ok();
