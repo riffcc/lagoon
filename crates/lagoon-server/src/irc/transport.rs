@@ -81,6 +81,21 @@ pub struct TransportConfig {
     /// the underlay URI is unreachable, e.g. Bunny → Fly).
     /// Set via `LAGOON_SWITCHBOARD_ADDR` env var. IP or hostname, no port suffix.
     pub switchboard_addr: Option<String>,
+    /// Our underlay peer URI, detected once at startup and cached.
+    ///
+    /// This is the real network address (fdaa:: on Fly.io, LAN IP on bare metal)
+    /// formatted as `tcp://[addr]:9443`. Included in every HELLO so peers can
+    /// reach us directly without Yggdrasil overlay routing.
+    ///
+    /// Cached to avoid running `hostname -I` (a blocking subprocess) inside the
+    /// state write lock on every Hello build. The underlay address is stable for
+    /// the lifetime of the process — we never need to re-detect it.
+    pub cached_underlay_uri: Option<String>,
+    /// Our Yggdrasil overlay address as a string, detected once at startup.
+    ///
+    /// Cached for the same reason as `cached_underlay_uri` — avoids repeated
+    /// `/proc/net/if_inet6` reads inside the state write lock.
+    pub cached_yggdrasil_addr: Option<String>,
 }
 
 impl std::fmt::Debug for TransportConfig {
@@ -90,6 +105,8 @@ impl std::fmt::Debug for TransportConfig {
             .field("yggdrasil_available", &self.yggdrasil_available)
             .field("ygg_node", &self.ygg_node.is_some())
             .field("switchboard_addr", &self.switchboard_addr)
+            .field("cached_underlay_uri", &self.cached_underlay_uri)
+            .field("cached_yggdrasil_addr", &self.cached_yggdrasil_addr)
             .finish()
     }
 }
@@ -101,6 +118,8 @@ impl TransportConfig {
             yggdrasil_available: false,
             ygg_node: None,
             switchboard_addr: None,
+            cached_underlay_uri: None,
+            cached_yggdrasil_addr: None,
         }
     }
 }
@@ -1114,10 +1133,28 @@ fn parse_host_port(s: &str) -> (String, u16, bool) {
 pub fn build_config() -> TransportConfig {
     let mut config = TransportConfig::new();
 
-    config.yggdrasil_available = detect_yggdrasil_addr().is_some();
+    // Detect Yggdrasil address once at startup and cache it.
+    // Used in HELLO messages — never re-detected at runtime.
+    config.cached_yggdrasil_addr = detect_yggdrasil_addr().map(|a| a.to_string());
+    config.yggdrasil_available = config.cached_yggdrasil_addr.is_some();
 
     if config.yggdrasil_available {
         info!("transport: Yggdrasil connectivity detected (TUN/system)");
+    }
+
+    // Detect underlay address once at startup and cache as a peer URI.
+    //
+    // CRITICAL: This MUST NOT be called at Hello-build time. `detect_underlay_addr()`
+    // runs `hostname -I` (a blocking subprocess). Calling it inside the state write
+    // lock — which happens on every Hello — blocks Tokio's thread pool and holds
+    // the global lock for hundreds of milliseconds, causing seconds of latency
+    // across the entire mesh.
+    config.cached_underlay_uri = detect_underlay_addr().map(|addr| match addr {
+        std::net::IpAddr::V6(v6) => format!("tcp://[{v6}]:9443"),
+        std::net::IpAddr::V4(v4) => format!("tcp://{v4}:9443"),
+    });
+    if let Some(ref uri) = config.cached_underlay_uri {
+        info!(uri, "transport: underlay peer URI cached at startup");
     }
 
     // LAGOON_SWITCHBOARD_ADDR = global anycast switchboard (e.g. "109.224.228.162"

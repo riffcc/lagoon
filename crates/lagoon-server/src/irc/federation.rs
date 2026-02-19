@@ -610,7 +610,13 @@ pub fn dial_missing_spiral_neighbors(
         st.federation.pending_dials.insert(connect_key.clone());
 
         let mut tc_with_peer = (*tc).clone();
-        tc_with_peer.peers.entry(connect_key.clone()).or_insert(peer_entry);
+        // MUST use insert(), not entry().or_insert() — the connect_key (e.g.
+        // "fly.lagun.co") already exists in tc.peers from LAGOON_PEERS config
+        // with want=None. or_insert() silently keeps the existing entry, losing
+        // the want: Some("peer:{id}") we just computed. That causes all relay
+        // tasks to ask for "any" peer instead of the specific one they need,
+        // so SPIRAL neighbors are never reliably connected.
+        tc_with_peer.peers.insert(connect_key.clone(), peer_entry);
         let tc_arc = Arc::new(tc_with_peer);
 
         spawn_native_relay(
@@ -3437,37 +3443,82 @@ pub fn spawn_event_processor(
                                     continue;
                                 }
 
-                                let peer_ygg_addr = st
+                                let peer_ygg_addr: Option<std::net::Ipv6Addr> = st
                                     .mesh
                                     .known_peers
                                     .get(&mkey)
                                     .and_then(|p| p.yggdrasil_addr.as_deref())
                                     .and_then(|s| s.parse().ok());
 
-                                let connect_key = if peer_ygg_addr.is_some() {
-                                    record.node_name.clone()
+                                // Use the same routing logic as dial_missing_spiral_neighbors:
+                                // switchboard (LAGOON_SWITCHBOARD_ADDR) > Ygg overlay > anycast.
+                                // This avoids the bugs of the old path:
+                                // - record.port = 6667 (wrong — peer's listen port ≠ switchboard)
+                                //   → connect_native() rejects as PlainTcp, fails immediately
+                                // - record.server_name = same for all nodes on shared SERVER_NAME
+                                //   → all peers collide on the same pending_dials key
+                                let anycast_entry: Option<String> = tc.switchboard_addr.clone()
+                                    .or_else(|| tc.peers.iter()
+                                        .find(|(_, e)| e.port == transport::SWITCHBOARD_PORT && !e.tls)
+                                        .map(|(host, _)| host.clone()));
+
+                                if peer_ygg_addr.is_none() && anycast_entry.is_none() {
+                                    tracing::debug!(
+                                        peer = %record.node_name,
+                                        peer_id = %mkey,
+                                        "peer_addr_gossip: no route to SPORE-discovered neighbor (no Ygg, no anycast)"
+                                    );
+                                    continue;
+                                }
+
+                                let peer_underlay_uri = st.mesh.known_peers.get(&mkey)
+                                    .and_then(|p| p.underlay_uri.as_deref())
+                                    .filter(|u| is_underlay_uri(u))
+                                    .map(|u| u.to_string());
+
+                                let (connect_key, peer_entry) = if let Some(ref sb_addr) = tc.switchboard_addr {
+                                    (sb_addr.clone(), transport::PeerEntry {
+                                        yggdrasil_addr: None,
+                                        port: transport::SWITCHBOARD_PORT,
+                                        tls: false,
+                                        want: Some(format!("peer:{mkey}")),
+                                        dial_host: None,
+                                    })
+                                } else if peer_ygg_addr.is_some() {
+                                    let underlay_host = peer_underlay_uri.as_deref()
+                                        .map(transport::extract_host_from_uri);
+                                    (record.node_name.clone(), transport::PeerEntry {
+                                        yggdrasil_addr: peer_ygg_addr,
+                                        port: transport::SWITCHBOARD_PORT,
+                                        tls: false,
+                                        want: None,
+                                        dial_host: underlay_host,
+                                    })
                                 } else {
-                                    record.server_name.clone()
+                                    let anycast = anycast_entry.unwrap();
+                                    (anycast, transport::PeerEntry {
+                                        yggdrasil_addr: None,
+                                        port: transport::SWITCHBOARD_PORT,
+                                        tls: false,
+                                        want: Some(format!("peer:{mkey}")),
+                                        dial_host: None,
+                                    })
                                 };
 
                                 info!(
                                     peer = %record.node_name,
                                     peer_id = %mkey,
+                                    connect_key = %connect_key,
                                     "peer_addr_gossip: connecting to SPORE-discovered SPIRAL neighbor"
                                 );
 
                                 st.federation.pending_dials.insert(connect_key.clone());
 
                                 let mut tc_with_peer = (*tc).clone();
-                                tc_with_peer.peers.entry(connect_key.clone()).or_insert(
-                                    transport::PeerEntry {
-                                        yggdrasil_addr: peer_ygg_addr,
-                                        port: record.port,
-                                        tls: record.tls,
-                                        want: None,
-                                        dial_host: None,
-                                    },
-                                );
+                                // Use insert() not or_insert() — the connect_key may already
+                                // exist in tc.peers (e.g. "fly.lagun.co" from LAGOON_PEERS)
+                                // with want=None. We must override with want: Some("peer:{id}").
+                                tc_with_peer.peers.insert(connect_key.clone(), peer_entry);
                                 let tc_arc = Arc::new(tc_with_peer);
 
                                 spawn_native_relay(
@@ -7041,18 +7092,22 @@ fn build_hello_payload(st: &mut super::server::ServerState) -> MeshHelloPayload 
     };
 
     // Ygg overlay address (for identity/routing, NOT for peering).
+    // Use cached value — avoids running /proc/net/if_inet6 on every Hello.
     let yggdrasil_addr = st
         .transport_config
         .ygg_node
         .as_ref()
         .map(|n| n.address().to_string())
-        .or_else(|| transport::detect_yggdrasil_addr().map(|a| a.to_string()));
+        .or_else(|| st.transport_config.cached_yggdrasil_addr.clone());
     // Ygg peer URI = UNDERLAY address.  You don't tunnel Ygg through Ygg.
     // The underlay is the real network (public internet, Fly 6PN, LAN).
-    let ygg_peer_uri = transport::detect_underlay_addr().map(|addr| match addr {
-        std::net::IpAddr::V6(v6) => format!("tcp://[{v6}]:9443"),
-        std::net::IpAddr::V4(v4) => format!("tcp://{v4}:9443"),
-    });
+    //
+    // Use cached value — avoids running `hostname -I` (a blocking subprocess)
+    // inside the state write lock. The original detect_underlay_addr() call here
+    // was causing seconds of latency: blocking Tokio's thread pool + holding the
+    // global write lock while the subprocess ran. The underlay address is stable
+    // for the lifetime of the process; detecting it once at startup is correct.
+    let ygg_peer_uri = st.transport_config.cached_underlay_uri.clone();
 
     // CVDF cooperative chain status (if service is running).
     let (cvdf_height, cvdf_weight, cvdf_tip_hex, cvdf_genesis_hex) =
