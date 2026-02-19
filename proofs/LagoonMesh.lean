@@ -117,6 +117,9 @@ import LagoonMesh.Messages
 import LagoonMesh.State
 import LagoonMesh.Transitions
 
+-- Peer address gossip convergence (SPORE-based eventual consistency)
+import LagoonMesh.PeerAddrGossip
+
 -- Layer 2: Single-node proofs
 import LagoonMesh.SpiralProofs
 import LagoonMesh.TransitionProofs
