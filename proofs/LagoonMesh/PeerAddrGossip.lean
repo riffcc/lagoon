@@ -323,6 +323,89 @@ theorem delta_subset_sender (sender recipient : PeerAddrStore)
     r ∈ sender.records :=
   (mem_delta_iff sender recipient r |>.mp hr).1
 
+/-! ### Helper Lemmas for Sync Completeness -/
+
+/-- After inserting a record for peer P, all records for peers ≠ P remain unchanged
+    and no new records for any peer ≠ P are created. -/
+private theorem insertRecord_no_peer_for (s : PeerAddrStore) (r : PeerAddrRecord) (p : PeerId)
+    (hNoP   : ∀ q ∈ s.records, q.peerId ≠ p)
+    (hRNeqP : r.peerId ≠ p) :
+    ∀ q ∈ (insertRecord s r).1.records, q.peerId ≠ p := by
+  intro q hq
+  simp only [insertRecord] at hq
+  -- Case split on whether the insertion was rejected or accepted
+  cases h : s.hasNewerOrEqual r.peerId r.timestamp with
+  | true  =>
+    simp only [h, ↓reduceIte] at hq
+    exact hNoP q hq
+  | false =>
+    simp only [h, Bool.false_eq_true, ↓reduceIte,
+               List.mem_cons, List.mem_filter, decide_eq_true_eq] at hq
+    rcases hq with rfl | ⟨hqS, _⟩
+    · exact hRNeqP
+    · exact hNoP q hqS
+
+/-- If `r ∈ incoming`, `s` has no existing record for `r.peerId`, and `incoming`
+    has at most one record per `peerId`, then `r ∈ (mergeAll s incoming).records`. -/
+private theorem mergeAll_absorbs_new_record (s : PeerAddrStore)
+    (incoming : List PeerAddrRecord) (r : PeerAddrRecord)
+    (hrIn        : r ∈ incoming)
+    (hNoExisting : ∀ q ∈ s.records, q.peerId ≠ r.peerId)
+    (hOnePerPeer : ∀ r₁ ∈ incoming, ∀ r₂ ∈ incoming,
+                    r₁.peerId = r₂.peerId → r₁ = r₂) :
+    r ∈ (mergeAll s incoming).records := by
+  induction incoming generalizing s with
+  | nil => simp at hrIn
+  | cons h t ih =>
+    simp only [mergeAll_cons]
+    -- r ∈ h :: t: either r = h (head) or r ∈ t (tail)
+    rcases List.mem_cons.mp hrIn with hrH | hrT
+    · -- hrH : r = h — r is the head element.
+      -- Rewrite the goal (r ↦ h) and hNoExisting to work uniformly with h.
+      rw [hrH]
+      rw [hrH] at hNoExisting
+      -- Goal: h ∈ (mergeAll (insertRecord s h).1 t).records
+      -- hNoExisting: ∀ q ∈ s.records, q.peerId ≠ h.peerId
+      have hAcc : insertAccepted s h := by
+        rw [merge_accepts_iff_newer]
+        intro ex hex heqPid
+        exact absurd heqPid (hNoExisting ex hex)
+      apply record_preserved_by_mergeAll _ h (record_in_store_after_insert s h hAcc) t
+      intro r' hr't heqPid
+      -- r'.peerId = h.peerId; both r' and h are in h :: t; by OnePerPeer, r' = h
+      have hr'H : r' = h :=
+        hOnePerPeer r' (List.mem_cons.mpr (Or.inr hr't)) h (List.mem_cons.mpr (Or.inl rfl)) heqPid
+      have : r'.timestamp = h.timestamp := congr_arg PeerAddrRecord.timestamp hr'H
+      omega
+    · -- hrT : r ∈ t — r is in the tail.  Split on whether h shares r's peer ID.
+      by_cases hPidEq : h.peerId = r.peerId
+      · -- h.peerId = r.peerId → h = r (by OnePerPeer applied to h and r in h :: t)
+        have hrH : h = r :=
+          hOnePerPeer h (List.mem_cons.mpr (Or.inl rfl)) r (List.mem_cons.mpr (Or.inr hrT)) hPidEq
+        -- Rewrite goal (r ↦ h) so we can use record_preserved_by_mergeAll with h
+        rw [← hrH]
+        -- Goal: h ∈ (mergeAll (insertRecord s h).1 t).records
+        -- hNoExisting uses r.peerId; since hrH : h = r, h.peerId = r.peerId
+        have hNoExistingH : ∀ q ∈ s.records, q.peerId ≠ h.peerId :=
+          fun q hq => hrH ▸ hNoExisting q hq
+        have hAcc : insertAccepted s h := by
+          rw [merge_accepts_iff_newer]
+          intro ex hex heqPid
+          exact absurd heqPid (hNoExistingH ex hex)
+        apply record_preserved_by_mergeAll _ h (record_in_store_after_insert s h hAcc) t
+        intro r' hr't heqPid
+        have hr'H : r' = h :=
+          hOnePerPeer r' (List.mem_cons.mpr (Or.inr hr't)) h (List.mem_cons.mpr (Or.inl rfl))
+            heqPid
+        have : r'.timestamp = h.timestamp := congr_arg PeerAddrRecord.timestamp hr'H
+        omega
+      · -- h.peerId ≠ r.peerId: inserting h leaves no record for r.peerId; apply IH.
+        exact ih (insertRecord s h).1 hrT
+          (insertRecord_no_peer_for s h r.peerId hNoExisting hPidEq)
+          (fun r₁ hr₁ r₂ hr₂ heq =>
+            hOnePerPeer r₁ (List.mem_cons.mpr (Or.inr hr₁))
+                        r₂ (List.mem_cons.mpr (Or.inr hr₂)) heq)
+
 /-! ### One-Direction Sync Completeness -/
 
 /-- **One-Direction Sync**: After A receives B's RecordDelta and merges it,
@@ -355,15 +438,15 @@ theorem sync_one_direction (A B : PeerAddrStore)
     exact absurd hqPid (hDisjoint q hqA r hrB)
   -- Step 2: r is in the delta
   have hrDelta : r ∈ delta := (mem_delta_iff B A r).mpr ⟨hrB, hNotCov⟩
-  -- Step 3: r ends up in A' after mergeAll of the delta.
-  -- The key argument:
-  --   (a) A has no record for r.peerId (from hDisjoint + hA.OnePerPeer)
-  --   (b) Therefore insertRecord A r accepts r (hasNewerOrEqual = false)
-  --   (c) The delta has at most one record for r.peerId (from hB.OnePerPeer: only r itself)
-  --   (d) So when foldl processes r from delta, it inserts r into the running store
-  --   (e) record_preserved_by_mergeAll then keeps r in the store for all subsequent inserts
-  --   (f) Therefore r ∈ A'.records.
-  sorry
+  -- Step 3: mergeAll absorbs r from the delta.
+  apply mergeAll_absorbs_new_record A delta r hrDelta
+  · -- A has no record for r.peerId (disjointness)
+    intro q hqA heqPid
+    exact absurd heqPid (hDisjoint q hqA r hrB)
+  · -- delta inherits one-per-peer from B.Valid (B's OnePerPeer on the filtered subset)
+    intro r₁ hr₁ r₂ hr₂ heqPid
+    exact hB.1 r₁ (delta_subset_sender B A r₁ hr₁)
+               r₂ (delta_subset_sender B A r₂ hr₂) heqPid
 
 /-! ### Pairwise Convergence -/
 
@@ -427,6 +510,26 @@ axiom gossipRound_monotone {n : Nat} (g : GossipGraph n)
     (i : Fin n) (r : PeerAddrRecord) (hr : r ∈ (g.stores i).records) :
     r ∈ ((gossipRound g).stores i).records
 
+/-- Adjacency is preserved by gossip rounds (topology is fixed). -/
+axiom gossipRound_preserves_adjacency {n : Nat} (g : GossipGraph n)
+    (i j : Fin n) (h : g.adjacent i j = true) :
+    (gossipRound g).adjacent i j = true
+
+/-- Per-node validity is preserved by gossip rounds. -/
+axiom gossipRound_preserves_validity {n : Nat} (g : GossipGraph n)
+    (hValid : ∀ i, (g.stores i).Valid) :
+    ∀ i, ((gossipRound g).stores i).Valid
+
+/-- Disjointness of peer IDs across nodes is preserved by gossip rounds. -/
+axiom gossipRound_preserves_disjoint {n : Nat} (g : GossipGraph n)
+    (hDisjoint : ∀ i j : Fin n, i ≠ j →
+      ∀ rI ∈ (g.stores i).records, ∀ rJ ∈ (g.stores j).records,
+      rI.peerId ≠ rJ.peerId) :
+    ∀ i j : Fin n, i ≠ j →
+      ∀ rI ∈ ((gossipRound g).stores i).records,
+      ∀ rJ ∈ ((gossipRound g).stores j).records,
+      rI.peerId ≠ rJ.peerId
+
 /-- Apply gossipRound k times. -/
 noncomputable def gossipRounds {n : Nat} (g : GossipGraph n) : Nat → GossipGraph n
   | 0     => g
@@ -444,6 +547,132 @@ theorem gossipRounds_monotone {n : Nat} (g : GossipGraph n)
   | zero => simpa
   | succ k ih => exact gossipRound_monotone _ i r ih
 
+theorem gossipRounds_preserves_adjacency {n : Nat} (g : GossipGraph n)
+    (k : Nat) (i j : Fin n) (h : g.adjacent i j = true) :
+    (gossipRounds g k).adjacent i j = true := by
+  induction k with
+  | zero => simpa
+  | succ k ih => exact gossipRound_preserves_adjacency _ i j ih
+
+theorem gossipRounds_preserves_validity {n : Nat} (g : GossipGraph n)
+    (k : Nat) (hValid : ∀ i, (g.stores i).Valid) :
+    ∀ i, ((gossipRounds g k).stores i).Valid := by
+  induction k with
+  | zero => simpa
+  | succ k ih => exact gossipRound_preserves_validity _ ih
+
+theorem gossipRounds_preserves_disjoint {n : Nat} (g : GossipGraph n) (k : Nat)
+    (hDisjoint : ∀ i j : Fin n, i ≠ j →
+      ∀ rI ∈ (g.stores i).records, ∀ rJ ∈ (g.stores j).records,
+      rI.peerId ≠ rJ.peerId) :
+    ∀ i j : Fin n, i ≠ j →
+      ∀ rI ∈ ((gossipRounds g k).stores i).records,
+      ∀ rJ ∈ ((gossipRounds g k).stores j).records,
+      rI.peerId ≠ rJ.peerId := by
+  induction k with
+  | zero => simpa
+  | succ k ih => exact gossipRound_preserves_disjoint _ ih
+
+/-- If r is at node p after k rounds and i is adjacent to p in the original graph,
+    then r is at i after k+1 rounds. -/
+private theorem one_hop_propagation {n : Nat} (g : GossipGraph n)
+    (hValid    : ∀ i, (g.stores i).Valid)
+    (hDisjoint : ∀ i j : Fin n, i ≠ j →
+      ∀ rI ∈ (g.stores i).records, ∀ rJ ∈ (g.stores j).records,
+      rI.peerId ≠ rJ.peerId)
+    (k : Nat) (i p : Fin n) (hAdj : g.adjacent i p = true)
+    (r : PeerAddrRecord) (hr : r ∈ ((gossipRounds g k).stores p).records) :
+    r ∈ ((gossipRounds g (k + 1)).stores i).records := by
+  show r ∈ ((gossipRound (gossipRounds g k)).stores i).records
+  exact gossipRound_one_hop (gossipRounds g k)
+    (gossipRounds_preserves_validity g k hValid)
+    (gossipRounds_preserves_disjoint g k hDisjoint)
+    i p (gossipRounds_preserves_adjacency g k i p hAdj)
+    r hr
+
+/-- Path propagation: a path of length ≤ k+1 from i to j in g means any record
+    at j propagates to i after k gossip rounds. -/
+private theorem path_propagation {n : Nat} (g : GossipGraph n)
+    (hValid    : ∀ i, (g.stores i).Valid)
+    (hDisjoint : ∀ i j : Fin n, i ≠ j →
+      ∀ rI ∈ (g.stores i).records, ∀ rJ ∈ (g.stores j).records,
+      rI.peerId ≠ rJ.peerId) :
+    ∀ (k : Nat) (path : List (Fin n)),
+    path.length ≤ k + 1 →
+    ∀ (i j : Fin n),
+    path.head? = some i →
+    path.getLast? = some j →
+    (∀ m (hm : m + 1 < path.length),
+      g.adjacent (path.get ⟨m, Nat.lt_of_succ_lt hm⟩)
+                 (path.get ⟨m + 1, hm⟩) = true) →
+    ∀ r ∈ (g.stores j).records,
+    r ∈ ((gossipRounds g k).stores i).records := by
+  intro k
+  induction k with
+  | zero =>
+    intro path hLen i j hHead hLast _hAdj r hr
+    simp only [Nat.zero_add] at hLen
+    -- path.length ≤ 1 with both endpoints defined → i = j
+    -- Note: subst on (v = i) removes i and keeps v; we prove (v = j) and subst.
+    cases path with
+    | nil => simp at hHead
+    | cons v vs =>
+      simp only [List.head?_cons, Option.some.injEq] at hHead
+      -- hHead : v = i. subst hHead removes i, keeping v.
+      subst hHead
+      -- Goal is now: r ∈ ((gossipRounds g 0).stores j).records (j still present)
+      -- (i was removed; all occurrences of i in goal/context are now v)
+      cases vs with
+      | nil =>
+        -- singleton path [v]; hLast : [v].getLast? = some j
+        simp [List.getLast?] at hLast
+        -- hLast : v = j
+        subst hLast
+        simpa
+      | cons w ws =>
+        -- path length ≥ 2 contradicts ≤ 1
+        simp only [List.length_cons] at hLen; omega
+  | succ k ih =>
+    intro path hLen i j hHead hLast hAdj r hr
+    cases path with
+    | nil => simp at hHead
+    | cons v vs =>
+      simp only [List.head?_cons, Option.some.injEq] at hHead
+      -- hHead : v = i. subst hHead removes i, keeping v.
+      subst hHead
+      -- After subst: i is gone, v is the head of the path.
+      cases vs with
+      | nil =>
+        -- singleton path [v] = [i]: v = j
+        simp [List.getLast?] at hLast
+        -- hLast : v = j
+        subst hLast
+        -- Goal: r ∈ ((gossipRounds g (k+1)).stores v).records
+        exact gossipRounds_monotone g (k + 1) v r (by simpa)
+      | cons w ws =>
+        -- path v :: w :: ws; v played the role of i
+        have hLen' : (w :: ws).length ≤ k + 1 := by
+          simp only [List.length_cons] at *; omega
+        have hAdj_vw : g.adjacent v w = true := by
+          have := hAdj 0 (by simp only [List.length_cons] at *; omega)
+          simpa using this
+        have hIH : r ∈ ((gossipRounds g k).stores w).records := by
+          apply ih (w :: ws) hLen' w j
+          · simp
+          · exact hLast
+          · intro m hm
+            -- Shift: (v :: w :: ws).get ⟨m+1, _⟩ = (w :: ws).get ⟨m, _⟩ by List.get iota.
+            -- Proof terms differ only in the Nat.lt witness.
+            have hm' : m + 1 + 1 < (v :: w :: ws).length := by
+              simp only [List.length_cons] at *; omega
+            have hmAdj := hAdj (m + 1) hm'
+            -- List.get (v :: w :: ws) ⟨m+1, _⟩ definitionally equals (w :: ws).get ⟨m, _⟩
+            -- by List.get's definition on cons. Proof terms in Fin differ but are
+            -- propositionally equal by proof irrelevance (Nat.lt ∈ Prop).
+            exact hmAdj
+          · exact hr
+        exact one_hop_propagation g hValid hDisjoint k v w hAdj_vw r hIH
+
 /-- **Graph Convergence**: In a connected graph of diameter d, after d gossip
     rounds, every node's store contains every record from every other node's
     initial store.
@@ -459,13 +688,9 @@ theorem graph_convergence {n : Nat} (g : GossipGraph n)
     (d : Nat) (hDiam : g.Diameter d) :
     ∀ i j : Fin n, ∀ r ∈ (g.stores j).records,
       r ∈ ((gossipRounds g d).stores i).records := by
-  sorry
-  -- Proof by induction on d:
-  -- Base d = 0: Diameter 0 means i = j for all reachable pairs → direct.
-  -- Step d → d+1: ∀ i, ∃ path of length ≤ d+2 from i to j.
-  --   Let p be i's neighbor on the path to j (path[1]).
-  --   After d rounds, p has r (by IH on shorter path p→j).
-  --   After one more round, i gets r from p (by gossipRound_one_hop).
+  intro i j r hr
+  obtain ⟨path, hLen, hHead, hLast, hAdj⟩ := hDiam i j
+  exact path_propagation g hValid hDisjoint d path hLen i j hHead hLast hAdj r hr
 
 /-! ### The Meta-Theorem -/
 
