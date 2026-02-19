@@ -241,19 +241,29 @@ def handleDisconnected (s : MeshState) (peerId : PeerId)
 
 /-! ### Tick Handler
 
-In Rust: the periodic VDF challenge interval (5s) and dead peer eviction. -/
+In Rust: the periodic VDF challenge interval (5s) and dead peer eviction.
 
-/-- Handle a periodic tick (advance time, evict dead peers). -/
+BUG FIX APPLIED: This handler now emits `cancelConnect` for every peer it evicts.
+Previously the Rust code had no mechanism to cancel connection tasks when their
+target peer was evicted. That produced the connection storm observed in production
+(attempt=925350 against a dead peer). -/
+
+/-- Handle a periodic tick (advance time, evict dead peers, cancel stale connects). -/
 def handleTick (s : MeshState) (newTime : Timestamp)
     : MeshState × List OutboundAction :=
   let s₁ := { s with now := newTime }
-  -- Evict dead peers
+  -- Evict dead peers, collecting cancelConnect actions for each one.
+  -- A peer is dead if VDF silent for VDF_DEAD_SECS (or lastSeen stale if never seen VDF).
   let deadPeers := computeDeadPeers s₁
-  let s₂ := deadPeers.foldl (fun acc pid =>
-    let acc₁ := { acc with knownPeers := acc.knownPeers.erase pid }
-    let acc₂ := { acc₁ with relays := acc₁.relays.erase pid }
-    { acc₂ with spiral := acc₂.spiral.removePeer pid }
-  ) s₁
+  let (s₂, cancelActions) := deadPeers.foldl (fun acc pid =>
+    let (accS, accActs) := acc
+    let accS₁ := { accS with knownPeers := accS.knownPeers.erase pid }
+    let accS₂ := { accS₁ with relays := accS₁.relays.erase pid }
+    let accS₃ := { accS₂ with spiral := accS₂.spiral.removePeer pid }
+    -- Cancel any pending connection task for this peer.
+    -- Without this, the Rust retry loop runs forever after eviction.
+    (accS₃, accActs ++ [.cancelConnect pid])
+  ) (s₁, [])
   -- Reconverge after evictions
   let s₃ := { s₂ with spiral := s₂.spiral.reconverge }
   -- VDF proof requests to all SPIRAL neighbors
@@ -261,12 +271,59 @@ def handleTick (s : MeshState) (newTime : Timestamp)
   -- Dial missing neighbors
   let dialActions := (computeNeighbors s₃.spiral).filterMap fun pid =>
     if s₃.relays.lookup pid = none then some (.connect pid) else none
-  (s₃, proofReqs ++ dialActions)
+  (s₃, cancelActions ++ proofReqs ++ dialActions)
+
+/-! ### Connection Failed Handler
+
+In Rust: currently MISSING — connection tasks retry forever with no backoff (BUG).
+
+This models the retry feedback loop so the FSM can bound connection attempts.
+The design is a DECAY rather than hard eviction:
+- Attempts < MAX_CONNECT_RETRIES: schedule retry with exponential backoff (1s, 2s, 4s…)
+- Attempts ≥ MAX_CONNECT_RETRIES: demote the peer from SPIRAL topology but keep in
+  knownPeers with refreshed lastSeen, giving it VDF_DEAD_SECS to prove itself alive.
+  If it doesn't show up, handleTick will evict it naturally.
+- Peer not in knownPeers (already evicted): cancel the retry task immediately. -/
+
+/-- Handle a failed connection attempt to a peer. -/
+def handleConnectionFailed (s : MeshState) (target : PeerId) (attempts : Nat)
+    : MeshState × List OutboundAction :=
+  match s.knownPeers.lookup target with
+  | none =>
+    -- Peer was already evicted (by tick or disconnect). The connection task is stale.
+    -- Just cancel it — nothing else to do.
+    (s, [.cancelConnect target])
+  | some _ =>
+    if attempts < MAX_CONNECT_RETRIES then
+      -- Still within retry budget. Back off exponentially and try again.
+      -- backoff: 1s, 2s, 4s, 8s, 16s (then demote)
+      (s, [.scheduleRetry target (CONNECT_BACKOFF_BASE_MS * 2 ^ attempts)])
+    else
+      -- Retry budget exhausted. Demote: remove from SPIRAL topology so we stop
+      -- treating this peer as a required neighbor, but refresh lastSeen so the
+      -- VDF clock is reset. handleTick will complete the eviction if VDF stays silent.
+      let s₁ := { s with spiral := s.spiral.removePeer target }
+      let s₂ := { s₁ with spiral := s₁.spiral.reconverge }
+      -- Refresh lastSeen to give the peer VDF_DEAD_SECS to show itself alive.
+      -- Update the existing PeerInfo rather than removing it.
+      let s₃ := match s₂.knownPeers.lookup target with
+        | none => s₂
+        | some info =>
+          let info' := { info with lastSeen := s₂.now, lastVdfAdvance := 0 }
+          { s₂ with knownPeers := s₂.knownPeers.insert target info' }
+      -- Redial any SPIRAL neighbors that are now missing after reconverge
+      let dialActions := (computeNeighbors s₃.spiral).filterMap fun pid =>
+        if s₃.relays.lookup pid = none then some (.connect pid) else none
+      -- Cancel the current retry task — peer is demoted, not a neighbor target
+      (s₃, [.cancelConnect target] ++ dialActions)
 
 /-! ### Master Transition Function
 
 The single entry point for all state transitions.
-In Rust: the `tokio::select!` match in `spawn_event_processor()`. -/
+In Rust: the `tokio::select!` match in `spawn_event_processor()`.
+
+BUG FIX APPLIED: `.tick` is now wired in. Previously handleTick was unreachable
+from transition, meaning dead peer eviction NEVER fired. -/
 
 /-- Process any inbound message or event. -/
 def transition (s : MeshState) (msg : InboundMsg)
@@ -277,5 +334,7 @@ def transition (s : MeshState) (msg : InboundMsg)
   | .vdfProof pid => handleVdfProof s pid
   | .redirect ps => handleRedirect s ps
   | .disconnected pid => handleDisconnected s pid
+  | .tick t => handleTick s t
+  | .connectionFailed target attempts => handleConnectionFailed s target attempts
 
 end LagoonMesh

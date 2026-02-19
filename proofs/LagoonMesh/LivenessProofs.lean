@@ -100,8 +100,9 @@ theorem vdfProof_refreshes_liveness (s : MeshState) (pid : PeerId) (info : PeerI
     | some info' => info'.lastVdfAdvance = s.now
     | none => False := by
   unfold handleVdfProof
-  simp [hKnown]
-  sorry -- After insert, lookup returns the updated info with lastVdfAdvance = s.now
+  -- simp resolves the outer match (using hKnown), then PMap.lookup_insert_eq
+  -- resolves the inner lookup-after-insert, giving lastVdfAdvance = s.now by rfl.
+  simp [hKnown, PMap.lookup_insert_eq]
 
 /-! ### Eviction Completeness -/
 
@@ -111,7 +112,10 @@ theorem dead_peer_in_eviction_set (s : MeshState) (pid : PeerId) (info : PeerInf
     (hDead : isDead s info = true) :
     pid ∈ computeDeadPeers s := by
   unfold computeDeadPeers
-  sorry -- pid is in knownPeers.keys, and filter keeps it because isDead = true
+  rw [List.mem_filter]
+  constructor
+  · exact PMap.mem_keys_of_lookup s.knownPeers pid hKnown
+  · simp [hKnown, hDead]
 
 /-- Every alive peer is NOT in computeDeadPeers. -/
 theorem alive_peer_not_in_eviction_set (s : MeshState) (pid : PeerId) (info : PeerInfo)
@@ -119,7 +123,9 @@ theorem alive_peer_not_in_eviction_set (s : MeshState) (pid : PeerId) (info : Pe
     (hAlive : isDead s info = false) :
     pid ∉ computeDeadPeers s := by
   unfold computeDeadPeers
-  sorry -- filter rejects pid because isDead = false
+  rw [List.mem_filter, not_and]
+  intro _
+  simp [hKnown, hAlive]
 
 /-! ### Eviction + Reconverge Composition -/
 

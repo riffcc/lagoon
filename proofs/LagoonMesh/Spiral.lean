@@ -89,6 +89,40 @@ theorem lookup_erase_ne [BEq α] [LawfulBEq α] (m : PMap α β) (k₁ k₂ : α
     (m.erase k₁).lookup k₂ = m.lookup k₂ := by
   sorry -- mechanical: filter preserves k₂ entries
 
+/-- If lookup returns Some, the key is in the key set. -/
+theorem mem_keys_of_lookup (m : PMap α β) (k : α) {v : β}
+    (h : m.lookup k = some v) : k ∈ m.keys := by
+  induction m with
+  | nil => simp [lookup] at h
+  | cons hd tl ih =>
+    simp only [keys, List.map_cons, List.mem_cons]
+    unfold lookup at h
+    cases hbeq : (hd.1 == k) with
+    | true =>
+      left
+      exact (LawfulBEq.eq_of_beq hbeq).symm
+    | false =>
+      right
+      simp only [hbeq] at h
+      exact ih h
+
+/-- If key is not in key set, lookup returns None. -/
+theorem lookup_none_of_not_mem_keys (m : PMap α β) (k : α)
+    (h : k ∉ m.keys) : m.lookup k = none := by
+  induction m with
+  | nil => simp [lookup]
+  | cons hd tl ih =>
+    simp only [keys, List.map_cons, List.mem_cons, not_or] at h
+    obtain ⟨hne, htl⟩ := h
+    -- Compute (hd.1 == k) = false from hne : k ≠ hd.1
+    have hbeq_false : (hd.1 == k) = false := by
+      cases hbeq : (hd.1 == k) with
+      | false => rfl
+      | true => exact absurd (LawfulBEq.eq_of_beq hbeq).symm hne
+    -- simp [lookup] uses equation lemmas (iota-reduced), hbeq_false reduces the if
+    simp only [lookup, hbeq_false]
+    exact ih htl
+
 end PMap
 
 /-! ### SPIRAL Topology State -/

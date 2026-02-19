@@ -182,4 +182,18 @@ def VDF_DEAD_SECS : Nat := 10
 /-- Maximum SPIRAL neighbors per node. -/
 def MAX_NEIGHBORS : Nat := 20
 
+/-- Maximum connection retries before demoting a peer from SPIRAL topology.
+    In Rust: this bound is currently missing (infinite retries — BUG).
+    After MAX_CONNECT_RETRIES failures, the peer is removed from the SPIRAL
+    neighbor set (we stop trying to connect) but kept in knownPeers with a
+    refreshed lastSeen, giving it VDF_DEAD_SECS to prove itself alive.
+    If it doesn't respond, handleTick will evict it naturally.
+    This is the decay: connection failure → demoted to "gossip-only, awaiting VDF". -/
+def MAX_CONNECT_RETRIES : Nat := 5
+
+/-- Base backoff in milliseconds for connection retries (doubles each attempt).
+    Retry schedule: 1s, 2s, 4s, 8s, 16s, then evict.
+    In Rust: this backoff is currently missing (immediate retry — BUG). -/
+def CONNECT_BACKOFF_BASE_MS : Nat := 1000
+
 end LagoonMesh

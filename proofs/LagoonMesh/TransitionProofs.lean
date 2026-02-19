@@ -162,6 +162,27 @@ theorem handleTick_valid (s : MeshState) (t : Timestamp)
     (hv : s.Valid) : (handleTick s t).1.Valid := by
   sorry -- removePeer_valid (iterated) + reconverge_valid
 
+/-- handleConnectionFailed preserves validity.
+    Two cases:
+    - Peer not in knownPeers: state unchanged, still valid.
+    - Peer known, within retries: state unchanged, still valid.
+    - Peer known, retries exhausted: removePeer + reconverge + refresh lastSeen.
+      All three operations preserve Valid. -/
+theorem handleConnectionFailed_valid (s : MeshState) (target : PeerId) (attempts : Nat)
+    (hv : s.Valid) : (handleConnectionFailed s target attempts).1.Valid := by
+  unfold handleConnectionFailed
+  split
+  · -- Peer not in knownPeers: returns (s, [cancelConnect]). State unchanged.
+    exact hv
+  · -- Peer is known.
+    split_ifs with hRetry
+    · -- attempts < MAX_CONNECT_RETRIES: returns (s, [scheduleRetry]). State unchanged.
+      exact hv
+    · -- attempts ≥ MAX_CONNECT_RETRIES: demote peer from SPIRAL.
+      -- removePeer preserves Valid, reconverge preserves Valid, knownPeers update
+      -- (only modifies lastSeen/lastVdfAdvance, not structural invariants).
+      sorry -- removePeer_valid + reconverge_valid + knownPeers.insert preserves Valid
+
 /-- THE MASTER THEOREM: Every state transition preserves validity.
     If the mesh state is valid before processing a message,
     it is valid after processing the message. -/
@@ -174,6 +195,8 @@ theorem transition_preserves_valid (s : MeshState) (msg : InboundMsg)
   | vdfProof pid => exact handleVdfProof_valid s pid hv
   | redirect ps => exact handleRedirect_valid s ps hv
   | disconnected pid => exact handleDisconnected_valid s pid hv
+  | tick t => exact handleTick_valid s t hv
+  | connectionFailed target attempts => exact handleConnectionFailed_valid s target attempts hv
 
 /-! ### Multi-Step Validity
 
@@ -202,13 +225,23 @@ theorem no_self_connection_ever (s : MeshState) (msgs : List InboundMsg)
     (processMessages s msgs).relays.lookup s.ourId = none := by
   sorry -- handleHello disconnects self immediately, no other handler adds self
 
-/-- Dead peers are eventually evicted. After a tick with time > lastAdvance + DEAD_SECS,
-    any peer that hasn't advanced its VDF is removed. -/
+/-- Dead peers are evicted by tick.
+    After a tick advancing time to t, any peer that was dead at time t
+    is removed from knownPeers. -/
 theorem dead_peers_evicted (s : MeshState) (t : Timestamp) (pid : PeerId)
     (hv : s.Valid)
     (hDead : ∀ info, s.knownPeers.lookup pid = some info → isDead { s with now := t } info = true) :
     (handleTick s t).1.knownPeers.lookup pid = none := by
   sorry -- handleTick iterates computeDeadPeers and erases each
+
+/-- Dead peers get cancelConnect actions when evicted by tick.
+    This is how the Rust code learns to cancel stale connection tasks. -/
+theorem dead_peers_get_cancel (s : MeshState) (t : Timestamp) (pid : PeerId)
+    (hv : s.Valid)
+    (hKnown : s.knownPeers.lookup pid ≠ none)
+    (hDead : ∀ info, s.knownPeers.lookup pid = some info → isDead { s with now := t } info = true) :
+    .cancelConnect pid ∈ (handleTick s t).2 := by
+  sorry -- handleTick foldl over deadPeers appends [.cancelConnect pid] for each
 
 /-! ### Merge Determinism -/
 

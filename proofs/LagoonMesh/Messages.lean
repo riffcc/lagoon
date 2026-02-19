@@ -62,6 +62,15 @@ inductive InboundMsg where
   | redirect : List PeerGossip → InboundMsg
   /-- Relay disconnected — the underlying connection closed. -/
   | disconnected : PeerId → InboundMsg
+  /-- Periodic timer tick — advances time and evicts dead peers.
+      In Rust: the VDF challenge interval fires every 5s via tokio::select!.
+      BUG FIX: This was previously unmodeled, meaning handleTick was never
+      reachable from transition, so dead peers were NEVER evicted. -/
+  | tick : Timestamp → InboundMsg
+  /-- A connection attempt to `target` failed after `attempts` tries.
+      In Rust: connection tasks currently retry FOREVER with no backoff (BUG).
+      This message models the retry feedback loop so the FSM can bound it. -/
+  | connectionFailed : PeerId → (attempts : Nat) → InboundMsg
   deriving Repr
 
 /-! ### Outbound Actions
@@ -83,6 +92,15 @@ inductive OutboundAction where
   | addYggPeer : PeerId → OutboundAction
   /-- Request VDF proof from a peer. -/
   | requestVdfProof : PeerId → OutboundAction
+  /-- Cancel any pending connection task for this peer.
+      Emitted when: (a) a peer is evicted by tick, or (b) handleConnectionFailed
+      determines the peer is gone or has exceeded MAX_CONNECT_RETRIES.
+      In Rust: this cancellation currently NEVER happens (BUG). -/
+  | cancelConnect : PeerId → OutboundAction
+  /-- Schedule a connection retry after a backoff delay.
+      `backoffMs` is the delay in milliseconds (exponential: 1s, 2s, 4s, 8s, 16s).
+      In Rust: retries happen immediately with zero backoff (BUG). -/
+  | scheduleRetry : PeerId → (backoffMs : Nat) → OutboundAction
   deriving Repr
 
 /-! ### Key Property: Message Type Safety

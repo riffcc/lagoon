@@ -21,6 +21,15 @@ Each of these is a failed proof obligation. Not a runtime crash. Not a 4 AM
 debugging session. Not thirteen nodes fighting over slot 0. A compile-time
 error that says "you haven't proven this invariant holds after this state transition."
 
+## Update (2026-02-18)
+
+Production deployment analysis revealed two more state machine violations:
+- **Tick not in transition**: `handleTick` was dead code — `.tick` not in `InboundMsg`,
+  so dead peer eviction NEVER fired. Stale gossip peers accumulated forever.
+- **Infinite connection retry**: connection tasks had no bound on retries, no backoff,
+  and were never cancelled when their target was evicted. Produced connection storm
+  (attempt=925,350 against a long-dead peer). Modelled and bounded in `ConnectionProofs.lean`.
+
 ## Architecture
 
 The state machine is modeled as pure functions:
@@ -50,6 +59,7 @@ preserves EVERY invariant. If it compiles, it's correct.
 * `MergeProofs.lean` — Merge determinism, conservation, convergence
 * `LivenessProofs.lean` — VDF monotonicity, dead peer detection correctness
 * `BootstrapProofs.lean` — APE bootstrap sequence correctness
+* `ConnectionProofs.lean` — Connection task boundedness (fixes infinite-retry storm, 2026-02-18)
 
 ### Layer 3: Slot Assignment Paths
 * `SlotPaths.lean` — The five and ONLY five ways to get a slot
@@ -113,6 +123,7 @@ import LagoonMesh.TransitionProofs
 import LagoonMesh.MergeProofs
 import LagoonMesh.LivenessProofs
 import LagoonMesh.BootstrapProofs
+import LagoonMesh.ConnectionProofs
 
 -- Layer 3: Slot assignment paths
 import LagoonMesh.SlotPaths
