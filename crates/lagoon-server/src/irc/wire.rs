@@ -169,6 +169,21 @@ pub enum MeshMessage {
     #[serde(rename = "liveness_delta")]
     LivenessDelta { data: String },
 
+    /// Peer address SPORE HaveList (base64-bincode).
+    ///
+    /// Sent to SPIRAL neighbors to initiate peer address reconciliation.
+    /// The receiver computes which address records it's missing and replies
+    /// with `PeerAddrDelta`.
+    #[serde(rename = "peer_addr_have")]
+    PeerAddrHave { data: String },
+
+    /// Peer address delta entries (base64-bincode).
+    ///
+    /// Contains serialized [`peer_addr_store::PeerAddrRecord`]s that the
+    /// receiver is missing. The receiver adds unknown peers to `known_peers`
+    /// and attempts to connect.
+    #[serde(rename = "peer_addr_delta")]
+    PeerAddrDelta { data: String },
 
     /// Socket migration — TCP_REPAIR state delivered via existing mesh relay.
     /// The target node calls `anymesh::restore()` to reconstruct the socket.

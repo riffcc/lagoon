@@ -17,6 +17,8 @@ pub mod yggdrasil;
 
 pub mod connection_gossip;
 pub mod connection_store;
+pub mod peer_addr_gossip;
+pub mod peer_addr_store;
 pub mod cvdf_transport;
 pub mod latency_gossip;
 pub mod liveness_gossip;

@@ -286,6 +286,20 @@ pub fn dispatch_mesh_message(
             });
             None
         }
+        MeshMessage::PeerAddrHave { data } => {
+            let _ = event_tx.send(RelayEvent::PeerAddrHave {
+                remote_host: remote_host.to_string(),
+                payload_b64: data,
+            });
+            None
+        }
+        MeshMessage::PeerAddrDelta { data } => {
+            let _ = event_tx.send(RelayEvent::PeerAddrDelta {
+                remote_host: remote_host.to_string(),
+                payload_b64: data,
+            });
+            None
+        }
         MeshMessage::SocketMigrate { migration, client_peer_id } => {
             let _ = event_tx.send(RelayEvent::SocketMigrate {
                 remote_host: remote_host.to_string(),
@@ -899,6 +913,16 @@ pub enum RelayEvent {
     },
     /// Received LIVENESS_DELTA — liveness attestations we're missing.
     LivenessDelta {
+        remote_host: String,
+        payload_b64: String,
+    },
+    /// Received PEER_ADDR_HAVE — remote peer's address record SPORE.
+    PeerAddrHave {
+        remote_host: String,
+        payload_b64: String,
+    },
+    /// Received PEER_ADDR_DELTA — address records we're missing.
+    PeerAddrDelta {
         remote_host: String,
         payload_b64: String,
     },
@@ -1575,6 +1599,22 @@ pub fn spawn_event_processor(
                     st.mesh
                         .connections
                         .insert(mkey.clone(), MeshConnectionState::Connected);
+
+                    // SPORE peer address gossip: store this peer's address so it
+                    // propagates to SPIRAL neighbors that haven't connected to them yet.
+                    {
+                        let now_ms = (now as i64) * 1000;
+                        if let Some(peer) = st.mesh.known_peers.get(&mkey) {
+                            let record = super::peer_addr_store::PeerAddrRecord::from_mesh_peer_info(peer, now_ms);
+                            if st.mesh.peer_addr_store.insert(record) {
+                                let spore_bytes = bincode::serialize(
+                                    st.mesh.peer_addr_store.spore(),
+                                ).unwrap_or_default();
+                                let actions = st.mesh.peer_addr_gossip.on_store_updated(now_ms, &spore_bytes);
+                                execute_peer_addr_gossip_actions(&st, actions);
+                            }
+                        }
+                    }
 
                     // APE: dynamically peer with this node's Yggdrasil underlay.
                     // Prefer ygg_peer_uri (self-reported from HELLO) over
@@ -2344,6 +2384,31 @@ pub fn spawn_event_processor(
                             count = newly_discovered.len(),
                             "mesh: re-gossiped newly discovered peers to neighbors"
                         );
+                    }
+
+                    // SPORE peer address gossip: store newly discovered peer addresses
+                    // for continuous SPIRAL-neighbor propagation. This closes the gap
+                    // where the one-shot re-broadcast above is missed by nodes that
+                    // weren't connected at discovery time.
+                    if !newly_discovered.is_empty() {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        let mut addr_store_changed = false;
+                        for peer in &newly_discovered {
+                            let record = super::peer_addr_store::PeerAddrRecord::from_mesh_peer_info(peer, now_ms);
+                            if st.mesh.peer_addr_store.insert(record) {
+                                addr_store_changed = true;
+                            }
+                        }
+                        if addr_store_changed {
+                            let spore_bytes = bincode::serialize(
+                                st.mesh.peer_addr_store.spore(),
+                            ).unwrap_or_default();
+                            let actions = st.mesh.peer_addr_gossip.on_store_updated(now_ms, &spore_bytes);
+                            execute_peer_addr_gossip_actions(&st, actions);
+                        }
                     }
 
                     if changed {
@@ -3224,6 +3289,201 @@ pub fn spawn_event_processor(
                 }
 
 
+                RelayEvent::PeerAddrHave { remote_host, payload_b64 } => {
+                    let msg_bytes = match base64::engine::general_purpose::STANDARD
+                        .decode(&payload_b64)
+                    {
+                        Ok(b) => b,
+                        Err(_) => {
+                            warn!(remote_host, "peer_addr_gossip: invalid base64 in PEER_ADDR_HAVE");
+                            continue;
+                        }
+                    };
+                    let sync_msg: super::peer_addr_gossip::SyncMessage =
+                        match bincode::deserialize(&msg_bytes) {
+                            Ok(m) => m,
+                            Err(_) => {
+                                warn!(remote_host, "peer_addr_gossip: invalid bincode in PEER_ADDR_HAVE");
+                                continue;
+                            }
+                        };
+
+                    if let super::peer_addr_gossip::SyncMessage::HaveList { spore_bytes } = sync_msg {
+                        tracing::debug!(remote_host, "peer_addr_gossip: received PEER_ADDR_HAVE");
+
+                        let st = state.read().await;
+                        let from_mkey = remote_host.clone();
+                        let our_spore = st.mesh.peer_addr_store.spore();
+                        let our_data = st.mesh.peer_addr_store.record_data_for_gossip();
+
+                        if let Some(action) = st.mesh.peer_addr_gossip.on_have_list_received(
+                            &from_mkey,
+                            &spore_bytes,
+                            our_spore,
+                            &our_data,
+                        ) {
+                            tracing::debug!(remote_host, "peer_addr_gossip: sending PEER_ADDR_DELTA");
+                            execute_peer_addr_gossip_actions(&st, vec![action]);
+                        }
+                    }
+                }
+
+                RelayEvent::PeerAddrDelta { remote_host, payload_b64 } => {
+                    let msg_bytes = match base64::engine::general_purpose::STANDARD
+                        .decode(&payload_b64)
+                    {
+                        Ok(b) => b,
+                        Err(_) => {
+                            warn!(remote_host, "peer_addr_gossip: invalid base64 in PEER_ADDR_DELTA");
+                            continue;
+                        }
+                    };
+                    let sync_msg: super::peer_addr_gossip::SyncMessage =
+                        match bincode::deserialize(&msg_bytes) {
+                            Ok(m) => m,
+                            Err(_) => {
+                                warn!(remote_host, "peer_addr_gossip: invalid bincode in PEER_ADDR_DELTA");
+                                continue;
+                            }
+                        };
+
+                    if let super::peer_addr_gossip::SyncMessage::RecordDelta { entries } = sync_msg {
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+
+                        let mut st = state.write().await;
+
+                        let records: Vec<super::peer_addr_store::PeerAddrRecord> = entries
+                            .iter()
+                            .filter_map(|bytes| bincode::deserialize(bytes).ok())
+                            .collect();
+
+                        let newly_accepted = st.mesh.peer_addr_store.merge(records, now_ms);
+
+                        if !newly_accepted.is_empty() {
+                            info!(
+                                remote_host,
+                                count = newly_accepted.len(),
+                                "peer_addr_gossip: merged record delta",
+                            );
+
+                            // Re-gossip to our own SPIRAL neighbors for transitive propagation.
+                            let spore_bytes = bincode::serialize(
+                                st.mesh.peer_addr_store.spore(),
+                            ).unwrap_or_default();
+                            let actions = st.mesh.peer_addr_gossip.on_store_updated(now_ms, &spore_bytes);
+                            execute_peer_addr_gossip_actions(&st, actions);
+
+                            // Add newly learned peers to known_peers and attempt connections.
+                            let spiral_active = st.mesh.spiral.is_claimed();
+                            let event_tx = st.federation_event_tx.clone();
+                            let tc = st.transport_config.clone();
+                            let our_pid = st.lens.peer_id.clone();
+
+                            for record in &newly_accepted {
+                                let mkey = record.peer_id.clone();
+
+                                // Skip self, defederated, tombstoned.
+                                if mkey == our_pid { continue; }
+                                if st.mesh.defederated.contains(&mkey)
+                                    || st.mesh.defederated.contains(&record.server_name)
+                                {
+                                    continue;
+                                }
+                                if st.mesh.eviction_tombstones.contains_key(&mkey) { continue; }
+
+                                // Add to known_peers if not already there and not already Connected.
+                                let is_connected = st.mesh.connections.get(&mkey).copied()
+                                    == Some(MeshConnectionState::Connected);
+                                if !st.mesh.known_peers.contains_key(&mkey) && !is_connected {
+                                    let peer_info = MeshPeerInfo {
+                                        peer_id: record.peer_id.clone(),
+                                        server_name: record.server_name.clone(),
+                                        node_name: record.node_name.clone(),
+                                        site_name: record.site_name.clone(),
+                                        public_key_hex: record.public_key_hex.clone(),
+                                        port: record.port,
+                                        tls: record.tls,
+                                        yggdrasil_addr: record.yggdrasil_addr.clone(),
+                                        underlay_uri: record.underlay_uri.clone(),
+                                        ygg_peer_uri: record.ygg_peer_uri.clone(),
+                                        last_seen: (now_ms / 1000) as u64,
+                                        // Seed last_vdf_advance so the peer survives VDF
+                                        // liveness sweep until a real VDF proof arrives.
+                                        last_vdf_advance: (now_ms / 1000) as u64,
+                                        ..Default::default()
+                                    };
+                                    info!(
+                                        peer_id = %mkey,
+                                        node = %record.node_name,
+                                        "peer_addr_gossip: learned peer via SPORE delta"
+                                    );
+                                    st.mesh.known_peers.insert(mkey.clone(), peer_info);
+                                }
+
+                                // SPIRAL gate: only connect to SPIRAL neighbors.
+                                // Non-SPIRAL peers are reachable transitively via overlay.
+                                if spiral_active && !st.mesh.spiral.is_neighbor(&mkey) {
+                                    continue;
+                                }
+
+                                // Skip if already connected/pending.
+                                if st.federation.relays.contains_key(&mkey)
+                                    || st.federation.pending_dials.contains(&record.node_name)
+                                    || st.federation.pending_dials.contains(&record.server_name)
+                                {
+                                    continue;
+                                }
+
+                                let peer_ygg_addr = st
+                                    .mesh
+                                    .known_peers
+                                    .get(&mkey)
+                                    .and_then(|p| p.yggdrasil_addr.as_deref())
+                                    .and_then(|s| s.parse().ok());
+
+                                let connect_key = if peer_ygg_addr.is_some() {
+                                    record.node_name.clone()
+                                } else {
+                                    record.server_name.clone()
+                                };
+
+                                info!(
+                                    peer = %record.node_name,
+                                    peer_id = %mkey,
+                                    "peer_addr_gossip: connecting to SPORE-discovered SPIRAL neighbor"
+                                );
+
+                                st.federation.pending_dials.insert(connect_key.clone());
+
+                                let mut tc_with_peer = (*tc).clone();
+                                tc_with_peer.peers.entry(connect_key.clone()).or_insert(
+                                    transport::PeerEntry {
+                                        yggdrasil_addr: peer_ygg_addr,
+                                        port: record.port,
+                                        tls: record.tls,
+                                        want: None,
+                                        dial_host: None,
+                                    },
+                                );
+                                let tc_arc = Arc::new(tc_with_peer);
+
+                                spawn_native_relay(
+                                    connect_key,
+                                    event_tx.clone(),
+                                    tc_arc,
+                                    state.clone(),
+                                    false,
+                                );
+                            }
+
+                            st.mesh.peer_addr_store.prune_stale(now_ms);
+                        }
+                    }
+                }
+
                 RelayEvent::LivenessHave { remote_host, payload_b64 } => {
                     let msg_bytes = match base64::engine::general_purpose::STANDARD
                         .decode(&payload_b64)
@@ -3952,6 +4212,37 @@ fn execute_connection_gossip_actions(
             }
             super::connection_gossip::SyncMessage::SnapshotDelta { .. } => {
                 MeshMessage::ConnectionDelta { data: b64 }
+            }
+        };
+        if let Some(relay) = st.federation.relays.get(&peer_id) {
+            if !relay.mesh_connected { continue; }
+            let _ = relay.outgoing_tx.send(RelayCommand::SendMesh(mesh_msg));
+        }
+    }
+}
+
+/// Execute peer address gossip sync actions by sending MESH subcommands to relay peers.
+fn execute_peer_addr_gossip_actions(
+    st: &super::server::ServerState,
+    actions: Vec<super::peer_addr_gossip::SyncAction>,
+) {
+    for action in actions {
+        let (peer_id, message) = match action {
+            super::peer_addr_gossip::SyncAction::SendHaveList {
+                neighbor_peer_id, message,
+            } => (neighbor_peer_id, message),
+            super::peer_addr_gossip::SyncAction::SendRecordDelta {
+                neighbor_peer_id, message,
+            } => (neighbor_peer_id, message),
+        };
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(bincode::serialize(&message).unwrap_or_default());
+        let mesh_msg = match &message {
+            super::peer_addr_gossip::SyncMessage::HaveList { .. } => {
+                MeshMessage::PeerAddrHave { data: b64 }
+            }
+            super::peer_addr_gossip::SyncMessage::RecordDelta { .. } => {
+                MeshMessage::PeerAddrDelta { data: b64 }
             }
         };
         if let Some(relay) = st.federation.relays.get(&peer_id) {
@@ -6693,7 +6984,8 @@ fn update_spiral_neighbors(st: &mut super::server::ServerState) {
     let neighbors = st.mesh.spiral.neighbors().clone();
     st.mesh.latency_gossip.set_spiral_neighbors(neighbors.clone());
     st.mesh.connection_gossip.set_spiral_neighbors(neighbors.clone());
-    st.mesh.liveness_gossip.set_spiral_neighbors(neighbors);
+    st.mesh.liveness_gossip.set_spiral_neighbors(neighbors.clone());
+    st.mesh.peer_addr_gossip.set_spiral_neighbors(neighbors);
 }
 
 fn build_hello_payload(st: &mut super::server::ServerState) -> MeshHelloPayload {
@@ -6920,6 +7212,8 @@ fn mesh_message_to_irc(msg: &MeshMessage) -> Message {
         MeshMessage::ConnectionDelta { data } => ("CONNECTION_DELTA".into(), data.clone()),
         MeshMessage::LivenessHave { data } => ("LIVENESS_HAVE".into(), data.clone()),
         MeshMessage::LivenessDelta { data } => ("LIVENESS_DELTA".into(), data.clone()),
+        MeshMessage::PeerAddrHave { data } => ("PEER_ADDR_HAVE".into(), data.clone()),
+        MeshMessage::PeerAddrDelta { data } => ("PEER_ADDR_DELTA".into(), data.clone()),
         MeshMessage::SocketMigrate { migration, client_peer_id } => {
             ("SOCKET_MIGRATE".into(), serde_json::json!({ "migration": migration, "client_peer_id": client_peer_id }).to_string())
         }

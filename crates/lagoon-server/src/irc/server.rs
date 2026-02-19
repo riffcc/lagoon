@@ -322,6 +322,13 @@ pub struct MeshState {
     pub connection_store: super::connection_store::ConnectionStore,
     /// SPIRAL-scoped connection snapshot gossip coordinator.
     pub connection_gossip: super::connection_gossip::ConnectionGossip,
+    /// SPORE-indexed peer address store — gossips address records so every
+    /// node eventually learns how to reach every other node. Fixes the
+    /// one-shot peer discovery gap where nodes joining after initial HELLO
+    /// exchange are never propagated to all existing nodes.
+    pub peer_addr_store: super::peer_addr_store::PeerAddrStore,
+    /// SPIRAL-scoped peer address gossip coordinator.
+    pub peer_addr_gossip: super::peer_addr_gossip::PeerAddrGossip,
     /// Bitmap-based liveness tracker: 1 bit per SPIRAL slot, SPORE reconciliation.
     pub liveness_bitmap: super::liveness_store::LivenessBitmap,
     /// SPIRAL-scoped liveness gossip coordinator (SPORE HaveList/Delta protocol).
@@ -409,6 +416,8 @@ impl MeshState {
             ),
             connection_store: super::connection_store::ConnectionStore::new(120_000), // 120s TTL
             connection_gossip: super::connection_gossip::ConnectionGossip::new(10_000), // 10s sync interval
+            peer_addr_store: super::peer_addr_store::PeerAddrStore::new(120_000), // 120s TTL
+            peer_addr_gossip: super::peer_addr_gossip::PeerAddrGossip::new(10_000), // 10s sync interval
             liveness_bitmap: super::liveness_store::LivenessBitmap::new(20), // 20s decay — convergence ~250ms
             liveness_gossip: super::liveness_gossip::LivenessGossip::new(0), // interval ignored — event-driven
             cvdf_service: None,
