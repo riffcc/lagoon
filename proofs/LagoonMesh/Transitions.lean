@@ -70,11 +70,18 @@ def handleHello (s : MeshState) (from_ : PeerId) (hello : HelloMsg)
     isBootstrap := from_ ∈ s.bootstrapPeers
   }
   let s₁ := { s with knownPeers := s.knownPeers.insert hello.peerId peerInfo }
-  -- Step 3: Mark as connected
+  -- Step 3: Mark as connected.
+  -- `handleMeshHello` models the INBOUND path: a remote peer sent us their
+  -- Hello (they dialed us). In Rust: `raw_mesh_handler` in switchboard.rs.
+  -- Outbound relays (where we dialed) also exchange Hello, but are inserted
+  -- by `native_raw_loop` with `isInbound = false`. For the pruning invariant
+  -- what matters is that inbound relays set isInbound := true so shouldPrune
+  -- returns false for them unconditionally.
   let relayInfo : RelayInfo := {
     peerId := hello.peerId
     isBootstrap := from_ ∈ s.bootstrapPeers
     helloExchanged := true
+    isInbound := true  -- this node accepted the connection (remote dialed us)
   }
   let s₂ := { s₁ with relays := s₁.relays.insert hello.peerId relayInfo }
   -- Step 4: SPIRAL merge evaluation

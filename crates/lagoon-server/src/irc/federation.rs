@@ -379,6 +379,22 @@ fn prune_non_spiral_relays(st: &mut super::server::ServerState) {
             if handle.is_bootstrap {
                 return false;
             }
+            // Never prune INBOUND connections (connect_target is empty for
+            // inbound switchboard relays). The dialing side decides who to
+            // connect to — we accept all inbound connections.
+            //
+            // Invariant: if A considers B a SPIRAL neighbor, A will keep
+            // a relay task alive trying to reach B. B must not kill the
+            // resulting inbound connection — even if B does not consider A
+            // a SPIRAL neighbor (topology convergence is not instantaneous,
+            // so SPIRAL neighbors are not always symmetric). Pruning inbound
+            // connections causes B to close the splice immediately after A
+            // sends HELLO, before B's response HELLO is sent. A sees EOF in
+            // <1s, consecutive_failures escalates to 60s backoff, and the
+            // relay is stuck alive-but-pending indefinitely.
+            if handle.connect_target.is_empty() {
+                return false;
+            }
             // Don't prune peers still bootstrapping (no SPIRAL slot yet).
             // They need this relay to receive their slot assignment.
             if !st.mesh.spiral.has_slot(peer_id) {

@@ -272,17 +272,23 @@ theorem neighbor_never_pruned (s : MeshState) (pid : PeerId) (ri : RelayInfo)
     (hNotBootstrap : ri.isBootstrap = false) :
     shouldPrune s pid ri = false := by
   unfold shouldPrune
+  -- After substituting hNotBootstrap = false and hNeighbor = true, the
+  -- isInbound branch reduces to (if ri.isInbound then false else false)
+  -- which is false regardless of ri.isInbound.
   simp [hNotBootstrap, hNeighbor]
 
-/-- The prune guard prevents pruning below minimum relay count. -/
+/-- The prune guard prevents pruning below minimum relay count.
+    Note: this applies only to outbound, non-bootstrap, non-neighbor relays.
+    Inbound relays are never pruned regardless (proved in ConnectionProofs.lean). -/
 theorem prune_guard (s : MeshState) (pid : PeerId) (ri : RelayInfo)
     (hNotBootstrap : ri.isBootstrap = false)
+    (hNotInbound : ri.isInbound = false)
     (hNotNeighbor : isNeighbor s pid = false)
     (hBelowMin : (s.relays.values.filter (fun r => !r.isBootstrap)).length
                  ≤ max (computeNeighbors s.spiral).length 2) :
     shouldPrune s pid ri = false := by
   unfold shouldPrune
-  simp [hNotBootstrap, hNotNeighbor]
+  simp [hNotBootstrap, hNotInbound, hNotNeighbor]
   omega
 
 end LagoonMesh

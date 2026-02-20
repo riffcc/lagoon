@@ -37,6 +37,13 @@ structure RelayInfo where
   peerId : PeerId
   isBootstrap : Bool
   helloExchanged : Bool
+  /-- True if the remote side initiated this connection (they dialed us).
+      In Rust: `connect_target.is_empty()` for inbound switchboard relays.
+      Inbound relays must NEVER be pruned — the dialing side chose us as a
+      SPIRAL neighbor, so we must keep the connection even if we don't
+      consider them our neighbor (SPIRAL topology convergence is not
+      instantaneous, so neighbor relationships may be temporarily asymmetric). -/
+  isInbound : Bool
   deriving Repr
 
 /-- The complete mesh node state. -/
@@ -118,6 +125,14 @@ With a guard: don't prune if we'd go below the minimum. -/
 def shouldPrune (s : MeshState) (pid : PeerId) (ri : RelayInfo) : Bool :=
   -- Never prune bootstrap
   if ri.isBootstrap then false
+  -- Never prune inbound connections. The dialing side chose us as a SPIRAL
+  -- neighbor; we must not reject that connection even if we don't consider
+  -- them our neighbor. SPIRAL topology convergence is not instantaneous:
+  -- if A considers B a neighbor but B does not yet consider A a neighbor,
+  -- pruning A's inbound relay on B breaks the connection before HELLO
+  -- completes, causing A's relay task to escalate to 60-second backoff.
+  -- Invariant: isInbound → ¬ shouldPrune (proved in ConnectionProofs.lean).
+  else if ri.isInbound then false
   -- Never prune SPIRAL neighbors
   else if isNeighbor s pid then false
   -- Guard: don't prune below minimum

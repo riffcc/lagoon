@@ -228,6 +228,71 @@ theorem tick_emits_cancel_for_each_dead_peer (s : MeshState) (t : Timestamp) (pi
   left; left
   exact evictF_foldl_mem _ _ _ hPidDead
 
+/-! ### Inbound Relay Preservation
+
+The root cause of "relay_count < neighbor_count after convergence" (2026-02-20):
+
+When node A considers B a SPIRAL neighbor and dials B, B's `prune_non_spiral_relays`
+was killing A's inbound relay before HELLO completed — because B's local SPIRAL view
+did not (yet) consider A a neighbor. SPIRAL convergence is not instantaneous:
+if A has merged around B but B has not yet merged around A, the topology is
+temporarily asymmetric. B would prune A's inbound connection immediately after
+receiving A's HELLO, before sending the response HELLO. A's `read_mesh_frame`
+got EOF (<1s, not 10s), so `connection_lived = false`, `consecutive_failures++`
+escalated to 60s backoff. The relay task stayed alive in `pending_dials`
+(`has_pending = true`) but never inserted a relay handle (`has_relay = false`).
+
+Fix: `shouldPrune` returns false for `isInbound = true` relays.
+The dialing side (A) chose B as a SPIRAL neighbor and will keep retrying.
+The accepting side (B) must preserve the inbound connection regardless of
+its own local topology view.
+
+Lean invariant: `isInbound → ¬ shouldPrune`. -/
+
+/-- Inbound relays are never pruned, regardless of SPIRAL topology.
+    Rust correspondence: `prune_non_spiral_relays` guard
+    `if handle.connect_target.is_empty() { return false; }` in federation.rs. -/
+theorem inbound_relay_never_pruned (s : MeshState) (pid : PeerId) (ri : RelayInfo)
+    (hInbound : ri.isInbound = true) :
+    shouldPrune s pid ri = false := by
+  unfold shouldPrune
+  simp [hInbound]
+
+/-- Corollary: an inbound relay for peer A is never in computePruneSet. -/
+theorem inbound_relay_not_in_prune_set (s : MeshState) (pid : PeerId) (ri : RelayInfo)
+    (hRelay : s.relays.lookup pid = some ri)
+    (hInbound : ri.isInbound = true) :
+    pid ∉ computePruneSet s := by
+  unfold computePruneSet
+  rw [List.mem_filter, not_and]
+  intro _
+  simp [hRelay, inbound_relay_never_pruned s pid ri hInbound]
+
+/-- Core connection invariant: if A considers B a SPIRAL neighbor, A's relay
+    task will eventually complete HELLO with B, because B preserves the
+    inbound connection (does not prune it).
+
+    This is stated as a model-level invariant over `shouldPrune`: for any
+    relay that B accepted from A (isInbound = true), B's pruning logic
+    will NOT disconnect it, regardless of whether B's local SPIRAL view
+    considers A a neighbor.
+
+    In the real system, "eventually" is bounded by: at most one reconnect
+    cycle (A gets Reconnect, retries, connects again successfully now that
+    B won't prune it) plus the HELLO timeout (30s worst case). -/
+theorem spiral_neighbor_connection_preserved
+    (s : MeshState) (a b : PeerId)
+    -- A is in B's relay map as an inbound connection (A dialed B)
+    (hInboundOnB : ∃ ri, s.relays.lookup a = some ri ∧ ri.isInbound = true) :
+    -- B will NOT prune A's inbound relay
+    ∀ ri, s.relays.lookup a = some ri → shouldPrune s a ri = false := by
+  obtain ⟨ri₀, hLookup, hIsInbound⟩ := hInboundOnB
+  intro ri hLookupRi
+  rw [hLookup] at hLookupRi
+  injection hLookupRi with h
+  subst h
+  exact inbound_relay_never_pruned s a ri₀ hIsInbound
+
 /-! ### The No-Storm Invariant
 
 Together, the above theorems mean: the connection storm observed in production
