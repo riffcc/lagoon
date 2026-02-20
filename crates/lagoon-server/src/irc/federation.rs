@@ -546,6 +546,20 @@ pub fn dial_missing_spiral_neighbors(
         // switchboard. The server-side L4 splice handles cross-provider routing
         // transparently (Bunny→switchboard→Fly target). Without a switchboard
         // addr, direct dial via Ygg overlay/underlay (Fly→Fly).
+        // CRITICAL: connect_key MUST be node_name (unique per peer) for ALL paths.
+        //
+        // Using the anycast host ("fly.lagun.co") or switchboard addr as the key
+        // breaks two invariants:
+        // 1. pending_dials — all peers collide on the same key; only one relay
+        //    task is tracked, the rest appear "not pending" and get re-spawned.
+        // 2. should_keep_retrying — checks `p.node_name == connect_target`.
+        //    "fly.lagun.co" never matches any peer's node_name, so relay tasks
+        //    exit after the first self-connection instead of retrying.
+        //
+        // Using node_name as the key:
+        // - pending_dials.contains(&node_name) correctly gates re-spawning ✓
+        // - should_keep_retrying matches the peer by name → keeps retrying ✓
+        // - dial_host carries the actual TCP target (anycast / switchboard) ✓
         let (connect_key, peer_entry) = if let Some(ref sb_addr) = tc.switchboard_addr {
             info!(
                 peer = %node_name,
@@ -553,12 +567,12 @@ pub fn dial_missing_spiral_neighbors(
                 switchboard = %sb_addr,
                 "mesh: dialing SPIRAL neighbor via switchboard"
             );
-            (sb_addr.clone(), transport::PeerEntry {
+            (node_name.clone(), transport::PeerEntry {
                 yggdrasil_addr: None,
                 port: transport::SWITCHBOARD_PORT,
                 tls: false,
                 want: Some(format!("peer:{}", neighbor_mkey)),
-                dial_host: None,
+                dial_host: Some(sb_addr.clone()),
             })
         } else if peer_ygg_addr.is_some() {
             // Ygg overlay — dial the peer's switchboard directly.
@@ -586,12 +600,12 @@ pub fn dial_missing_spiral_neighbors(
                 anycast = %anycast,
                 "mesh: dialing SPIRAL neighbor via anycast switchboard"
             );
-            (anycast, transport::PeerEntry {
+            (node_name.clone(), transport::PeerEntry {
                 yggdrasil_addr: None,
                 port: transport::SWITCHBOARD_PORT,
                 tls: false,
                 want: Some(format!("peer:{}", neighbor_mkey)),
-                dial_host: None,
+                dial_host: Some(anycast),
             })
         };
 
@@ -3476,13 +3490,17 @@ pub fn spawn_event_processor(
                                     .filter(|u| is_underlay_uri(u))
                                     .map(|u| u.to_string());
 
+                                // Same fix as dial_missing_spiral_neighbors: use
+                                // node_name as the connect_key (unique per peer)
+                                // so should_keep_retrying and pending_dials work
+                                // correctly. Actual TCP target goes in dial_host.
                                 let (connect_key, peer_entry) = if let Some(ref sb_addr) = tc.switchboard_addr {
-                                    (sb_addr.clone(), transport::PeerEntry {
+                                    (record.node_name.clone(), transport::PeerEntry {
                                         yggdrasil_addr: None,
                                         port: transport::SWITCHBOARD_PORT,
                                         tls: false,
                                         want: Some(format!("peer:{mkey}")),
-                                        dial_host: None,
+                                        dial_host: Some(sb_addr.clone()),
                                     })
                                 } else if peer_ygg_addr.is_some() {
                                     let underlay_host = peer_underlay_uri.as_deref()
@@ -3496,12 +3514,12 @@ pub fn spawn_event_processor(
                                     })
                                 } else {
                                     let anycast = anycast_entry.unwrap();
-                                    (anycast, transport::PeerEntry {
+                                    (record.node_name.clone(), transport::PeerEntry {
                                         yggdrasil_addr: None,
                                         port: transport::SWITCHBOARD_PORT,
                                         tls: false,
                                         want: Some(format!("peer:{mkey}")),
-                                        dial_host: None,
+                                        dial_host: Some(anycast),
                                     })
                                 };
 
