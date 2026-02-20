@@ -6678,18 +6678,35 @@ fn evict_dead_peers(st: &mut super::server::ServerState) -> Vec<String> {
             continue;
         }
 
-        // Relay task manages this peer's lifecycle — never timer-evict.
-        // The relay task will send PeerGone when it permanently exits.
-        if st.federation.managed_peers.contains(peer_mkey) {
-            continue;
-        }
-
         // Live relay in map = alive. Period.
         if st.federation.relays.contains_key(peer_mkey) {
             continue;
         }
 
-        // Ghost peer: no relay, no relay task.
+        // No live relay — peer may be retried (managed_peers) or ghost.
+        //
+        // INVARIANT (Lean: no_infinite_storm): We must NOT skip eviction for
+        // managed-but-dead peers. The managed_peers protection was meant to
+        // prevent evicting peers whose relay tasks are in a reconnect cycle.
+        // But it creates a circular deadlock for dead peers:
+        //   1. Machine P reboots → relay task retrying (has_pending=true)
+        //   2. managed_peers contains P → evict_dead_peers skips P
+        //   3. P stays in known_peers → should_keep_retrying = true
+        //   4. Relay task keeps retrying P forever (never exits, never PeerGone)
+        //
+        // The relay check above (federation.relays) already protects LIVE peers.
+        // The liveness bitmap below protects recently-seen peers regardless of
+        // whether they have a relay task. managed_peers is redundant for live
+        // peers and actively harmful for dead-but-retried peers. Remove it.
+        //
+        // After eviction: should_keep_retrying returns false → relay task exits
+        // → sends PeerGone → managed_peers.remove(). Clean lifecycle.
+        //
+        // Corresponds to Lean handleTick which evicts ALL dead peers from
+        // knownPeers with no managed-peer exception (ConnectionProofs.lean,
+        // no_infinite_storm theorem).
+
+        // Ghost peer: no relay (and no longer protected by managed guard).
         // We can't observe their liveness directly — we rely on their SPIRAL
         // neighbors to attest via the liveness bitmap (SPORE gossip).
         // Bitmap bit=1 means SOMEONE in the mesh can see them. Trust the mesh.
